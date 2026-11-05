@@ -8,17 +8,13 @@
 
 ## 项目资料
 
-- [目录与开发入口](docs/project-structure.md)
 - [制作团队测试说明](docs/production-mvp/team-testing.md)
-- [实施与验证索引](docs/production-mvp/README.md)
-- [迭代计划](plan.md)
-- [代码复用清单](reuse-map.md)
 
 ## 本机运行
 
-本机项目页：<http://127.0.0.1:1242/app/projects>
+按仓库中的运行配置启动服务后，打开项目管理页。测试记录保存在本机，可在页面导出 ZIP 后交由负责人离线汇总。
 
-服务配置与项目数据保存在 XM_Studio 项目目录中。运行和开发环境要求见项目文档。
+服务配置与项目数据保存在本机项目目录中，不会自动上传。
 
 ## 许可证
 

@@ -8,17 +8,13 @@ Projects and production feedback stay on each tester's machine. Team members can
 
 ## Project Guides
 
-- [Repository structure and development entry points](docs/project-structure.md)
 - [Production team testing guide](docs/production-mvp/team-testing.md)
-- [Implementation and verification index](docs/production-mvp/README.md)
-- [Iteration plan](plan.md)
-- [Code reuse map](reuse-map.md)
 
 ## Run Locally
 
-Local projects page: <http://127.0.0.1:1242/app/projects>
+Start the service with the repository's runtime configuration, then open the projects page. Test records stay on the local machine and can be exported as ZIP files for offline review.
 
-Runtime configuration and project data are stored in the XM_Studio project directory. See the project guides for environment and development requirements.
+Runtime configuration and project data stay in the local project directory and are not uploaded automatically.
 
 ## License
 

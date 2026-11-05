@@ -99,3 +99,32 @@ docs/verification-reports/
 
 # mutmut 变异测试的工作副本（`mutmut run` 生成的整仓复制品）
 mutants/
+
+# Local development notes and upstream documentation are not part of the tester repository.
+/.github/
+/.out-of-scope/
+/AGENTS.md
+/CHANGELOG.md
+/CODING_STANDARDS.md
+/CONTRIBUTING.md
+/GLOSSARY.md
+/PRODUCT.md
+/plan.md
+/reuse-map.md
+/website/
+/public/agent-installation-guide.md
+/agent_runtime_profile/skill-optimization-workspace/
+/docs/LESSONS.md
+/docs/adr/
+/docs/agents/
+/docs/api-docs/
+/docs/assets/
+/docs/dockerhub-README.md
+/docs/project-structure.md
+/docs/readme-assets.md
+/docs/research/
+/docs/standards/
+/docs/testing/
+/docs/upstream-baseline.json
+/docs/production-mvp/*
+!/docs/production-mvp/team-testing.md
