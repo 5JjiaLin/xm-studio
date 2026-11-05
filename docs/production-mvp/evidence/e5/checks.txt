@@ -1,0 +1,1 @@
+PASS: 2s total; blue then red; blue muted; red audible; yellow top caption at 1.1-1.6s only.

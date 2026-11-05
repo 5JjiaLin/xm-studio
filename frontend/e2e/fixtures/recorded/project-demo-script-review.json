@@ -1,0 +1,29 @@
+{
+  "method": "GET",
+  "path": "/api/v1/projects/demo/episodes/1/script-review",
+  "status": 200,
+  "body": {
+    "episode": 1,
+    "content_mode": "narration",
+    "status": "no_script_plan",
+    "fingerprint": null,
+    "confirmed_at": null,
+    "content": null,
+    "supported_durations": null,
+    "episode_target_duration": null,
+    "script_overwrite": {
+      "revision": "sha256-v1:922284d4b6c0928c24579d0eeecfcf96dfa5d36298f29f327d7f4daf4c65c3e7",
+      "entries": [],
+      "storyboard_count": 0,
+      "video_count": 0,
+      "narration_audio_count": 0,
+      "end_frame_count": 0,
+      "grid_member_count": 0,
+      "grid_count": 0,
+      "text": "本集已有正式脚本，确认会整份覆盖它：现有 0 条脚本条目全部移除，时间线上手改的台词与提示词一并丢弃。"
+    },
+    "soft_violations": [],
+    "duration_tiers": null,
+    "quarantine": null
+  }
+}

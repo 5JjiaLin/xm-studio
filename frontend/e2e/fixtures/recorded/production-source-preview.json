@@ -1,0 +1,9 @@
+{
+  "method": "POST",
+  "path": "/api/v1/production/source-preview",
+  "status": 200,
+  "body": {
+    "text": "小明：你好。",
+    "filename": "episode.txt"
+  }
+}

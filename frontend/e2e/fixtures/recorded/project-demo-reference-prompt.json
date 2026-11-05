@@ -1,0 +1,14 @@
+{
+  "method": "POST",
+  "path": "/api/v1/projects/demo/reference-videos/episodes/1/units/E1U1/prompt-preview",
+  "status": 200,
+  "body": {
+    "text": null,
+    "unavailable": "无法解析 i2v 视频能力，请检查供应商与模型配置",
+    "is_text_form": true,
+    "references": [],
+    "warnings": [],
+    "used_assets": [],
+    "voice_only": []
+  }
+}

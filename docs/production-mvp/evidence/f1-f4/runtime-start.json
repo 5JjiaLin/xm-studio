@@ -1,0 +1,16 @@
+{
+  "pid": 7040,
+  "cwd": ".",
+  "worker_owner": "worker-b7382e7e62",
+  "template_sha256": {
+    "text/reference_video_prompt_authoring.md": "0d86f7c2bbd586785648eb619a17c226c188dee4e8bee6f72d666fab7007e5a0",
+    "text/reference_video_script_plan.md": "4e2fd1360718cf4c453f5ce615bac61a2c6c3c74c6fa8336c46b861fab2f5455",
+    "partials/shared/writing_syntax.md": "63c567e4117021383d1879c3beace9e64ab9672fec131d9f3d6ebad3a93a746e",
+    "partials/text/reference_video_script_plan/unit_rule/screenplay.md": "e7143b88b23f51f1a724f4fec0b2892f006cf2f7756ade3aef611aa625064ca4",
+    "partials/text/reference_video_script_plan/unit_rule/novel.md": "eb7266f426220018836567e350a365a324b999858d63a3c5e222b7de07782a43",
+    "reference_video/unit.md": "dbf487cd6f978c9f500b47f312694e707f705aaa9f4d4d41c04b1dc04a4121fa"
+  },
+  "authoring_render_sha256": "be3b1d1df1a1acd36a38815b41d8cb762f13d21ee5a51902f7e4d7ab0065a138",
+  "matches_offline_input": true,
+  "method": "启动后在提供 HTTP 与 worker 的同一进程内调用真实 builder，未提交生成任务。"
+}

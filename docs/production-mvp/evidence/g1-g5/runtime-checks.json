@@ -1,0 +1,112 @@
+{
+  "/app/make/proj-4bc708bf?step=assets&episode=1": {
+    "status": 200,
+    "bytes": 1550
+  },
+  "/api/v1/production/feedback/settings": {
+    "status": 200,
+    "bytes": 110
+  },
+  "/api/v1/projects/proj-4bc708bf/production/feedback/objects": {
+    "status": 200,
+    "bytes": 114548
+  },
+  "preview": {
+    "unit": "E1U9",
+    "types": [
+      "character",
+      "prop",
+      "scene"
+    ],
+    "assets": [
+      {
+        "type": "scene",
+        "name": "黑色石殿",
+        "status": "sent",
+        "request_indices": [
+          1
+        ]
+      },
+      {
+        "type": "prop",
+        "name": "大玉台",
+        "status": "sent",
+        "request_indices": [
+          2
+        ]
+      },
+      {
+        "type": "prop",
+        "name": "黑石柱",
+        "status": "sent",
+        "request_indices": [
+          3
+        ]
+      },
+      {
+        "type": "prop",
+        "name": "灯笼",
+        "status": "sent",
+        "request_indices": [
+          4
+        ]
+      },
+      {
+        "type": "character",
+        "name": "吉迪恩",
+        "status": "sent",
+        "request_indices": [
+          5
+        ]
+      },
+      {
+        "type": "character",
+        "name": "埃利亚斯",
+        "status": "sent",
+        "request_indices": [
+          6
+        ]
+      },
+      {
+        "type": "prop",
+        "name": "铁链",
+        "status": "sent",
+        "request_indices": [
+          7
+        ]
+      },
+      {
+        "type": "prop",
+        "name": "破旧木箱",
+        "status": "sent",
+        "request_indices": [
+          8
+        ]
+      }
+    ],
+    "references": 8,
+    "unavailable": null
+  },
+  "export": {
+    "status": 200,
+    "event_count": 55,
+    "files": 5,
+    "checksums_valid": true,
+    "contains_db_env": false
+  },
+  "runtime": {
+    "pid": 17551,
+    "migration": "da7111b6a01f",
+    "worker_lease": [
+      [
+        "worker-13423b2ca4",
+        1793867624.5191839
+      ]
+    ],
+    "active_tasks": 0,
+    "api_calls": [
+      119,
+      119
+    ]
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "method": "GET",
+  "path": "/api/v1/projects/demo/episodes/1/production/edit",
+  "status": 200,
+  "body": {
+    "timeline_id": "tl-recorded",
+    "revision": 1,
+    "clips": [
+      {
+        "id": "c1",
+        "unit_id": "E1U1",
+        "trim": null,
+        "source_volume": 1,
+        "hold_us": 0,
+        "carries_narration": true,
+        "reason": null,
+        "transition_to_next": null
+      },
+      {
+        "id": "c2",
+        "unit_id": "E1U2",
+        "trim": null,
+        "source_volume": 1,
+        "hold_us": 0,
+        "carries_narration": true,
+        "reason": null,
+        "transition_to_next": null
+      }
+    ],
+    "media": {
+      "E1U1": {
+        "version": null,
+        "duration_us": null
+      },
+      "E1U2": {
+        "version": null,
+        "duration_us": null
+      }
+    },
+    "subtitle_drafts": {
+      "E1U1": "",
+      "E1U2": ""
+    },
+    "duration": 8,
+    "issues": []
+  }
+}

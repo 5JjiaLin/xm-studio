@@ -1,0 +1,456 @@
+{
+  "method": "GET",
+  "path": "/api/v1/providers/gemini-aistudio/models",
+  "status": 200,
+  "body": {
+    "models": [
+      {
+        "model_id": "gemini-3-flash-preview",
+        "api_model_name": "gemini-3-flash-preview",
+        "display_name": "Gemini 3 Flash Preview",
+        "media_type": "text",
+        "enabled": true,
+        "is_default": true,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "uncached_input_tokens",
+              "min_price": 0.5,
+              "max_price": 0.5,
+              "per": 1000000
+            },
+            {
+              "meter": "output_tokens",
+              "min_price": 3,
+              "max_price": 3,
+              "per": 1000000
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemini-3-pro-image",
+        "api_model_name": "gemini-3-pro-image",
+        "display_name": "Gemini 3 Pro Image",
+        "media_type": "image",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "output_images",
+              "min_price": 0.134,
+              "max_price": 0.24,
+              "per": 1
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemini-3.1-flash-image",
+        "api_model_name": "gemini-3.1-flash-image",
+        "display_name": "Gemini 3.1 Flash Image",
+        "media_type": "image",
+        "enabled": true,
+        "is_default": true,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "output_images",
+              "min_price": 0.045,
+              "max_price": 0.151,
+              "per": 1
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "veo-3.1-generate-preview",
+        "api_model_name": "veo-3.1-generate-preview",
+        "display_name": "Veo 3.1",
+        "media_type": "video",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "output_seconds",
+              "min_price": 0.2,
+              "max_price": 0.6,
+              "per": 1
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "veo-3.1-fast-generate-preview",
+        "api_model_name": "veo-3.1-fast-generate-preview",
+        "display_name": "Veo 3.1 Fast",
+        "media_type": "video",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "output_seconds",
+              "min_price": 0.08,
+              "max_price": 0.3,
+              "per": 1
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "veo-3.1-lite-generate-preview",
+        "api_model_name": "veo-3.1-lite-generate-preview",
+        "display_name": "Veo 3.1 Lite",
+        "media_type": "video",
+        "enabled": true,
+        "is_default": true,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "output_seconds",
+              "min_price": 0.03,
+              "max_price": 0.08,
+              "per": 1
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemini-3.8-flash-tts",
+        "api_model_name": "gemini-3.8-flash-tts",
+        "display_name": "Gemini 3.8 Flash TTS",
+        "media_type": "audio",
+        "enabled": true,
+        "is_default": true,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "audio_output_tokens",
+              "min_price": 9,
+              "max_price": 9,
+              "per": 1000000
+            },
+            {
+              "meter": "uncached_input_tokens",
+              "min_price": 0.5,
+              "max_price": 0.5,
+              "per": 1000000
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemini-3.8-flash-lite-tts",
+        "api_model_name": "gemini-3.8-flash-lite-tts",
+        "display_name": "Gemini 3.8 Flash-Lite TTS",
+        "media_type": "audio",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "audio_output_tokens",
+              "min_price": 6,
+              "max_price": 6,
+              "per": 1000000
+            },
+            {
+              "meter": "uncached_input_tokens",
+              "min_price": 0.5,
+              "max_price": 0.5,
+              "per": 1000000
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemini-3.1-flash-lite",
+        "api_model_name": "gemini-3.1-flash-lite",
+        "display_name": "Gemini 3.1 Flash Lite",
+        "media_type": "text",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "uncached_input_tokens",
+              "min_price": 0.25,
+              "max_price": 0.25,
+              "per": 1000000
+            },
+            {
+              "meter": "output_tokens",
+              "min_price": 1.5,
+              "max_price": 1.5,
+              "per": 1000000
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemini-3.1-pro-preview",
+        "api_model_name": "gemini-3.1-pro-preview",
+        "display_name": "Gemini 3.1 Pro Preview",
+        "media_type": "text",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "uncached_input_tokens",
+              "min_price": 2,
+              "max_price": 4,
+              "per": 1000000
+            },
+            {
+              "meter": "output_tokens",
+              "min_price": 12,
+              "max_price": 18,
+              "per": 1000000
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemini-3.5-flash",
+        "api_model_name": "gemini-3.5-flash",
+        "display_name": "Gemini 3.5 Flash",
+        "media_type": "text",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "uncached_input_tokens",
+              "min_price": 1.5,
+              "max_price": 1.5,
+              "per": 1000000
+            },
+            {
+              "meter": "output_tokens",
+              "min_price": 9,
+              "max_price": 9,
+              "per": 1000000
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemini-3.5-flash-lite",
+        "api_model_name": "gemini-3.5-flash-lite",
+        "display_name": "Gemini 3.5 Flash Lite",
+        "media_type": "text",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "uncached_input_tokens",
+              "min_price": 0.3,
+              "max_price": 0.3,
+              "per": 1000000
+            },
+            {
+              "meter": "output_tokens",
+              "min_price": 2.5,
+              "max_price": 2.5,
+              "per": 1000000
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemini-3.6-flash",
+        "api_model_name": "gemini-3.6-flash",
+        "display_name": "Gemini 3.6 Flash",
+        "media_type": "text",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "uncached_input_tokens",
+              "min_price": 0.75,
+              "max_price": 0.75,
+              "per": 1000000
+            },
+            {
+              "meter": "output_tokens",
+              "min_price": 3.75,
+              "max_price": 3.75,
+              "per": 1000000
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemini-3.7-flash",
+        "api_model_name": "gemini-3.7-flash",
+        "display_name": "Gemini 3.7 Flash",
+        "media_type": "text",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "uncached_input_tokens",
+              "min_price": 0.75,
+              "max_price": 0.75,
+              "per": 1000000
+            },
+            {
+              "meter": "output_tokens",
+              "min_price": 3.75,
+              "max_price": 3.75,
+              "per": 1000000
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemini-3.8-flash",
+        "api_model_name": "gemini-3.8-flash",
+        "display_name": "Gemini 3.8 Flash",
+        "media_type": "text",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "uncached_input_tokens",
+              "min_price": 0.75,
+              "max_price": 0.75,
+              "per": 1000000
+            },
+            {
+              "meter": "output_tokens",
+              "min_price": 3.75,
+              "max_price": 3.75,
+              "per": 1000000
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemini-4-argon",
+        "api_model_name": "gemini-4-argon",
+        "display_name": "Gemini 4 Argon",
+        "media_type": "text",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [],
+        "price": {
+          "currency": "USD",
+          "items": [
+            {
+              "meter": "uncached_input_tokens",
+              "min_price": 2,
+              "max_price": 2,
+              "per": 1000000
+            },
+            {
+              "meter": "output_tokens",
+              "min_price": 10,
+              "max_price": 10,
+              "per": 1000000
+            }
+          ]
+        },
+        "endpoint": null
+      },
+      {
+        "model_id": "gemma-4-26b-a4b-it",
+        "api_model_name": "gemma-4-26b-a4b-it",
+        "display_name": "Gemma 4 26B A4B IT",
+        "media_type": "text",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [
+          "unpriced"
+        ],
+        "price": null,
+        "endpoint": null
+      },
+      {
+        "model_id": "gemma-4-31b-it",
+        "api_model_name": "gemma-4-31b-it",
+        "display_name": "Gemma 4 31B IT",
+        "media_type": "text",
+        "enabled": true,
+        "is_default": false,
+        "official": true,
+        "flags": [
+          "unpriced"
+        ],
+        "price": null,
+        "endpoint": null
+      }
+    ],
+    "discoverable": true
+  }
+}

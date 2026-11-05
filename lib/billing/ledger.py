@@ -1,0 +1,469 @@
+"""记账账本（ledger）：三通道封装 API 调用记账落库。
+
+对外三个通道对应三种真实记账形态：
+
+1. **记账括号**（``record`` async context manager）—— image / audio / video / text 四条生成
+   路径用。进入即落 pending 行并在块内暴露 ``call_id``（任务调用以 ``api_calls.task_id``
+   关联）；成功以 ``call.success(result)`` 显式递交 backend 结果对象；``Exception`` 分支自动
+   翻 failed（原文截断落 ``error_message``，可识别的失败类别另落 ``error_code`` + ``error_params``，
+   见 :mod:`lib.billing.call_failure`）后原样重抛，且记账失败不吞原异常；``CancelledError`` 先结算为
+   cancelled（零费用）再原样重抛；正常退出未声明成功抛 ``RuntimeError``。
+2. **resume 补账**（``resume_success`` / ``resume_failed`` / ``resume_cancelled``）—— 按 ``call_id`` 精准翻 pending，
+   幂等守卫（``WHERE status='pending'``）由仓储承担；finalize 自身异常不吞、直接冒泡（交
+   worker finally 兜底）。``resume_failed`` 收调用方手上的异常或失败原文，与记账括号同经
+   :mod:`lib.billing.call_failure` 编码后落三元组。
+3. **Agent 轮次**（``record_agent_turn``）—— Agent 会话的一轮按模型各写一条终态行，费用由仓储按会话连接时取下的
+   Agent 凭证与模型目录计价，调用方不经 pending 中间态。
+
+成功通道的 backend 结果对象 union 分发集中在 ``_settlement_from_result``：text 与 audio 的用量在此
+按用量契约转成计量项用量（结算时按模型目录的价目表计价），video 实际计费时长的语义转写也在此单点完成，
+调用点成功分支不做逐字段提取。video 的计量依赖发出的请求，由调用点向视频调用通道取得后随结果一并递交。
+
+结算落库后发一条 ``usage_record / recorded`` 项目变更（走 ``project_change_hints`` 的 batch 总线，
+与任务终态事件同一条 SSE），界面据此刷新用量而不必轮询；无项目名的调用（端点试跑）不发，pending
+阶段不发。发布口经 ``publish_change`` 注入，带生产默认值。``settle_interrupted_calls`` 是启动收口
+入口：把崩溃留下的、没有存活任务的 pending 行翻成终态。
+
+``session_factory`` 注入口保留：``Ledger(session_factory=...)`` 覆盖生产三处接线
+（MediaGenerator / TextGenerator / SessionManager）与测试内存库替换需求。写侧直连
+``UsageRepository``，不经用量透传层。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import AsyncGenerator, Callable, Coroutine, Sequence
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any, assert_never
+
+from lib.agent.credential_tiers import AgentPricing
+from lib.backends.providers import CallPurpose, CallStatus, CallType
+from lib.billing.call_failure import CallFailure, classify_call_failure
+from lib.billing.metering import Usage, token_usage
+from lib.db import safe_session_factory
+from lib.db.base import DEFAULT_USER_ID
+from lib.db.repositories.usage_repo import AgentModelCall, SettlementInput, UsageRepository
+from lib.project.project_change_hints import emit_project_change_batch
+
+logger = logging.getLogger(__name__)
+
+#: 记账结算的项目变更条目：entity_type 与项目实体、任务终态都区分开。
+USAGE_RECORD_ENTITY_TYPE = "usage_record"
+USAGE_RECORD_ACTION = "recorded"
+
+#: 结算事件的发布口。生产默认是项目变更批次总线（与任务终态事件同一条 SSE），测试注入替身。
+ProjectChangePublisher = Callable[[str, Sequence[dict[str, Any]]], None]
+
+
+def build_usage_record_change(call_id: int, status: CallStatus) -> dict[str, Any]:
+    """把一次结算转成项目变更 dict。
+
+    与任务终态事件同构，是**刷新信号**而非实体变更：``important=False`` + ``focus=None``，
+    消费方据此只重拉用量数据，不弹通知、不触发聚焦跳转。``status`` 让消费方不必回查即可
+    判断这次结算是成功还是失败。
+    """
+    return {
+        "entity_type": USAGE_RECORD_ENTITY_TYPE,
+        "action": USAGE_RECORD_ACTION,
+        "entity_id": str(call_id),
+        # label 不进通知文案（important=False），仅作日志/调试可读标识。
+        "label": str(call_id),
+        "focus": None,
+        "important": False,
+        "status": str(status),
+    }
+
+
+def _settlement_from_result(call_type: CallType, result: Any, *, usage: Usage | None = None) -> SettlementInput:
+    """成功通道 union 分发：按 call_type 从 backend 结果对象提取计费维度。
+
+    语义转写的唯一落点：
+    - image 的调用通道已按用量契约上报计量项与选择维度，原样转交；
+    - text 的总输入与三项缓存 → 互不重叠的 token 计量项（未缓存输入 = 总输入 − 缓存读 − 两档缓存写），
+      降级链上的多次请求各出一份，计费时逐次落上下文档；
+    - audio 的原始文本 → 计量用的 ``text``（字符数由计算器按价目表统计），另把字符数记进 ``usage_tokens``；
+      按 token 计价的 TTS 再带输入 token 与输出音频 token；
+    - video 的 ``duration_seconds``（backend 回报的实际计费/生成时长）→
+      ``billed_duration_seconds``（覆盖 start_call 时的请求时长）；``usage`` 是视频调用通道按用量契约上报的
+      这次请求的计量。
+
+    四种 backend 结果对象结构独立、无共同基类，按调用点已知的 ``call_type`` 显式分发。
+    """
+    if call_type == "image":
+        return SettlementInput(
+            usage_tokens=result.usage_tokens,
+            image_input_tokens=result.image_input_tokens,
+            image_output_tokens=result.image_output_tokens,
+            text_input_tokens=result.text_input_tokens,
+            text_output_tokens=result.text_output_tokens,
+            # 调用通道按用量契约上报（自定义供应商的包装层在被包装的通道不报时按通用口径补上）。
+            usage=(result.usage,) if result.usage is not None else (),
+        )
+    if call_type == "audio":
+        return SettlementInput(
+            usage_tokens=len(result.text),
+            input_tokens=result.input_tokens,
+            output_tokens=result.audio_output_tokens,
+            usage=(
+                Usage(
+                    quantities=token_usage(
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.audio_output_tokens,
+                        output_meter="audio_output_tokens",
+                    ),
+                    text=result.text,
+                ),
+            ),
+        )
+    if call_type == "video":
+        return SettlementInput(
+            usage_tokens=result.usage_tokens,
+            generate_audio=result.generate_audio,
+            billed_duration_seconds=result.duration_seconds,
+            usage=(usage,) if usage is not None else (),
+        )
+    if call_type == "text":
+        return SettlementInput(
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cache_read_tokens=result.cache_read_tokens,
+            cache_write_5m_tokens=result.cache_write_5m_tokens,
+            cache_write_1h_tokens=result.cache_write_1h_tokens,
+            # 没有任何计量（未追踪）时仍按一次零用量的请求计价。
+            usage=tuple(
+                Usage(
+                    quantities=token_usage(
+                        input_tokens=request.input_tokens,
+                        output_tokens=request.output_tokens,
+                        cache_read_tokens=request.cache_read_tokens,
+                        cache_write_5m_tokens=request.cache_write_5m_tokens,
+                        cache_write_1h_tokens=request.cache_write_1h_tokens,
+                    )
+                )
+                for request in result.request_tokens()
+            )
+            or (Usage(),),
+        )
+    assert_never(call_type)
+
+
+class LedgerCall:
+    """记账括号句柄：块内暴露 ``call_id``，``success(result)`` 递交 backend 结果对象。"""
+
+    def __init__(self, call_id: int, *, call_type: CallType) -> None:
+        self.call_id = call_id
+        self._call_type: CallType = call_type
+        self._settlement: SettlementInput | None = None
+
+    def success(self, result: Any, *, usage: Usage | None = None) -> None:
+        """声明成功并递交 backend 结果对象；union 分发在此完成，结算在括号退出时执行。
+
+        ``usage`` 只用于 video：调用通道按用量契约上报的这次请求的计量。
+        """
+        self._settlement = _settlement_from_result(self._call_type, result, usage=usage)
+
+
+class Ledger:
+    def __init__(self, *, session_factory=None, publish_change: ProjectChangePublisher = emit_project_change_batch):
+        self._session_factory = session_factory or safe_session_factory
+        self._publish_change = publish_change
+
+    def _publish(self, project_name: str, changes: Sequence[dict[str, Any]]) -> None:
+        """发一批结算事件。项目名为空（端点试跑）不发；发布失败不向上抛——账已落库，
+        事件只是实时性优化，消费方有轮询兜底。"""
+        if not project_name or not changes:
+            return
+        try:
+            self._publish_change(project_name, changes)
+        except Exception:
+            logger.exception("发送记账结算项目事件失败 project=%s count=%d", project_name, len(changes))
+
+    def _emit_recorded(self, project_name: str, call_id: int, status: CallStatus) -> None:
+        """结算落库后推一条 ``usage_record / recorded``；pending 阶段不发。"""
+        self._publish(project_name, [build_usage_record_change(call_id, status)])
+
+    @asynccontextmanager
+    async def record(
+        self,
+        *,
+        project_name: str,
+        call_type: CallType,
+        model: str,
+        provider: str,
+        prompt: str | None = None,
+        resolution: str | None = None,
+        duration_seconds: int | None = None,
+        aspect_ratio: str | None = None,
+        generate_audio: bool | None = None,
+        user_id: str = DEFAULT_USER_ID,
+        segment_id: str | None = None,
+        output_path: str | None = None,
+        task_id: str | None = None,
+        purpose: CallPurpose | None = None,
+        session_id: str | None = None,
+        inputs: object | None = None,
+    ) -> AsyncGenerator[LedgerCall]:
+        """记账括号：进入落 pending，块内 ``call.success(result)`` 声明成功。
+
+        退出语义：``CancelledError`` 结算为 cancelled（零费用）后原样重抛；``Exception`` 翻
+        failed 后原样重抛；正常退出但未声明成功抛 ``RuntimeError``；声明成功则以 backend 结果
+        对象结算翻 success。取消落在进入时的开账写入上，同样等 pending 行落库后结算为 cancelled 再重抛。
+        """
+        from lib.project.task_project_claim import current_task_project_claim
+
+        claim = current_task_project_claim()
+        if task_id is None and claim is not None and claim.project_name == project_name:
+            task_id = claim.task_id
+        call_id = await self._open_call(
+            project_name=project_name,
+            call_type=call_type,
+            model=model,
+            prompt=prompt,
+            resolution=resolution,
+            duration_seconds=duration_seconds,
+            aspect_ratio=aspect_ratio,
+            generate_audio=generate_audio,
+            provider=provider,
+            user_id=user_id,
+            segment_id=segment_id,
+            task_id=task_id,
+            purpose=purpose,
+            session_id=session_id,
+            inputs=inputs,
+        )
+        call = LedgerCall(call_id, call_type=call_type)
+        try:
+            yield call
+        except asyncio.CancelledError:
+            # 用户取消：零费用结算为 cancelled 后原样重抛，不留 pending 也不计入失败率。
+            # （CancelledError 在 3.11+ 继承 BaseException 天然不进 except Exception，此处显式
+            #  声明为契约，而非依赖隐式继承副作用。）
+            if await self._finish_cancelled(call_id):
+                self._emit_recorded(project_name, call_id, CallStatus.CANCELLED)
+            raise
+        except Exception as exc:
+            # 自动翻 failed（错误信息截断由仓储承担）后原样重抛。
+            if await self._finish_failed(call_id, exc):
+                self._emit_recorded(project_name, call_id, CallStatus.FAILED)
+            raise
+        else:
+            if call._settlement is None:
+                raise RuntimeError(f"ledger.record(call_type={call_type!r}) 正常退出但未调用 call.success(result)")
+            try:
+                await self._finish_success(call_id, call._settlement, output_path=output_path)
+            except asyncio.CancelledError:
+                # 取消打在成功结算的写入上：结果已经拿到、费用已经产生，写入在护盾内落地后
+                # 事件照发，取消再继续传播——这条调用是真实花费，不能按零费用取消结算。
+                self._emit_recorded(project_name, call_id, CallStatus.SUCCESS)
+                raise
+            except Exception as exc:
+                # 成功结算写入本身失败：不留永久 pending，尝试翻 failed 后原样重抛。
+                if await self._finish_failed(call_id, exc):
+                    self._emit_recorded(project_name, call_id, CallStatus.FAILED)
+                raise
+            self._emit_recorded(project_name, call_id, CallStatus.SUCCESS)
+
+    async def pending_call_id_for_task(self, task_id: str) -> int | None:
+        """按任务反查它那条待结算的调用行 id，供续跑与派发终态补账定位。"""
+        async with self._session_factory() as session:
+            return await UsageRepository(session).find_pending_call_id_by_task_id(task_id)
+
+    async def resume_success(self, *, call_id: int, result: Any, usage: Usage | None = None) -> int:
+        """resume 成功补账：按 call_id 精准翻 pending → success，返回受影响行数（幂等 0/1）。
+
+        ``usage`` 是视频调用通道按续跑请求上报的计量。finalize 自身异常不吞、直接冒泡（交 worker finally
+        兜底），避免 ApiCall 永久卡 pending。
+        """
+        settlement = _settlement_from_result("video", result, usage=usage)
+        return await self._finalize(call_id=call_id, status=CallStatus.SUCCESS, settlement=settlement)
+
+    async def resume_failed(self, *, call_id: int, failure: BaseException | str | None = None) -> int:
+        """resume 过期/失败补账：翻 pending → failed，零费用不重扣（幂等 0/1）。
+
+        ``failure`` 收调用方手上的异常或失败原文，经 ``classify_call_failure`` 编码后落库：
+        ``error_message`` 是原文，认得出的类型再落 ``error_code`` / ``error_params``。不给
+        失败信息时那三列保持空——记录表对这些行只有一个「失败」状态，没有短语也没有原文。
+        """
+        return await self._finalize(
+            call_id=call_id,
+            status=CallStatus.FAILED,
+            settlement=SettlementInput(cost_amount=0.0),
+            failure=None if failure is None else classify_call_failure(failure),
+        )
+
+    async def resume_cancelled(self, *, call_id: int) -> int:
+        """resume 取消补账：翻 pending → cancelled，零费用不重扣（幂等 0/1）。"""
+        return await self._finalize(
+            call_id=call_id, status=CallStatus.CANCELLED, settlement=SettlementInput(cost_amount=0.0)
+        )
+
+    async def record_provider_response(self, *, call_id: int, body: object) -> None:
+        """覆盖保存该供应商调用最后一次收到的响应体。"""
+        async with self._session_factory() as session:
+            await UsageRepository(session).update_last_provider_response(call_id, body)
+
+    async def record_agent_turn(
+        self,
+        *,
+        project_name: str,
+        session_id: str,
+        prompt: str | None,
+        user_id: str,
+        provider: str,
+        pricing: AgentPricing,
+        status: CallStatus,
+        calls: Sequence[AgentModelCall],
+    ) -> None:
+        """Agent 会话的一轮：每个模型写一条终态行，按会话连接时取下的 Agent 凭证倍率与条目绑定计价（docs/adr/0102）。
+
+        没有用量的轮次不写。写入整体不被取消打断：取消到达时先等这一轮的行落库、事件发出，再传播取消。
+        """
+        if not calls:
+            return
+        await self._settle(
+            self._write_agent_turn(
+                project_name=project_name,
+                session_id=session_id,
+                prompt=prompt,
+                user_id=user_id,
+                provider=provider,
+                pricing=pricing,
+                status=status,
+                calls=list(calls),
+            )
+        )
+
+    async def _write_agent_turn(self, *, project_name: str, status: CallStatus, **kwargs: Any) -> None:
+        async with self._session_factory() as session:
+            call_ids = await UsageRepository(session).record_agent_turn(
+                project_name=project_name, status=status, **kwargs
+            )
+        self._publish(project_name, [build_usage_record_change(call_id, status) for call_id in call_ids])
+
+    async def settle_interrupted_calls(self, *, taskless_started_before: datetime | None) -> int:
+        """服务启动收口：把没有存活任务的 pending 调用行翻成终态，返回翻掉的行数。
+
+        进程崩溃会把「已落 pending、未结算」的调用行永远留在 pending。分流规则、零费用口径与
+        ``taskless_started_before`` 的含义由仓储承担（见 ``UsageRepository.settle_interrupted_pending_calls``），
+        这里只按项目分组把结算事件发出去，让正开着的界面立刻看到这些行不再悬着。
+        """
+        async with self._session_factory() as session:
+            settled = await UsageRepository(session).settle_interrupted_pending_calls(
+                taskless_started_before=taskless_started_before
+            )
+
+        by_project: dict[str, list[dict[str, Any]]] = {}
+        for item in settled:
+            if not item.project_name:
+                continue
+            by_project.setdefault(item.project_name, []).append(build_usage_record_change(item.call_id, item.status))
+        for project_name, changes in by_project.items():
+            self._publish(project_name, changes)
+        return len(settled)
+
+    async def _start_call(self, **kwargs: Any) -> int:
+        async with self._session_factory() as session:
+            return await UsageRepository(session).start_call(**kwargs)
+
+    async def _open_call(self, *, project_name: str, **kwargs: Any) -> int:
+        """记账括号的开账写入不被取消打断：取消到达时先等 pending 行落库拿到 id，按 cancelled
+        结算后再把取消继续传播。
+
+        仓储先提交再回读 id，取消若打在两者之间，行已落库而括号还没进 ``try``，调用方也拿不到
+        id，只能等启动收口。护盾模式同 ``_settle``。
+        """
+        opening = asyncio.ensure_future(self._start_call(project_name=project_name, **kwargs))
+        try:
+            return await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            call_id = await asyncio.shield(opening)
+            if await self._finish_cancelled(call_id):
+                self._emit_recorded(project_name, call_id, CallStatus.CANCELLED)
+            raise
+
+    async def _settle[T](self, write: Coroutine[Any, Any, T]) -> T:
+        """结算写入不被取消打断：取消到达时先等写入落地，再把取消继续传播。
+
+        括号内的三种终态写入都经此处。写入跑在独立 task 里，外层被取消只中断等待，
+        不中断写入；等到写入完成才重抛，行不会因取消时机停在 pending。
+        """
+        pending = asyncio.ensure_future(write)
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            if not pending.done():
+                await asyncio.shield(pending)
+            raise
+
+    async def _finish_success(self, call_id: int, settlement: SettlementInput, *, output_path: str | None) -> None:
+        await self._settle(self._write_success(call_id, settlement, output_path=output_path))
+
+    async def _write_success(self, call_id: int, settlement: SettlementInput, *, output_path: str | None) -> None:
+        async with self._session_factory() as session:
+            await UsageRepository(session).finish_call(
+                call_id, status=CallStatus.SUCCESS, settlement=settlement, output_path=output_path
+            )
+
+    async def _finish_failed(self, call_id: int, exc: BaseException) -> bool:
+        """翻 failed；返回是否真的写进去了（写失败时不发事件）。
+
+        记账失败不吞原异常：写入失败仅记日志，原异常继续冒泡。分类也在 try 内：它读的是异常
+        自身的属性，真抛出来也只该跟写入失败同样处理，不该顶替原异常冒出去。
+        """
+        try:
+            failure = classify_call_failure(exc)
+            await self._settle(self._write_failed(call_id, failure))
+        except Exception:
+            logger.exception("ledger 失败分支记账写入自身失败 call_id=%s（原异常照常重抛）", call_id)
+            return False
+        return True
+
+    async def _write_failed(self, call_id: int, failure: CallFailure) -> None:
+        async with self._session_factory() as session:
+            await UsageRepository(session).finish_call(
+                call_id,
+                status=CallStatus.FAILED,
+                settlement=SettlementInput(),
+                error_message=failure.error_message,
+                error_code=failure.error_code,
+                error_params=failure.error_params,
+            )
+
+    async def _finish_cancelled(self, call_id: int) -> bool:
+        """翻 cancelled；返回是否真的写进去了（写失败时不发事件）。
+
+        取消分支同样不吞 CancelledError：写入失败仅记日志，取消照常重抛
+        （行留 pending，交由取消方的兜底结算或启动收口）。
+        """
+        try:
+            await self._settle(self._write_cancelled(call_id))
+        except Exception:
+            logger.exception("ledger 取消分支记账写入自身失败 call_id=%s（取消照常重抛）", call_id)
+            return False
+        return True
+
+    async def _write_cancelled(self, call_id: int) -> None:
+        async with self._session_factory() as session:
+            await UsageRepository(session).finish_call(
+                call_id, status=CallStatus.CANCELLED, settlement=SettlementInput(cost_amount=0.0)
+            )
+
+    async def _finalize(
+        self, *, call_id: int, status: CallStatus, settlement: SettlementInput, failure: CallFailure | None = None
+    ) -> int:
+        async with self._session_factory() as session:
+            repo = UsageRepository(session)
+            affected = await repo.finalize_pending_by_call_id(
+                call_id=call_id,
+                status=status,
+                settlement=settlement,
+                error_message=None if failure is None else failure.error_message,
+                error_code=None if failure is None else failure.error_code,
+                error_params=None if failure is None else failure.error_params,
+            )
+            # 事件要带项目名，而 resume 链路只有 call_id；幂等命中 0 行时不查也不发。
+            project_name = await repo.get_call_project_name(call_id) if affected else ""
+        self._emit_recorded(project_name, call_id, status)
+        return affected

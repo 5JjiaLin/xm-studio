@@ -1,0 +1,9 @@
+{
+  "method": "GET",
+  "path": "/api/v1/projects/demo/production/feedback/objects",
+  "status": 200,
+  "body": {
+    "objects": {},
+    "reviews": {}
+  }
+}

@@ -1,0 +1,474 @@
+import { ChevronRight } from "lucide-react";
+import { useState } from "react";
+import type { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
+import { Link } from "wouter";
+
+import { EpisodeItemRefView } from "@/components/shared/episode-item/EpisodeItemRef";
+import { cn } from "cn";
+
+import { API } from "@/api";
+import { providerSettingsPath } from "@/app-routes";
+import { Button } from "@/components/ui/button";
+import { InfoTip, InfoTipContent, InfoTipTrigger } from "@/components/ui/info-tip";
+import { Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import type { UsageRecordDetail } from "@/types";
+import { formatCurrencyAmount } from "@/utils/cost-format";
+import { formatShortDateTime } from "@/utils/date-format";
+import { itemIdsInEpisodeText } from "@/utils/episode-display";
+import {
+  MEDIA_META,
+  STATUS_LABEL_KEYS,
+  STATUS_TEXT_CLASSES,
+  failurePhraseKey,
+  formatDurationMs,
+  providerLabelResolver,
+  purposeKey,
+  targetParts,
+  unpricedReasonKey,
+  usageProjectLabel,
+} from "./usage-record-format";
+
+interface UsageRecordDetailModalProps {
+  recordId: number;
+  detail: UsageRecordDetail | null;
+  loading: boolean;
+  failed: boolean;
+  providerLabel: ReturnType<typeof providerLabelResolver>;
+  onClose: () => void;
+}
+
+function Group({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="flex flex-col gap-2 border-t border-border pt-4 first:border-t-0 first:pt-0">
+      <h3 className="text-xs font-medium text-muted-foreground">{title}</h3>
+      {children}
+    </section>
+  );
+}
+
+/** 供应商模型 Sheet 的地址：自定义供应商的记录写的是 `custom-<id>`。 */
+function providerModelPath(provider: string, model: string): string {
+  const custom = /^custom-(\d+)$/.exec(provider);
+  return custom
+    ? providerSettingsPath({ custom: Number(custom[1]), model })
+    : providerSettingsPath({ preset: provider, model });
+}
+
+/**
+ * 调用的模型：供应商还在供应商设置里时打开它的 Sheet；Agent 凭证、已删除的自定义供应商、不再内置的旧值与没有供应商的
+ * 旧记录只显示模型名。
+ */
+function ProviderModelLink({ provider, model, linkable }: { provider: string; model: string; linkable: boolean }) {
+  const { t } = useTranslation("dashboard");
+  if (!linkable) return model;
+  return (
+    <Link
+      href={providerModelPath(provider, model)}
+      title={t("usage_open_provider_model")}
+      className="text-primary underline-offset-4 hover:underline focus-visible:underline"
+    >
+      {model}
+    </Link>
+  );
+}
+
+function Field({
+  label,
+  value,
+  hint,
+  indent = false,
+}: {
+  label: string;
+  value: ReactNode;
+  /** 悬停、点按标签或按 Enter/Space 时显示的说明。 */
+  hint?: string;
+  /** 从属于上一行的明细（如缓存写入的两档）。 */
+  indent?: boolean;
+}) {
+  return (
+    <div className="flex gap-3 py-0.5 text-sm">
+      <span className={cn("w-24 shrink-0 text-muted-foreground", indent && "pl-3")}>
+        {hint ? (
+          <InfoTip>
+            <InfoTipTrigger render={<button type="button" className="cursor-help underline decoration-dotted underline-offset-4" />}>{label}</InfoTipTrigger>
+            <InfoTipContent title={label}>{hint}</InfoTipContent>
+          </InfoTip>
+        ) : (
+          label
+        )}
+      </span>
+      <span className="num min-w-0 flex-1 text-xs break-words whitespace-pre-wrap text-subtle-foreground">{value}</span>
+    </div>
+  );
+}
+
+/** 项目内相对路径的缩略图；文件已不存在时换成占位，历史记录也能照常打开。 */
+function Thumbnail({
+  projectName,
+  path,
+  caption,
+}: {
+  projectName: string;
+  path: string;
+  caption?: string | null;
+}) {
+  const { t } = useTranslation("dashboard");
+  const [broken, setBroken] = useState(false);
+  return (
+    <figure className="flex w-24 flex-col gap-1">
+      {broken ? (
+        <div className="grid size-24 place-items-center rounded-md border border-border text-xs text-muted-foreground">
+          {t("usage_image_missing")}
+        </div>
+      ) : (
+        <img
+          // 用量记录引用的图可能已被覆盖或删除，这里没有指纹可用：显式不带版本，走服务端的协商缓存
+          src={API.getFileUrl(projectName, path, null, { width: 320 })}
+          alt={itemIdsInEpisodeText(caption ?? path)}
+          onError={() => setBroken(true)}
+          className="size-24 rounded-md border border-border object-cover"
+        />
+      )}
+      {caption && <figcaption className="truncate text-xs text-muted-foreground">{itemIdsInEpisodeText(caption)}</figcaption>}
+    </figure>
+  );
+}
+
+function InputsGroup({ detail }: { detail: UsageRecordDetail }) {
+  const { t } = useTranslation("dashboard");
+  const inputs = detail.inputs;
+  const images = inputs?.reference_images ?? [];
+  const referenceAudio = inputs?.reference_audio ?? [];
+  const params = inputs?.parameters;
+  const hasAny =
+    Boolean(detail.prompt) ||
+    images.length > 0 ||
+    Boolean(inputs?.start_image) ||
+    Boolean(inputs?.end_image) ||
+    referenceAudio.length > 0 ||
+    Boolean(inputs?.voice) ||
+    Boolean(params && Object.keys(params).length > 0) ||
+    detail.resolution !== null ||
+    detail.aspect_ratio !== null ||
+    detail.duration_seconds !== null;
+
+  if (!hasAny) {
+    return <p className="text-sm text-muted-foreground">{t("usage_detail_empty")}</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {detail.prompt && (
+        <p className="max-w-[40em] rounded-md border border-border p-3 text-sm leading-relaxed whitespace-pre-wrap text-subtle-foreground">
+          {detail.prompt}
+        </p>
+      )}
+      {(images.length > 0 || inputs?.start_image || inputs?.end_image) && (
+        <div className="flex flex-wrap gap-3">
+          {images.map((image) => (
+            <Thumbnail
+              key={image.path}
+              projectName={detail.project_name}
+              path={image.path}
+              caption={image.label ?? image.role ?? null}
+            />
+          ))}
+          {inputs?.start_image && (
+            <Thumbnail
+              projectName={detail.project_name}
+              path={inputs.start_image}
+              caption={t("usage_field_first_frame")}
+            />
+          )}
+          {inputs?.end_image && (
+            <Thumbnail
+              projectName={detail.project_name}
+              path={inputs.end_image}
+              caption={t("usage_field_last_frame")}
+            />
+          )}
+        </div>
+      )}
+      <div>
+        {inputs?.voice && <Field label={t("usage_field_voice")} value={inputs.voice} />}
+        {referenceAudio.length > 0 && (
+          <Field
+            label={t("usage_field_reference_audio")}
+            value={referenceAudio.map(itemIdsInEpisodeText).join("\n")}
+          />
+        )}
+        {detail.resolution && (
+          <Field label={t("usage_field_resolution")} value={detail.resolution} />
+        )}
+        {detail.aspect_ratio && (
+          <Field label={t("usage_field_aspect_ratio")} value={detail.aspect_ratio} />
+        )}
+        {detail.duration_seconds !== null && (
+          <Field
+            label={t("usage_field_duration_seconds")}
+            value={`${detail.duration_seconds} s`}
+          />
+        )}
+        {params && Object.keys(params).length > 0 && (
+          <Field
+            label={t("usage_field_params")}
+            value={JSON.stringify(params, null, 2)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+const formatTokens = (value: number) => value.toLocaleString();
+
+function UsageGroup({ detail }: { detail: UsageRecordDetail }) {
+  const { t } = useTranslation("dashboard");
+  const {
+    input_tokens: input,
+    output_tokens: output,
+    usage_tokens: total,
+    cache_read_tokens: cacheRead,
+    cache_write_5m_tokens: write5m,
+    cache_write_1h_tokens: write1h,
+  } = detail;
+  if (input === null && output === null && total === null) {
+    return <p className="text-sm text-muted-foreground">{t("usage_detail_empty")}</p>;
+  }
+  const hasWrite = write5m !== null || write1h !== null;
+  // 记录里的总输入含缓存读写；对外的「输入」只指没有命中也没有写入缓存的那部分。
+  const uncachedInput =
+    input === null ? null : Math.max(0, input - (cacheRead ?? 0) - (write5m ?? 0) - (write1h ?? 0));
+  const show = (value: number | null) => (value === null ? "—" : formatTokens(value));
+  return (
+    <div>
+      {input !== null && (
+        <>
+          <Field
+            label={t("usage_field_input_tokens")}
+            hint={t("usage_field_input_tokens_hint")}
+            value={show(uncachedInput)}
+          />
+          <Field label={t("usage_field_cache_read_tokens")} value={show(cacheRead)} />
+          <Field
+            label={t("usage_field_cache_write_tokens")}
+            value={hasWrite ? formatTokens((write5m ?? 0) + (write1h ?? 0)) : "—"}
+          />
+          {hasWrite && (
+            <>
+              <Field indent label={t("usage_field_cache_write_5m_tokens")} value={show(write5m)} />
+              <Field indent label={t("usage_field_cache_write_1h_tokens")} value={show(write1h)} />
+            </>
+          )}
+        </>
+      )}
+      {output !== null && <Field label={t("usage_field_output_tokens")} value={formatTokens(output)} />}
+      {total !== null && <Field label={t("usage_field_total_tokens")} value={formatTokens(total)} />}
+    </div>
+  );
+}
+
+export function UsageRecordDetailModal({
+  recordId,
+  detail,
+  loading,
+  failed,
+  providerLabel,
+  onClose,
+}: UsageRecordDetailModalProps) {
+  const { t, i18n } = useTranslation(["dashboard", "common"]);
+  const [rawOpen, setRawOpen] = useState(false);
+
+  const media = detail ? MEDIA_META[detail.media_type] : null;
+  const phraseKey = failurePhraseKey(detail?.error_code ?? null);
+  const retryAfter = detail?.error_params?.retry_after_seconds;
+  const failureStatus = detail?.error_params?.status;
+  const purpose = purposeKey(detail?.purpose ?? null);
+  const target = detail ? targetParts(detail.segment_id, detail.segment_ref ?? null, detail.purpose, t) : null;
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <DialogContent size="lg">
+        <DialogHeader>
+          <DialogTitle>
+            {target ? (
+              <span className="flex min-w-0 items-baseline gap-2">
+                {target.item && (
+                  <EpisodeItemRefView
+                    item={{ ...target.item, excerpt: "" }}
+                    kind={target.item.kind}
+                    projectName={detail?.project_name}
+                    className="shrink-0 self-center"
+                  />
+                )}
+                {target.prefix && <span className="num shrink-0">{target.prefix}</span>}
+                <span className="min-w-0 break-words">
+                  {target.item?.excerpt ? `${target.name} · ${target.item.excerpt}` : target.name}
+                </span>
+              </span>
+            ) : (
+              t("dashboard:usage_detail_title", { id: recordId })
+            )}
+          </DialogTitle>
+          {detail && media ? (
+            <DialogDescription>
+              <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <span className="inline-flex items-center gap-1.5">
+                  <media.Icon aria-hidden="true" className={cn("size-3.5", media.iconClass)} />
+                  {t(`dashboard:${media.labelKey}`)}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span>{usageProjectLabel(detail.project_name, t, i18n.language, detail.project_title)}</span>
+                <span aria-hidden="true">·</span>
+                <span className={STATUS_TEXT_CLASSES[detail.status]}>
+                  {t(`dashboard:${STATUS_LABEL_KEYS[detail.status]}`)}
+                </span>
+              </span>
+            </DialogDescription>
+          ) : (
+            <DialogDescription className="sr-only">{t("dashboard:usage_detail_title", { id: recordId })}</DialogDescription>
+          )}
+        </DialogHeader>
+
+        <DialogBody>
+          <div className="flex flex-col gap-4">
+            {loading && <p className="text-sm text-muted-foreground">{t("common:loading")}</p>}
+            {failed && <p className="text-sm text-destructive">{t("dashboard:usage_load_failed")}</p>}
+
+            {detail && (
+              <>
+                {detail.status === "failed" && (
+                  <Group title={t("dashboard:usage_detail_group_failure")}>
+                    <div className="flex flex-col gap-1 rounded-md border border-destructive/20 bg-destructive/10 p-3">
+                      <p className="text-sm text-destructive">
+                        {phraseKey
+                          ? t(`dashboard:${phraseKey}`)
+                          : (detail.error_message ?? t("dashboard:usage_detail_empty"))}
+                      </p>
+                      {phraseKey && detail.error_message && (
+                        <p className="num text-xs break-words text-muted-foreground">{detail.error_message}</p>
+                      )}
+                      {typeof retryAfter === "number" && (
+                        <Field label={t("dashboard:usage_field_retry_after")} value={`${retryAfter} s`} />
+                      )}
+                      {typeof failureStatus === "number" && (
+                        <Field label={t("dashboard:usage_field_http_status")} value={failureStatus} />
+                      )}
+                    </div>
+                  </Group>
+                )}
+
+                <Group title={t("dashboard:usage_detail_group_inputs")}>
+                  <InputsGroup detail={detail} />
+                </Group>
+
+                <Group title={t("dashboard:usage_detail_group_call")}>
+                  <div>
+                    <Field label={t("dashboard:usage_col_provider")} value={providerLabel(detail.provider)} />
+                    <Field
+                      label={t("dashboard:usage_col_model")}
+                      value={
+                        detail.model ? (
+                          <ProviderModelLink
+                            provider={detail.provider}
+                            model={detail.model}
+                            linkable={detail.provider_in_settings}
+                          />
+                        ) : (
+                          "—"
+                        )
+                      }
+                    />
+                    <Field
+                      label={t("dashboard:usage_field_purpose")}
+                      value={purpose ? t(`dashboard:${purpose}`) : "—"}
+                    />
+                    <Field label={t("dashboard:usage_field_task")} value={detail.task_type ?? "—"} />
+                    <Field
+                      label={t("dashboard:usage_field_started")}
+                      value={formatShortDateTime(detail.started_at) ?? "—"}
+                    />
+                    <Field
+                      label={t("dashboard:usage_field_finished")}
+                      value={formatShortDateTime(detail.finished_at) ?? "—"}
+                    />
+                    <Field label={t("dashboard:usage_col_duration")} value={formatDurationMs(detail.duration_ms, t)} />
+                  </div>
+                </Group>
+
+                <Group title={t("dashboard:usage_detail_group_output")}>
+                  {detail.output_path ? (
+                    <div className="flex items-start gap-3">
+                      {detail.media_type === "image" && (
+                        <Thumbnail projectName={detail.project_name} path={detail.output_path} />
+                      )}
+                      <Field label={t("dashboard:usage_field_file")} value={itemIdsInEpisodeText(detail.output_path)} />
+                    </div>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">{t("dashboard:usage_detail_empty")}</p>
+                  )}
+                </Group>
+
+                {detail.media_type === "text" && (
+                  <Group title={t("dashboard:usage_detail_group_usage")}>
+                    <UsageGroup detail={detail} />
+                  </Group>
+                )}
+
+                <Group title={t("dashboard:usage_col_cost")}>
+                  {detail.cost_amount === null ? (
+                    <>
+                      <p className="text-xl text-foreground">{t("dashboard:usage_cost_unpriced")}</p>
+                      <Field
+                        label={t("dashboard:usage_field_unpriced_reason")}
+                        value={t(`dashboard:${unpricedReasonKey(detail.unpriced_reason)}`)}
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <p className="num text-xl text-foreground">
+                        {formatCurrencyAmount(detail.currency, detail.cost_amount, { maximumFractionDigits: 4 })}
+                        <span className="ml-1.5 text-xs text-muted-foreground">{detail.currency}</span>
+                      </p>
+                      <p className="text-xs text-muted-foreground">{t("dashboard:usage_detail_cost_hint")}</p>
+                    </>
+                  )}
+                </Group>
+
+                <section className="flex flex-col gap-2 border-t border-border pt-3">
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    className="self-start"
+                    aria-expanded={rawOpen}
+                    onClick={() => setRawOpen((prev) => !prev)}
+                  >
+                    <ChevronRight
+                      aria-hidden="true"
+                      data-icon="inline-start"
+                      className={cn("transition-transform", rawOpen && "rotate-90")}
+                    />
+                    {t("dashboard:usage_detail_group_raw")}
+                  </Button>
+                  {rawOpen && (
+                    <pre className="relative max-h-64 overflow-auto rounded-md border border-border p-3 text-xs leading-normal text-muted-foreground">
+                      {detail.last_provider_response
+                        ? JSON.stringify(detail.last_provider_response, null, 2)
+                        : t("dashboard:usage_detail_empty")}
+                    </pre>
+                  )}
+                </section>
+              </>
+            )}
+          </div>
+        </DialogBody>
+      </DialogContent>
+    </Dialog>
+  );
+}

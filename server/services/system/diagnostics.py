@@ -1,0 +1,157 @@
+"""收集脱敏后的系统诊断信息，供 /system/logs/download 打包。"""
+
+from __future__ import annotations
+
+import os
+import platform
+import sys
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+from lib.infra.data_root_layout import DataRootLayout
+from lib.infra.logging_utils import redact_value
+
+_UNAVAILABLE = "<unavailable: {exc}>"
+
+
+def _safe(fn: Callable[[], object], label: str) -> str:
+    try:
+        return str(fn())
+    except Exception as exc:
+        return _UNAVAILABLE.format(exc=f"{label}: {exc}")
+
+
+def _app_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("arcreel")
+    except PackageNotFoundError:
+        pass
+
+    try:
+        import tomllib
+
+        from lib.infra.env_init import PROJECT_ROOT
+
+        with (PROJECT_ROOT / "pyproject.toml").open("rb") as f:
+            data = tomllib.load(f)
+        return str(data.get("project", {}).get("version", "<unknown>"))
+    except Exception:
+        return "<unknown>"
+
+
+def _python_version() -> str:
+    return sys.version.replace("\n", " ")
+
+
+def _os_info() -> str:
+    return platform.platform()
+
+
+def _layout_location(pick: Callable[[DataRootLayout], Path]) -> Callable[[], str]:
+    return lambda: str(pick(DataRootLayout.current()))
+
+
+_DATA_ROOT_FIELDS: list[tuple[str, Callable[[], object]]] = [
+    ("Data directory", _layout_location(lambda layout: layout.root)),
+    ("Projects directory", _layout_location(lambda layout: layout.projects_dir)),
+    ("Deleted projects directory", _layout_location(lambda layout: layout.deleted_projects_dir)),
+    ("Global assets directory", _layout_location(lambda layout: layout.global_assets_dir)),
+    ("User data directory", _layout_location(lambda layout: layout.users_dir)),
+    ("Log directory", _layout_location(lambda layout: layout.log_dir)),
+    ("Vertex credentials directory", _layout_location(lambda layout: layout.vertex_keys_dir)),
+    ("Trial runs directory", _layout_location(lambda layout: layout.trial_runs_dir)),
+    ("Runtime state directory", _layout_location(lambda layout: layout.runtime_dir)),
+]
+
+
+_SENSITIVE_QUERY_KEYS = frozenset({"password", "passwd", "pwd", "token", "secret", "api_key", "apikey"})
+
+
+def _db_url() -> str:
+    from lib.db.engine import get_database_url
+
+    raw = get_database_url()
+    try:
+        parsed = urlparse(raw)
+        netloc = parsed.netloc
+        if parsed.username or parsed.password:
+            user = redact_value(parsed.username) if parsed.username else ""
+            host = parsed.hostname or ""
+            port = f":{parsed.port}" if parsed.port else ""
+            netloc = f"{user}:••@{host}{port}" if parsed.password else f"{user}@{host}{port}"
+
+        query = parsed.query
+        if query:
+            masked = [
+                (k, "••" if k.lower() in _SENSITIVE_QUERY_KEYS else v)
+                for k, v in parse_qsl(query, keep_blank_values=True)
+            ]
+            query = urlencode(masked)
+
+        return urlunparse(parsed._replace(netloc=netloc, query=query))
+    except Exception:
+        # 脱敏失败时回退到原始字符串，避免诊断包完全失败；调用方 _safe 会再兜一层。
+        return raw
+
+
+def _log_level() -> str:
+    return os.environ.get("LOG_LEVEL", "INFO")
+
+
+def _sandbox_status() -> str:
+    from server.app import check_sandbox_available
+
+    return "enabled" if check_sandbox_available() else "disabled"
+
+
+def _providers() -> str:
+    from lib.config.registry import PROVIDER_REGISTRY
+
+    ids = sorted(PROVIDER_REGISTRY.keys())
+    return ", ".join(ids) if ids else "<none>"
+
+
+def _catalog_dataset_version() -> str:
+    from lib.catalog import query
+
+    return query.official_data().dataset_version
+
+
+def _catalog_last_sync() -> str:
+    from lib.catalog.official_sync import sync_status
+
+    at = sync_status().last_success_at
+    return at.isoformat() if at is not None else "<never>"
+
+
+def _catalog_sync_error() -> str:
+    from lib.catalog.official_sync import sync_status
+
+    return sync_status().last_error or "<none>"
+
+
+def collect_diagnostics(*, app_version: Callable[[], object] | None = None) -> str:
+    """返回脱敏的 plain-text 诊断报告。任一字段失败用 <unavailable> 占位，整体不抛。"""
+    fields: list[tuple[str, Callable[[], object]]] = [
+        ("App version", app_version or _app_version),
+        ("Python", _python_version),
+        ("OS", _os_info),
+        *_DATA_ROOT_FIELDS,
+        ("Database URL", _db_url),
+        ("Log level", _log_level),
+        ("Sandbox", _sandbox_status),
+        ("Registered providers", _providers),
+        ("Catalog dataset version", _catalog_dataset_version),
+        ("Catalog last sync", _catalog_last_sync),
+        ("Catalog last sync error", _catalog_sync_error),
+        ("Report generated", lambda: datetime.now(UTC).isoformat()),
+    ]
+
+    lines = ["ArcReel diagnostics", "=" * 40]
+    for label, fn in fields:
+        lines.append(f"{label}: {_safe(fn, label)}")
+    return "\n".join(lines) + "\n"

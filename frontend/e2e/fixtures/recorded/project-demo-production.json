@@ -1,0 +1,10 @@
+{
+  "method": "GET",
+  "path": "/api/v1/projects/demo/episodes/1/production",
+  "status": 200,
+  "body": {
+    "episode": 1,
+    "status": "idle",
+    "stage": null
+  }
+}

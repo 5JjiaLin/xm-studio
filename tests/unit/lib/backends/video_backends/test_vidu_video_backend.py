@@ -1,0 +1,532 @@
+"""ViduVideoBackend 单元测试 — 重点：endpoint 选择、duration 强制、resolution 原样透传、build_request 字段。"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from arcreel_market_core.video_backend_contract import VideoCapabilityError, VideoGenerationRequest
+from lib.backends.providers import PROVIDER_VIDU
+from lib.backends.video_backends.vidu import (
+    _DURATION_RULES,
+    _ENDPOINT_MODELS,
+    _ENDPOINTS_WITH_ASPECT_RATIO,
+    _KNOWN_MODELS,
+    _Q3_MODELS,
+    DEFAULT_MODEL,
+    ViduVideoBackend,
+    _coerce_duration,
+)
+from lib.catalog import query as catalog
+from tests.fakes import bounded_poll_clock
+
+
+@pytest.fixture
+def video_output_path(tmp_path: Path) -> Path:
+    return tmp_path / "out.mp4"
+
+
+class TestBackendBasics:
+    def test_default_model_is_q3_turbo(self):
+        backend = ViduVideoBackend(api_key="test-key")
+        assert backend.name == PROVIDER_VIDU
+        assert backend.model == DEFAULT_MODEL == "viduq3-turbo"
+
+    def test_max_reference_images_seven(self):
+        backend = ViduVideoBackend(api_key="test-key")
+        assert backend.video_capabilities.max_reference_images == 7
+
+    def test_max_reference_images_zero_for_non_reference2video_model(self):
+        # viduq3-pro-fast 支持 /img2video，但不在 /start-end2video、/reference2video 白名单内——
+        # last_frame/reference_images 应为 False，max_reference_images 随 reference_images 归零，
+        # 避免展示层声称支持尾帧/参考图但生成期必然 RuntimeError。
+        backend = ViduVideoBackend(api_key="test-key", model="viduq3-pro-fast")
+        caps = backend.video_capabilities
+        assert caps.first_frame is True
+        assert caps.last_frame is False
+        assert caps.max_reference_images == 0
+        assert caps.max_reference_images == 0
+
+    def test_last_frame_true_for_start_end2video_model(self):
+        # viduq3-turbo 在 /start-end2video 白名单内，last_frame 应为 True。
+        backend = ViduVideoBackend(api_key="test-key", model="viduq3-turbo")
+        assert backend.video_capabilities.last_frame is True
+
+    async def test_marks_resubmit_unsafe_after_task_creation(self, video_output_path: Path):
+        backend = ViduVideoBackend(api_key="test-key")
+        client = MagicMock()
+        client_context = MagicMock()
+        client_context.__aenter__ = AsyncMock(return_value=client)
+        client_context.__aexit__ = AsyncMock(return_value=False)
+        resubmit_unsafe = MagicMock()
+        request = VideoGenerationRequest(
+            prompt="x",
+            output_path=video_output_path,
+            on_provider_resubmit_unsafe=resubmit_unsafe,
+        )
+
+        with (
+            patch("lib.backends.video_backends.vidu.create_vidu_client", return_value=client_context),
+            patch.object(backend, "_create_task", new=AsyncMock(return_value={"task_id": "job-1"})),
+            patch(
+                "lib.backends.video_backends.vidu.poll_with_retry",
+                new=AsyncMock(side_effect=RuntimeError("poll failed")),
+            ),
+            pytest.raises(RuntimeError, match="poll failed"),
+        ):
+            await backend.generate(request)
+
+        resubmit_unsafe.assert_called_once_with()
+
+
+class TestEndpointSelection:
+    def _backend(self, model: str = "viduq3-turbo") -> ViduVideoBackend:
+        return ViduVideoBackend(api_key="test-key", model=model)
+
+    def test_text_only_picks_text2video(self, video_output_path: Path):
+        backend = self._backend()
+        req = VideoGenerationRequest(prompt="x", output_path=video_output_path)
+        assert backend._select_endpoint(req) == "/text2video"
+
+    def test_start_image_picks_img2video(self, tmp_path: Path, video_output_path: Path):
+        backend = self._backend()
+        start = tmp_path / "start.png"
+        start.write_bytes(b"x")
+        req = VideoGenerationRequest(prompt="x", output_path=video_output_path, start_image=start)
+        assert backend._select_endpoint(req) == "/img2video"
+
+    def test_start_and_end_image_picks_start_end2video(self, tmp_path: Path, video_output_path: Path):
+        backend = self._backend()
+        start, end = tmp_path / "s.png", tmp_path / "e.png"
+        for p in (start, end):
+            p.write_bytes(b"x")
+        req = VideoGenerationRequest(prompt="x", output_path=video_output_path, start_image=start, end_image=end)
+        assert backend._select_endpoint(req) == "/start-end2video"
+
+    def test_reference_images_take_priority(self, tmp_path: Path, video_output_path: Path):
+        """有 refs 时即使带 start_image 也应走 reference2video（依实现：refs 先判）。"""
+        backend = self._backend()
+        ref = tmp_path / "ref.png"
+        ref.write_bytes(b"x")
+        req = VideoGenerationRequest(prompt="x", output_path=video_output_path, reference_images=[ref])
+        assert backend._select_endpoint(req) == "/reference2video"
+
+
+class TestEndpointModelMatrix:
+    """端点支持模型集合是 spec，钉死，避免误改。"""
+
+    def test_reference2video_does_not_include_q3_pro(self):
+        # q3-pro 在 reference2video 上不被官方文档列出
+        assert "viduq3-pro" not in _ENDPOINT_MODELS["/reference2video"]
+
+    def test_reference2video_includes_q3_turbo(self):
+        assert "viduq3-turbo" in _ENDPOINT_MODELS["/reference2video"]
+
+    def test_text2video_excludes_vidu2_0(self):
+        assert "vidu2.0" not in _ENDPOINT_MODELS["/text2video"]
+
+    def test_aspect_ratio_only_text2video_and_reference2video(self):
+        assert frozenset({"/text2video", "/reference2video"}) == _ENDPOINTS_WITH_ASPECT_RATIO
+
+    def test_q3_models_set(self):
+        assert "viduq3-turbo" in _Q3_MODELS
+        assert "viduq3-pro" in _Q3_MODELS
+        assert "vidu2.0" not in _Q3_MODELS
+
+
+class TestCoerceDuration:
+    def test_q3_turbo_text2video_passthrough_in_range(self):
+        assert _coerce_duration("viduq3-turbo", "/text2video", 8) == 8
+
+    def test_q3_turbo_text2video_clamps_to_nearest(self):
+        # range 1..16；超过 16 应取 16
+        assert _coerce_duration("viduq3-turbo", "/text2video", 30) == 16
+
+    def test_vidu2_0_img2video_only_4_or_8(self):
+        assert _coerce_duration("vidu2.0", "/img2video", 12) == 8
+        assert _coerce_duration("vidu2.0", "/img2video", 5) == 4
+        assert _coerce_duration("vidu2.0", "/img2video", 4) == 4
+        assert _coerce_duration("vidu2.0", "/img2video", 8) == 8
+
+    def test_vidu2_0_reference2video_only_4(self):
+        assert _coerce_duration("vidu2.0", "/reference2video", 8) == 4
+
+    def test_q1_text2video_only_5(self):
+        assert _coerce_duration("viduq1", "/text2video", 10) == 5
+
+    def test_q3_reference2video_min_3(self):
+        # range 3..16；请求 1 → 取最近 3
+        assert _coerce_duration("viduq3", "/reference2video", 1) == 3
+
+    def test_unknown_combination_passthrough(self):
+        # 表里无项时不强校（透传 / 兜底 5）
+        assert _coerce_duration("unknown-model", "/img2video", 9) == 9
+        assert _coerce_duration("unknown-model", "/img2video", None) == 5
+
+
+class TestBuildRequest:
+    """_build_request 是核心串联函数：endpoint 选择 + duration/resolution/aspect_ratio/audio 字段拼装。"""
+
+    @patch("lib.backends.video_backends.vidu.image_to_data_uri")
+    def test_text2video_body_minimal(self, mock_data_uri, video_output_path: Path):
+        backend = ViduVideoBackend(api_key="test-key", model="viduq3-turbo")
+        req = VideoGenerationRequest(
+            prompt="hello",
+            output_path=video_output_path,
+            aspect_ratio="9:16",
+            duration_seconds=8,
+            resolution="720p",
+        )
+        endpoint, body = backend._build_request(req)
+
+        assert endpoint == "/text2video"
+        assert body["model"] == "viduq3-turbo"
+        assert body["prompt"] == "hello"
+        assert body["duration"] == 8
+        assert body["resolution"] == "720p"
+        assert body["aspect_ratio"] == "9:16"
+        # q3 默认透传 audio
+        assert body["audio"] is True
+        # text2video 不携带 images
+        assert "images" not in body
+
+    @pytest.mark.parametrize(
+        ("model", "resolution"),
+        [("viduq1", "720p"), ("viduq3-turbo", "4K"), ("unknown-model", "9000p")],
+    )
+    def test_resolution_is_sent_as_requested(self, video_output_path: Path, model: str, resolution: str):
+        """档位以模型目录条目为准：不在任何本地表里的值也原样下发，由上游拒绝（docs/adr/0104）。"""
+        backend = ViduVideoBackend(api_key="test-key", model=model)
+        req = VideoGenerationRequest(prompt="x", output_path=video_output_path, resolution=resolution)
+
+        _, body = backend._build_request(req)
+
+        assert body["resolution"] == resolution
+
+    def test_resolution_omitted_when_not_requested(self, video_output_path: Path):
+        backend = ViduVideoBackend(api_key="test-key", model="viduq3-turbo")
+
+        _, body = backend._build_request(VideoGenerationRequest(prompt="x", output_path=video_output_path))
+
+        assert "resolution" not in body
+
+    def test_metered_usage_reports_requested_resolution(self, video_output_path: Path):
+        request = VideoGenerationRequest(prompt="x", output_path=video_output_path, resolution="720p")
+
+        assert ViduVideoBackend.metered_usage("viduq1", request).dimensions["resolution"] == "720p"
+
+    @patch("lib.backends.video_backends.vidu.image_to_data_uri", new=MagicMock(return_value="data:image/png;base64,XX"))
+    def test_img2video_passes_one_image_no_aspect_ratio(self, tmp_path: Path, video_output_path: Path):
+        start = tmp_path / "s.png"
+        start.write_bytes(b"x")
+
+        backend = ViduVideoBackend(api_key="test-key", model="viduq3-turbo")
+        req = VideoGenerationRequest(
+            prompt="x",
+            output_path=video_output_path,
+            start_image=start,
+            aspect_ratio="9:16",  # 应被丢弃
+            duration_seconds=5,
+        )
+        endpoint, body = backend._build_request(req)
+
+        assert endpoint == "/img2video"
+        assert body["images"] == ["data:image/png;base64,XX"]
+        # img2video 不接受 aspect_ratio
+        assert "aspect_ratio" not in body
+
+    @patch("lib.backends.video_backends.vidu.image_to_data_uri", new=MagicMock(return_value="data:image/png;base64,XX"))
+    def test_reference2video_with_q3_turbo(self, tmp_path: Path, video_output_path: Path):
+        ref1, ref2 = tmp_path / "r1.png", tmp_path / "r2.png"
+        for p in (ref1, ref2):
+            p.write_bytes(b"x")
+
+        backend = ViduVideoBackend(api_key="test-key", model="viduq3-turbo")
+        req = VideoGenerationRequest(
+            prompt="x",
+            output_path=video_output_path,
+            reference_images=[ref1, ref2],
+            aspect_ratio="9:16",
+            duration_seconds=5,
+        )
+        endpoint, body = backend._build_request(req)
+
+        assert endpoint == "/reference2video"
+        assert len(body["images"]) == 2
+        # reference2video 接受 aspect_ratio
+        assert body["aspect_ratio"] == "9:16"
+        # range 3..16，5 透传
+        assert body["duration"] == 5
+
+    def test_reference2video_with_q3_pro_raises_model_mismatch(self, tmp_path: Path, video_output_path: Path):
+        ref = tmp_path / "r.png"
+        ref.write_bytes(b"x")
+
+        backend = ViduVideoBackend(api_key="test-key", model="viduq3-pro")
+        req = VideoGenerationRequest(
+            prompt="x",
+            output_path=video_output_path,
+            reference_images=[ref],
+            duration_seconds=5,
+        )
+        with pytest.raises(RuntimeError, match="不支持"):
+            backend._build_request(req)
+
+    def test_non_q3_model_does_not_send_audio(self, video_output_path: Path):
+        backend = ViduVideoBackend(api_key="test-key", model="vidu2.0")
+        # vidu2.0 走 img2video，不能 text2video
+        # 这里直接用 reference2video 路径需 ref；走 start-image 演示
+        # 用 monkeypatch 跳过 image_to_data_uri
+        # 简化：直接构造一个 text2video 请求验证 audio 不写入
+        # —— 但 vidu2.0 不在 text2video 集合里，应该 raise
+        req = VideoGenerationRequest(prompt="x", output_path=video_output_path, duration_seconds=4)
+        with pytest.raises(RuntimeError, match="不支持"):
+            backend._build_request(req)
+
+
+class TestUnsendableInputsRejected:
+    """端点发不出的输入在组装请求时拒绝，不静默丢弃。"""
+
+    @staticmethod
+    def _image(tmp_path: Path, name: str) -> Path:
+        p = tmp_path / name
+        p.write_bytes(b"x")
+        return p
+
+    @pytest.mark.parametrize("frame", ["start_image", "end_image"])
+    def test_reference_images_with_frame(self, tmp_path: Path, video_output_path: Path, frame: str):
+        req = VideoGenerationRequest(
+            prompt="x",
+            output_path=video_output_path,
+            reference_images=[self._image(tmp_path, "r.png")],
+            **{frame: self._image(tmp_path, "f.png")},
+        )
+        with pytest.raises(VideoCapabilityError) as exc:
+            ViduVideoBackend(api_key="test-key", model="viduq3-turbo")._build_request(req)
+        assert exc.value.code == "video_reference_images_with_frames_unsupported"
+
+    def test_reference_images_over_limit(self, tmp_path: Path, video_output_path: Path):
+        refs = [self._image(tmp_path, f"r{i}.png") for i in range(8)]
+        req = VideoGenerationRequest(prompt="x", output_path=video_output_path, reference_images=refs)
+        with pytest.raises(VideoCapabilityError) as exc:
+            ViduVideoBackend(api_key="test-key", model="viduq3-turbo")._build_request(req)
+        assert exc.value.code == "video_reference_images_exceeded"
+        assert exc.value.params == {"model": "viduq3-turbo", "limit": 7, "count": 8}
+
+    def test_end_frame_without_start_frame(self, tmp_path: Path, video_output_path: Path):
+        req = VideoGenerationRequest(
+            prompt="x", output_path=video_output_path, end_image=self._image(tmp_path, "e.png")
+        )
+        with pytest.raises(VideoCapabilityError) as exc:
+            ViduVideoBackend(api_key="test-key", model="viduq3-turbo")._build_request(req)
+        assert exc.value.code == "video_end_image_requires_start_image"
+
+    def test_reference_audio(self, tmp_path: Path, video_output_path: Path):
+        req = VideoGenerationRequest(
+            prompt="x", output_path=video_output_path, reference_audio_files=[self._image(tmp_path, "a.mp3")]
+        )
+        with pytest.raises(VideoCapabilityError) as exc:
+            ViduVideoBackend(api_key="test-key", model="viduq3-turbo")._build_request(req)
+        assert exc.value.code == "video_reference_audio_unsupported"
+
+
+class TestPromptLength:
+    """prompt 超限一律拒绝，不再客户端静默截断。"""
+
+    def test_reference_only_model_declares_narrow_limit(self):
+        """viduq3 只跑 /reference2video，静态声明取该端点的窄值。"""
+        assert ViduVideoBackend.video_capabilities_for_model("viduq3").max_prompt_chars == 2000
+
+    def test_multi_endpoint_model_declares_wide_limit(self):
+        """viduq3-turbo 还能跑 t2v/i2v，静态声明取宽值——否则会误拒其合法的长 prompt。"""
+        assert ViduVideoBackend.video_capabilities_for_model("viduq3-turbo").max_prompt_chars == 5000
+
+    def test_unknown_model_declares_wide_limit(self):
+        """未登记 model（中转自定义命名）取宽值：能力不明时误拒是更糟的降级。"""
+        assert ViduVideoBackend.video_capabilities_for_model("proxy-x").max_prompt_chars == 5000
+
+    def test_reference2video_over_limit_raises(self, video_output_path: Path):
+        backend = ViduVideoBackend(api_key="k", model="viduq3-turbo")
+        req = VideoGenerationRequest(
+            prompt="字" * 2001,
+            output_path=video_output_path,
+            duration_seconds=8,
+            reference_images=[Path("a.png")],
+        )
+        with pytest.raises(VideoCapabilityError) as exc:
+            backend._build_request(req)
+
+        assert exc.value.code == "video_prompt_too_long"
+        assert exc.value.params == {
+            "provider": PROVIDER_VIDU,
+            "model": "viduq3-turbo",
+            "limit": 2000,
+            "count": 2001,
+        }
+
+    @patch("lib.backends.video_backends.vidu.image_to_data_uri", new=MagicMock(return_value="data:image/png;base64,XX"))
+    def test_reference2video_at_limit_passes_untruncated(self, video_output_path: Path):
+        backend = ViduVideoBackend(api_key="k", model="viduq3-turbo")
+        prompt = "字" * 2000
+        req = VideoGenerationRequest(
+            prompt=prompt,
+            output_path=video_output_path,
+            duration_seconds=8,
+            reference_images=[Path("a.png")],
+        )
+        _endpoint, body = backend._build_request(req)
+
+        assert body["prompt"] == prompt
+
+    def test_text2video_allows_longer_than_reference_limit(self, video_output_path: Path):
+        """端点上限按端点各算：t2v 的 5000 不受 /reference2video 的 2000 牵连。"""
+        backend = ViduVideoBackend(api_key="k", model="viduq3-turbo")
+        req = VideoGenerationRequest(prompt="字" * 3000, output_path=video_output_path, duration_seconds=8)
+        _endpoint, body = backend._build_request(req)
+
+        assert len(body["prompt"]) == 3000
+
+
+class TestDurationRulesSpec:
+    """直接钉死 _DURATION_RULES 关键条目，避免误改。"""
+
+    def test_q1_text2video_only_5(self):
+        assert _DURATION_RULES[("viduq1", "/text2video")] == [5]
+
+    def test_q2_img2video_up_to_10(self):
+        """/img2video 官方为 1–10；1–8 是 /start-end2video 的值，两端点不同。"""
+        assert _DURATION_RULES[("viduq2-pro", "/img2video")] == list(range(1, 11))
+        assert _DURATION_RULES[("viduq2-turbo", "/img2video")] == list(range(1, 11))
+        assert _DURATION_RULES[("viduq2-pro-fast", "/img2video")] == list(range(1, 11))
+        assert _DURATION_RULES[("viduq2-pro", "/start-end2video")] == list(range(1, 9))
+
+    def test_vidu2_0_img2video_only_4_8(self):
+        assert _DURATION_RULES[("vidu2.0", "/img2video")] == [4, 8]
+
+    def test_vidu2_0_reference2video_only_4(self):
+        assert _DURATION_RULES[("vidu2.0", "/reference2video")] == [4]
+
+    def test_q3_turbo_text2video_full_range(self):
+        assert _DURATION_RULES[("viduq3-turbo", "/text2video")] == list(range(1, 17))
+
+
+class TestRegistryBackendConsistency:
+    """目录里 vidu 视频条目的模型事实与 backend 执行期表须无分歧（两侧同一份官方文档核实）。
+
+    时长表是 docs/adr/0018 允许的端点级例外，两侧只要求子集。
+    """
+
+    def _vidu2_model_info(self) -> catalog.CatalogModel:
+        model = catalog.get_model("vidu", "vidu2.0")
+        assert model is not None
+        return model
+
+    def test_reference_image_durations_matches_reference2video_rule(self):
+        model_info = self._vidu2_model_info()
+        assert model_info.reference_image_durations == _DURATION_RULES[("vidu2.0", "/reference2video")]
+
+    def test_supported_durations_covers_img2video_and_start_end2video(self):
+        model_info = self._vidu2_model_info()
+        expected_durations = set(_DURATION_RULES[("vidu2.0", "/img2video")]) | set(
+            _DURATION_RULES[("vidu2.0", "/start-end2video")]
+        )
+        assert set(model_info.supported_durations) == expected_durations
+
+    def test_duration_resolution_constraints_confines_non_720p_to_4s(self):
+        """8 秒档只出 720p——360p / 1080p 须声明仅 4 秒可选，UI 才不会给出无效的时长×分辨率组合。"""
+        model_info = self._vidu2_model_info()
+        assert model_info.duration_resolution_constraints == {"360p": [4], "1080p": [4]}
+
+    @pytest.mark.parametrize("name", sorted(_KNOWN_MODELS))
+    def test_durations_within_endpoint_rules(self, name: str):
+        """目录时长须落在端点级时长表内，否则 _coerce_duration 会把用户选的时长静默改成最近值。
+
+        端点级校正是 docs/adr/0018 允许的例外，两侧只要求子集，不要求相等。
+        """
+        model_info = catalog.get_model("vidu", name, media_type="video")
+        if model_info is None:
+            pytest.skip(f"目录未登记视频型号 {name}")
+        non_reference = {
+            d for (m, ep), ds in _DURATION_RULES.items() if m == name and ep != "/reference2video" for d in ds
+        }
+        reference = set(_DURATION_RULES.get((name, "/reference2video"), []))
+        # 只走参考生视频的型号，可选时长就是参考生视频端点的时长。
+        allowed = non_reference or reference
+        extra = set(model_info.supported_durations) - allowed
+        assert not extra, f"目录 vidu/{name} 的 supported_durations 含端点时长表外的 {sorted(extra)}"
+        extra_ref = set(model_info.reference_image_durations or []) - reference
+        assert not extra_ref, (
+            f"目录 vidu/{name} 的 reference_image_durations 含 /reference2video 时长表外的 {sorted(extra_ref)}"
+        )
+
+
+class TestCreateTask413:
+    """413 规整：_create_task 透出保留状态码的 httpx.HTTPStatusError（咽喉层据此降档）。"""
+
+    async def test_create_task_413_surfaces_httpstatuserror_no_retry(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        import httpx
+
+        request = httpx.Request("POST", "https://vidu/text2video")
+        response = httpx.Response(413, request=request, text="Request Entity Too Large")
+        err = httpx.HTTPStatusError("error 413", request=request, response=response)
+
+        resp = MagicMock()
+        resp.status_code = 413
+        resp.text = "Request Entity Too Large"
+        resp.raise_for_status = MagicMock(side_effect=err)
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=resp)
+
+        backend = ViduVideoBackend(api_key="k", model="viduq3-turbo")
+        with pytest.raises(httpx.HTTPStatusError) as ei:
+            await backend._create_task(client, "/text2video", {"model": "viduq3-turbo", "prompt": "x", "duration": 8})
+        assert ei.value.response.status_code == 413
+        # 413 非 retryable → fail-fast 单次
+        assert client.post.call_count == 1
+
+
+class TestCreateTaskAmbiguity:
+    """create 阶段按「请求是否确定送达」收窄重试，避免重复建任务 + 重复计费。"""
+
+    async def test_read_timeout_fails_fast_with_manual_retry_hint(self):
+        from unittest.mock import AsyncMock
+
+        import httpx
+
+        from lib.backends.http_status_errors import AmbiguousSubmitError
+
+        client = AsyncMock()
+        client.post = AsyncMock(side_effect=httpx.ReadTimeout("read timed out"))
+
+        backend = ViduVideoBackend(api_key="k", model="viduq3-turbo")
+        with (
+            bounded_poll_clock(),
+            pytest.raises(AmbiguousSubmitError, match="手动重试"),
+        ):
+            await backend._create_task(client, "/text2video", {"model": "viduq3-turbo", "prompt": "x", "duration": 8})
+        # 歧义态：请求可能已送达，不重试
+        assert client.post.call_count == 1
+
+    async def test_connect_error_retries(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        import httpx
+
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.json.return_value = {"task_id": "vidu-conn"}
+        client = AsyncMock()
+        client.post = AsyncMock(side_effect=[httpx.ConnectError("refused"), httpx.ConnectError("refused"), ok])
+
+        backend = ViduVideoBackend(api_key="k", model="viduq3-turbo")
+        with bounded_poll_clock():
+            data = await backend._create_task(
+                client, "/text2video", {"model": "viduq3-turbo", "prompt": "x", "duration": 8}
+            )
+        assert data["task_id"] == "vidu-conn"
+        # ConnectError 请求确定未送达，应重试
+        assert client.post.call_count == 3

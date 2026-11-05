@@ -1,0 +1,276 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Loader2, Plus } from "lucide-react";
+import { useTranslation } from "react-i18next";
+
+import { API } from "@/api";
+import { AddCredentialModal } from "@/components/agent/AddCredentialModal";
+import { CredentialList } from "@/components/agent/CredentialList";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
+import { useAppStore } from "@/stores/app-store";
+import { useConfigStatusStore } from "@/stores/config-status-store";
+import type { CatalogEntryHit } from "@/types";
+import type {
+  AgentCredential,
+  AgentCredentialTier,
+  CreateAgentCredentialRequest,
+  PresetProvider,
+  TestConnectionResponse,
+  UpdateAgentCredentialRequest,
+} from "@/types/agent-credential";
+import { errMsg, voidCall } from "@/utils/async";
+
+/**
+ * Agent 供应商列表（数据上是 Agent 凭证）。增改、删除、切换生效都是即时动作：成功以列表变化为反馈，
+ * 失败弹出提示；删除不可撤销，先经 AlertDialog 确认。
+ */
+export function CredentialsSection() {
+  const { t } = useTranslation("dashboard");
+
+  const [credentials, setCredentials] = useState<AgentCredential[]>([]);
+  const [presets, setPresets] = useState<PresetProvider[]>([]);
+  const [customSentinelId, setCustomSentinelId] = useState("__custom__");
+  const [addModalOpen, setAddModalOpen] = useState(false);
+  // 每次打开新建弹窗换一个 key，弹窗重挂载，不带上一轮的草稿与诊断结果
+  const [addSession, setAddSession] = useState(0);
+  const [busyCredId, setBusyCredId] = useState<number | null>(null);
+  // 档位绑定按 Agent 供应商分桶：不同供应商上的请求可以同时在途，一个结束不放开另一个。
+  const [tierBusyIds, setTierBusyIds] = useState<ReadonlySet<number>>(() => new Set());
+  const [testResult, setTestResult] = useState<TestConnectionResponse | null>(null);
+  const [testedCredId, setTestedCredId] = useState<number | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<AgentCredential | null>(null);
+  const [deletingCred, setDeletingCred] = useState(false);
+  const [editingCred, setEditingCred] = useState<AgentCredential | null>(null);
+
+  const loadController = useRef<AbortController | null>(null);
+  const loadCreds = useCallback(async () => {
+    loadController.current?.abort();
+    const controller = new AbortController();
+    loadController.current = controller;
+    try {
+      const [c, p] = await Promise.all([API.listAgentCredentials({ signal: controller.signal }), API.listAgentPresetProviders({ signal: controller.signal })]);
+      if (controller.signal.aborted) return;
+      setCredentials(c.credentials);
+      setPresets(p.providers);
+      setCustomSentinelId(p.custom_sentinel_id);
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      useAppStore.getState().pushToast(errMsg(err), "error");
+    }
+  }, []);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- mount 时异步拉取 Agent 供应商后回写，属于受控的初始化加载
+    void loadCreds();
+    return () => loadController.current?.abort();
+  }, [loadCreds]);
+
+  const afterChange = useCallback(async () => {
+    await loadCreds();
+    voidCall(useConfigStatusStore.getState().refresh());
+  }, [loadCreds]);
+
+  const handleCreate = useCallback(
+    async (req: CreateAgentCredentialRequest) => {
+      await API.createAgentCredential(req);
+      await afterChange();
+    },
+    [afterChange],
+  );
+
+  const handleUpdate = useCallback(
+    async (req: CreateAgentCredentialRequest) => {
+      if (editingCred == null) return;
+      const patch: UpdateAgentCredentialRequest = {
+        display_name: req.display_name,
+        base_url: req.base_url,
+        model: req.model,
+        haiku_model: req.haiku_model,
+        sonnet_model: req.sonnet_model,
+        opus_model: req.opus_model,
+        subagent_model: req.subagent_model,
+        multiplier: req.multiplier,
+      };
+      if (req.api_key) patch.api_key = req.api_key;
+      await API.updateAgentCredential(editingCred.id, patch);
+      await afterChange();
+    },
+    [editingCred, afterChange],
+  );
+
+  const handleActivate = useCallback(
+    async (id: number) => {
+      setBusyCredId(id);
+      try {
+        await API.activateAgentCredential(id);
+        await afterChange();
+      } catch (err) {
+        useAppStore.getState().pushToast(errMsg(err), "error");
+      } finally {
+        setBusyCredId(null);
+      }
+    },
+    [afterChange],
+  );
+
+  const handleTest = useCallback(async (id: number) => {
+    setBusyCredId(id);
+    setTestResult(null);
+    setTestedCredId(id);
+    try {
+      setTestResult(await API.testAgentCredential(id));
+    } catch (err) {
+      useAppStore.getState().pushToast(errMsg(err), "error");
+    } finally {
+      setBusyCredId(null);
+    }
+  }, []);
+
+  // 绑定与解除绑定的响应是更新后的整条凭证，直接换进列表，不重新拉取。
+  const changeTierBinding = useCallback(async (id: number, change: () => Promise<AgentCredential>) => {
+    setTierBusyIds((prev) => new Set(prev).add(id));
+    try {
+      const updated = await change();
+      setCredentials((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+    } catch (err) {
+      useAppStore.getState().pushToast(errMsg(err), "error");
+    } finally {
+      setTierBusyIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  }, []);
+
+  const handleBindTier = useCallback(
+    (id: number, tier: AgentCredentialTier, entry: CatalogEntryHit) =>
+      changeTierBinding(id, () => API.bindAgentCredentialTier(id, tier, `${entry.maker}/${entry.name}`)),
+    [changeTierBinding],
+  );
+
+  const handleUnbindTier = useCallback(
+    (id: number, tier: AgentCredentialTier) =>
+      changeTierBinding(id, () => API.unbindAgentCredentialTier(id, tier)),
+    [changeTierBinding],
+  );
+
+  const confirmDelete = useCallback(async () => {
+    if (deleteTarget == null) return;
+    setDeletingCred(true);
+    try {
+      await API.deleteAgentCredential(deleteTarget.id);
+      await afterChange();
+      setDeleteTarget(null);
+    } catch (err) {
+      useAppStore.getState().pushToast(errMsg(err), "error");
+    } finally {
+      setDeletingCred(false);
+    }
+  }, [deleteTarget, afterChange]);
+
+  return (
+    <section aria-labelledby="agent-providers-title" className="flex flex-col gap-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex min-w-0 flex-col gap-1">
+          <h3 id="agent-providers-title" className="text-base font-medium">
+            {t("agent_credentials")}
+          </h3>
+          <p className="text-sm text-muted-foreground">{t("agent_providers_desc")}</p>
+        </div>
+        <Button
+          variant="outline"
+          onClick={() => {
+            setAddSession((n) => n + 1);
+            setAddModalOpen(true);
+          }}
+          className="shrink-0"
+        >
+          <Plus aria-hidden data-icon="inline-start" />
+          {t("add_credential")}
+        </Button>
+      </div>
+
+      <CredentialList
+        credentials={credentials}
+        busyId={busyCredId}
+        testedId={testedCredId}
+        testResult={testResult}
+        onActivate={(id) => void handleActivate(id)}
+        onTest={(id) => void handleTest(id)}
+        onEdit={setEditingCred}
+        onDelete={setDeleteTarget}
+        tierBusyIds={tierBusyIds}
+        onBindTier={(id, tier, entry) => void handleBindTier(id, tier, entry)}
+        onUnbindTier={(id, tier) => void handleUnbindTier(id, tier)}
+      />
+
+      <AddCredentialModal
+        key={addSession}
+        open={addModalOpen}
+        presets={presets}
+        customSentinelId={customSentinelId}
+        onSubmit={handleCreate}
+        onClose={() => setAddModalOpen(false)}
+      />
+
+      <AddCredentialModal
+        key={editingCred?.id ?? "edit-empty"}
+        open={editingCred !== null}
+        mode="edit"
+        presets={presets}
+        customSentinelId={customSentinelId}
+        initial={
+          editingCred
+            ? {
+                preset_id: editingCred.preset_id,
+                display_name: editingCred.display_name,
+                base_url: editingCred.base_url,
+                model: editingCred.model ?? undefined,
+                haiku_model: editingCred.haiku_model ?? undefined,
+                sonnet_model: editingCred.sonnet_model ?? undefined,
+                opus_model: editingCred.opus_model ?? undefined,
+                subagent_model: editingCred.subagent_model ?? undefined,
+                multiplier: editingCred.multiplier,
+              }
+            : undefined
+        }
+        onSubmit={handleUpdate}
+        onClose={() => setEditingCred(null)}
+      />
+
+      <AlertDialog
+        open={deleteTarget !== null}
+        onOpenChange={(next) => {
+          // 删除请求在途时不响应 Esc，避免对话框先于结果消失
+          if (!next && !deletingCred) setDeleteTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("cred_delete_confirm_title")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("cred_delete_confirm", { name: deleteTarget?.display_name ?? "" })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deletingCred}>{t("common:cancel")}</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" disabled={deletingCred} onClick={() => void confirmDelete()}>
+              {deletingCred ? <Loader2 aria-hidden data-icon="inline-start" className="animate-spin" /> : null}
+              {t("cred_delete_action")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </section>
+  );
+}

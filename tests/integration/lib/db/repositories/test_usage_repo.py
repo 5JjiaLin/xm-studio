@@ -1,0 +1,1187 @@
+"""Tests for UsageRepository."""
+
+import asyncio
+import base64
+import json
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from sqlalchemy import null, select, update
+
+from lib.backends.providers import CallStatus
+from lib.billing.metering import Usage, token_usage
+from lib.db.base import DEFAULT_USER_ID, utc_now
+from lib.db.models.api_call import ApiCall
+from lib.db.models.task import Task
+from lib.db.repositories.usage_repo import (
+    MAX_BILLED_DURATION_SECONDS,
+    MAX_PROVIDER_RESPONSE_BYTES,
+    PROJECT_LEVEL_SEGMENT_KEY,
+    SettlementInput,
+    UsageCursor,
+    UsageCursorError,
+    UsageFilters,
+    UsageRepository,
+)
+
+
+async def backdate_call(session, call_id: int, *, delta: timedelta) -> None:
+    """把调用行的 started_at 改到 ``delta`` 之前，模拟长期停在 pending 的行。"""
+    await session.execute(update(ApiCall).where(ApiCall.id == call_id).values(started_at=utc_now() - delta))
+    await session.commit()
+
+
+async def stored_calls(session, project_name: str = "demo") -> list[ApiCall]:
+    """按 id 升序读回该项目落库的 api_calls 行。"""
+    stmt = select(ApiCall).where(ApiCall.project_name == project_name).order_by(ApiCall.id)
+    return list((await session.execute(stmt)).scalars().all())
+
+
+class TestUsageRepository:
+    async def test_start_and_finish_call(self, async_session):
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(
+            project_name="demo",
+            call_type="image",
+            model="gemini-3.1-flash-image-preview",
+            provider="gemini",
+            prompt="test prompt",
+            resolution="1K",
+        )
+        assert call_id > 0
+
+        await repo.finish_call(
+            call_id,
+            status="success",
+            settlement=SettlementInput(),
+            output_path="storyboards/test.png",
+        )
+
+        calls = await stored_calls(async_session)
+        assert len(calls) == 1
+        assert calls[0].status == "success"
+
+    async def test_last_provider_response_is_bounded(self, async_session):
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(project_name="demo", call_type="video", model="m", provider="gemini")
+
+        await repo.update_last_provider_response(call_id, {"payload": "x" * (MAX_PROVIDER_RESPONSE_BYTES + 1)})
+
+        stored = (await stored_calls(async_session))[0].last_provider_response
+        assert isinstance(stored, dict)
+        assert stored["truncated"] is True
+        assert len(json.dumps(stored, ensure_ascii=False).encode()) < MAX_PROVIDER_RESPONSE_BYTES
+
+    async def test_non_ascii_response_is_bounded_by_what_gets_persisted(self, async_session):
+        """量的必须是 JSON 列真正写出去的那份文本。
+
+        JSON 列按 ensure_ascii=True 序列化，非 ASCII escape 成 \\uXXXX；按 ensure_ascii=False
+        量体积，一段表情符号能量出 60 KiB 却写出 180 KiB，上限就形同虚设。
+        """
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(project_name="demo", call_type="video", model="m", provider="gemini")
+
+        # 每个表情符号 4 字节 UTF-8，escape 成两个 \uXXXX 转义序列后是 12 字节。
+        await repo.update_last_provider_response(call_id, {"payload": "🎬" * 15000})
+
+        stored = (await stored_calls(async_session))[0].last_provider_response
+        assert isinstance(stored, dict)
+        assert stored["truncated"] is True
+        assert len(json.dumps(stored).encode()) <= MAX_PROVIDER_RESPONSE_BYTES
+
+    async def test_response_just_under_the_cap_is_stored_verbatim(self, async_session):
+        """判据按 JSON 列的缺省序列化算——它带空白分隔符，比紧凑写法更占地方。"""
+        from lib.db.repositories.usage_repo import bound_provider_response
+
+        body = {"payload": "x" * (MAX_PROVIDER_RESPONSE_BYTES - 1024)}
+        assert len(json.dumps(body).encode()) <= MAX_PROVIDER_RESPONSE_BYTES
+
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(project_name="demo", call_type="video", model="m", provider="gemini")
+        await repo.update_last_provider_response(call_id, body)
+
+        assert bound_provider_response(body) == body
+        stored = (await stored_calls(async_session))[0].last_provider_response
+        assert stored == body
+
+
+class TestClassifyAssetOutputPath:
+    def test_products_bucketed_separately_from_props(self):
+        from lib.db.repositories.usage_repo import _classify_asset_output_path
+
+        assert _classify_asset_output_path("products/保温杯.png") == "products"
+        assert _classify_asset_output_path("/abs/path/products/保温杯.png") == "products"
+        assert _classify_asset_output_path("props/玉佩.png") == "props"
+        assert _classify_asset_output_path("characters/Alice.png") == "characters"
+        assert _classify_asset_output_path(None) == "other"
+
+
+class TestFinalizePendingByCallId:
+    """Resume 路径专用：按 call_id 精准翻 pending → success/failed。"""
+
+    async def test_flips_pending_to_success(self, async_session):
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(project_name="demo", call_type="video", model="m", provider="gemini")
+
+        # 显式 cost_amount=0.0 维持单元测试的确定性，绕过 auto-calc 路径
+        affected = await repo.finalize_pending_by_call_id(call_id=call_id, settlement=SettlementInput(cost_amount=0.0))
+        assert affected == 1
+
+        calls = await stored_calls(async_session)
+        assert calls[0].status == "success"
+        assert calls[0].cost_amount == 0.0
+
+    async def test_auto_calculates_cost_when_amount_omitted(self, async_session):
+        """cost_amount=None + status='success' → 按续跑请求上报的计量查价目表算实际 cost。"""
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(
+            project_name="demo",
+            call_type="video",
+            model="veo-3.1-generate-preview",
+            duration_seconds=8,
+            resolution="1080p",
+            aspect_ratio="9:16",
+            generate_audio=True,
+            provider="gemini-aistudio",
+        )
+
+        usage = Usage(quantities={"output_seconds": 8}, dimensions={"resolution": "1080p", "audio": True})
+        affected = await repo.finalize_pending_by_call_id(call_id=call_id, settlement=SettlementInput(usage=(usage,)))
+        assert affected == 1
+
+        calls = await stored_calls(async_session)
+        # (1080p, 有声) 0.40 USD/s × 8s
+        assert calls[0].status == "success"
+        assert calls[0].cost_amount == pytest.approx(3.2)
+        assert calls[0].unpriced_reason is None
+
+    async def test_builtin_video_prices_the_reported_usage(self, async_session):
+        """内置视频按调用通道上报的计量与选择维度查价目表，回报的视频 token 同时写回 ApiCall.usage_tokens。"""
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(
+            project_name="demo",
+            call_type="video",
+            model="doubao-seedance-2-0-260128",
+            duration_seconds=5,
+            resolution="1080p",
+            provider="ark",
+        )
+
+        usage = Usage(
+            quantities={"video_tokens": 246840, "output_seconds": 5, "input_images": 0, "requests": 1},
+            dimensions={"resolution": "1080p", "input_video": False},
+        )
+        affected = await repo.finalize_pending_by_call_id(
+            call_id=call_id, settlement=SettlementInput(usage_tokens=246840, usage=(usage,))
+        )
+        assert affected == 1
+
+        calls = await stored_calls(async_session)
+        assert calls[0].currency == "CNY"
+        # 1080p、无输入视频：51 CNY / 百万 token
+        assert calls[0].cost_amount == pytest.approx(246840 * 51.0 / 1_000_000)
+        assert calls[0].unpriced_reason is None
+        assert calls[0].usage_tokens == 246840, "usage_tokens 必须 UPDATE 写回 ApiCall 行"
+
+    async def test_builtin_video_without_usage_is_unpriced(self, async_session):
+        """内置视频没有上报计量时，价目表的计量项全部落空，记为未定价：不按秒数或 token 近似值猜一个金额，
+        也不静默记 0。"""
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(
+            project_name="demo",
+            call_type="video",
+            model="doubao-seedance-2-0-260128",
+            duration_seconds=8,
+            provider="ark",
+        )
+
+        affected = await repo.finalize_pending_by_call_id(call_id=call_id, settlement=SettlementInput())
+        assert affected == 1
+
+        calls = await stored_calls(async_session)
+        assert calls[0].cost_amount is None
+        assert calls[0].unpriced_reason == "missing_rate"
+
+    @pytest.mark.parametrize(
+        ("billed", "expected"),
+        [(15, 15), (0, 6), (MAX_BILLED_DURATION_SECONDS + 1, 6)],
+        ids=["reported", "non-positive", "over-limit"],
+    )
+    async def test_billed_duration_written_back_with_fallback(self, async_session, billed, expected):
+        """provider 回报的实际计费时长回写 ApiCall.duration_seconds；非正或超出合理上限（24h）的视同未提供，
+        保留请求时长（repo 写入层是全部 backend 的最后防线，防超大数值写入 DB Integer 列溢出）。"""
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(
+            project_name="demo",
+            call_type="video",
+            model="wan2.7-r2v",
+            duration_seconds=6,
+            provider="dashscope",
+        )
+
+        usage = Usage(quantities={"output_seconds": expected}, dimensions={"resolution": "720p"})
+        affected = await repo.finalize_pending_by_call_id(
+            call_id=call_id, settlement=SettlementInput(billed_duration_seconds=billed, usage=(usage,))
+        )
+        assert affected == 1
+
+        calls = await stored_calls(async_session)
+        assert calls[0].duration_seconds == expected
+        assert calls[0].cost_amount == pytest.approx(expected * 0.6)
+
+    async def test_does_not_touch_other_pending_call(self, async_session):
+        repo = UsageRepository(async_session)
+        cid_a = await repo.start_call(
+            project_name="demo", call_type="video", model="m", provider="gemini", segment_id="E1S01"
+        )
+        cid_b = await repo.start_call(
+            project_name="demo", call_type="video", model="m", provider="gemini", segment_id="E1S01"
+        )
+
+        affected = await repo.finalize_pending_by_call_id(call_id=cid_a, settlement=SettlementInput(cost_amount=0.0))
+        assert affected == 1
+
+        # 全量查询
+        calls = await stored_calls(async_session)
+        by_id = {c.id: c for c in calls}
+        assert by_id[cid_a].status == "success"
+        assert by_id[cid_b].status == "pending", "另一条 pending 不应被 touch"
+
+    async def test_idempotent_when_already_success(self, async_session):
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(project_name="demo", call_type="video", model="m", provider="gemini")
+        await repo.finish_call(call_id, status="success", settlement=SettlementInput(cost_amount=5.0, currency="USD"))
+
+        affected = await repo.finalize_pending_by_call_id(
+            call_id=call_id, settlement=SettlementInput(cost_amount=999.0)
+        )
+        assert affected == 0, "已 success 行应保持不变"
+
+        calls = await stored_calls(async_session)
+        assert calls[0].cost_amount == 5.0, "cost 未被覆写"
+
+    async def test_finalize_failed_status(self, async_session):
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(project_name="demo", call_type="video", model="m", provider="gemini")
+
+        affected = await repo.finalize_pending_by_call_id(
+            call_id=call_id, settlement=SettlementInput(), status="failed"
+        )
+        assert affected == 1
+
+        calls = await stored_calls(async_session)
+        assert calls[0].status == "failed"
+        assert calls[0].cost_amount == 0.0
+
+    async def test_unknown_call_id_returns_zero(self, async_session):
+        repo = UsageRepository(async_session)
+        affected = await repo.finalize_pending_by_call_id(call_id=99999, settlement=SettlementInput())
+        assert affected == 0
+
+    async def test_writes_the_failure_triple_when_given_one(self, async_session):
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(project_name="demo", call_type="video", model="m", provider="gemini")
+
+        affected = await repo.finalize_pending_by_call_id(
+            call_id=call_id,
+            settlement=SettlementInput(cost_amount=0.0),
+            status=CallStatus.FAILED,
+            error_message="429 too many requests",
+            error_code="rate_limited",
+            error_params={"retry_after_seconds": 30},
+        )
+        assert affected == 1
+
+        row = await async_session.get(ApiCall, call_id)
+        assert row.error_message == "429 too many requests"
+        assert row.error_code == "rate_limited"
+        assert row.error_params == {"retry_after_seconds": 30}
+
+    async def test_truncates_the_raw_failure_message_at_500(self, async_session):
+        """与 finish_call 同口径：原文列不因一段超长上游错误体撑爆。"""
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(project_name="demo", call_type="video", model="m", provider="gemini")
+
+        await repo.finalize_pending_by_call_id(
+            call_id=call_id,
+            settlement=SettlementInput(cost_amount=0.0),
+            status=CallStatus.FAILED,
+            error_message="x" * 900,
+        )
+
+        row = await async_session.get(ApiCall, call_id)
+        assert row.error_message == "x" * 500
+
+    async def test_leaves_the_failure_triple_untouched_without_one(self, async_session):
+        """success / cancelled 出口不带失败信息，那三列不该被这次 finalize 写成任何值。"""
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(project_name="demo", call_type="video", model="m", provider="gemini")
+
+        await repo.finalize_pending_by_call_id(call_id=call_id, settlement=SettlementInput(cost_amount=0.0))
+
+        row = await async_session.get(ApiCall, call_id)
+        assert (row.error_message, row.error_code, row.error_params) == (None, None, None)
+
+    async def test_writes_duration_ms(self, async_session):
+        """resume 完成的调用必须回写 duration_ms，否则记录表的耗时列与详情都读不到这次调用的时长。"""
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(project_name="demo", call_type="video", model="m", provider="gemini")
+
+        affected = await repo.finalize_pending_by_call_id(call_id=call_id, settlement=SettlementInput(cost_amount=0.0))
+        assert affected == 1
+
+        calls = await stored_calls(async_session)
+        item = calls[0]
+        # started_at 与 finished_at 同瞬间内完成；duration_ms 必须是已写入的非 None 整数
+        assert item.duration_ms is not None
+        assert item.duration_ms >= 0
+
+    async def test_settles_call_pending_for_over_int32_milliseconds(self, async_session):
+        """停机超过 24.8 天后续接：墙钟耗时超出 int4 毫秒上限，PostgreSQL 下也要写入真实耗时。"""
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(project_name="demo", call_type="video", model="m", provider="gemini")
+        await backdate_call(async_session, call_id, delta=timedelta(days=30))
+
+        affected = await repo.finalize_pending_by_call_id(call_id=call_id, settlement=SettlementInput(cost_amount=0.0))
+
+        assert affected == 1
+        row = await async_session.get(ApiCall, call_id)
+        assert row.status == "success"
+        assert row.duration_ms is not None
+        assert row.duration_ms >= 30 * 24 * 3600 * 1000
+
+    async def test_generate_audio_override_written_back(self, async_session):
+        """provider 在 submit 后可能降级/关闭音频；finalize 接受 caller 透传的 generate_audio
+        覆盖 ApiCall 行上 start_call 时的请求值（与 finish_call 同语义）。计价按调用通道上报的有声维度，与之同源。"""
+        repo = UsageRepository(async_session)
+        # start_call 时请求 generate_audio=True
+        call_id = await repo.start_call(
+            project_name="demo",
+            call_type="video",
+            model="veo-3.1-generate-preview",
+            duration_seconds=8,
+            resolution="720p",
+            generate_audio=True,
+            provider="gemini-aistudio",
+        )
+
+        # provider 实际降级到关闭音频
+        usage = Usage(quantities={"output_seconds": 8}, dimensions={"resolution": "720p", "audio": False})
+        affected = await repo.finalize_pending_by_call_id(
+            call_id=call_id, settlement=SettlementInput(generate_audio=False, usage=(usage,))
+        )
+        assert affected == 1
+
+        calls = await stored_calls(async_session)
+        assert calls[0].generate_audio is False
+        # (720p, 无声) 0.20 USD/s × 8s
+        assert calls[0].cost_amount == pytest.approx(1.6)
+
+
+class TestMultiProviderUsage:
+    async def test_ark_call_records_provider_and_tokens(self, async_session):
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(
+            project_name="demo",
+            call_type="video",
+            model="doubao-seedance-2-0-260128",
+            prompt="test",
+            resolution="720p",
+            duration_seconds=5,
+            generate_audio=True,
+            provider="ark",
+        )
+
+        await repo.finish_call(
+            call_id,
+            status="success",
+            settlement=SettlementInput(
+                usage_tokens=246840,
+                usage=(Usage(quantities={"video_tokens": 246840}, dimensions={"resolution": "720p"}),),
+            ),
+        )
+
+        calls = await stored_calls(async_session)
+        item = calls[0]
+        assert item.provider == "ark"
+        assert item.currency == "CNY"
+        assert item.usage_tokens == 246840
+        # 46.00 CNY/百万 token
+        assert item.cost_amount == pytest.approx(246840 * 46.0 / 1_000_000, rel=1e-3)
+
+    async def test_provider_neither_builtin_nor_custom_settles_unpriced(self, async_session):
+        # 供应商标识既不在注册表、也不是自定义供应商的存量行（如裸 gemini）对应不上条目，记为未定价，结算本身不报错
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(
+            project_name="demo",
+            call_type="video",
+            model="veo-3.1-generate-001",
+            provider="gemini",
+            resolution="1080p",
+            duration_seconds=8,
+            generate_audio=True,
+        )
+        usage = Usage(quantities={"output_seconds": 8}, dimensions={"resolution": "1080p", "audio": True})
+        await repo.finish_call(call_id, status="success", settlement=SettlementInput(usage=(usage,)))
+
+        item = (await stored_calls(async_session))[0]
+        assert item.provider == "gemini"
+        assert item.status == "success"
+        assert item.cost_amount is None
+        assert item.unpriced_reason == "no_entry"
+
+    async def test_builtin_call_without_reported_usage_settles_unpriced(self, async_session):
+        # 没有上报用量的内置供应商调用同样查价目表：计量项全部落空，记为未定价，不按默认模型或秒数猜
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(
+            project_name="demo", call_type="image", model="gemini-3-pro-image", provider="gemini-aistudio"
+        )
+        await repo.finish_call(call_id, status="success", settlement=SettlementInput(usage_tokens=8))
+
+        item = (await stored_calls(async_session))[0]
+        assert item.status == "success"
+        assert item.cost_amount is None
+        assert item.unpriced_reason == "missing_rate"
+
+    async def test_text_call_gemini_cost(self, async_session):
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(
+            project_name="demo",
+            call_type="text",
+            model="gemini-3-flash-preview",
+            prompt="分析小说内容",
+            provider="gemini-aistudio",
+        )
+
+        await repo.finish_call(
+            call_id,
+            status="success",
+            settlement=SettlementInput(
+                input_tokens=1000,
+                output_tokens=500,
+                usage=(Usage(quantities=token_usage(input_tokens=1000, output_tokens=500)),),
+            ),
+        )
+
+        calls = await stored_calls(async_session)
+        item = calls[0]
+        assert item.call_type == "text"
+        assert item.input_tokens == 1000
+        assert item.output_tokens == 500
+        assert item.currency == "USD"
+        # cost = (1000 * 0.50 + 500 * 3.00) / 1_000_000 = 0.002
+        assert item.cost_amount == pytest.approx((1000 * 0.50 + 500 * 3.00) / 1_000_000)
+
+    async def test_text_call_ark_cost(self, async_session):
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(
+            project_name="demo",
+            call_type="text",
+            model="doubao-seed-2-1-lite-260915",
+            prompt="分析小说内容",
+            provider="ark",
+        )
+
+        await repo.finish_call(
+            call_id,
+            status="success",
+            settlement=SettlementInput(
+                input_tokens=2000,
+                output_tokens=1000,
+                usage=(Usage(quantities=token_usage(input_tokens=2000, output_tokens=1000)),),
+            ),
+        )
+
+        calls = await stored_calls(async_session)
+        item = calls[0]
+        assert item.currency == "CNY"
+        # cost = (2000 * 0.80 + 1000 * 2.70) / 1_000_000 = 0.0043
+        assert item.cost_amount == pytest.approx((2000 * 0.80 + 1000 * 2.70) / 1_000_000)
+
+    async def test_text_call_failed_zero_cost(self, async_session):
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(
+            project_name="demo",
+            call_type="text",
+            model="gemini-3-flash-preview",
+            provider="gemini",
+        )
+
+        await repo.finish_call(
+            call_id,
+            status="failed",
+            settlement=SettlementInput(),
+            error_message="API error",
+        )
+
+        calls = await stored_calls(async_session)
+        item = calls[0]
+        assert item.cost_amount == 0.0
+
+
+BASE_TIME = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+
+
+def make_call(**overrides) -> ApiCall:
+    """一行 api_calls；未覆写的列取一组不影响筛选的中性值。"""
+    fields: dict = {
+        "project_name": "demo",
+        "call_type": "image",
+        "model": "gemini-3.1-flash-image-preview",
+        "provider": "gemini",
+        "status": CallStatus.SUCCESS,
+        "started_at": BASE_TIME,
+        "cost_amount": 0.0,
+        "currency": "USD",
+        "user_id": DEFAULT_USER_ID,
+    }
+    fields.update(overrides)
+    return ApiCall(**fields)
+
+
+def make_task(task_id: str, *, task_type: str = "image_generation") -> Task:
+    return Task(
+        task_id=task_id,
+        project_name="demo",
+        task_type=task_type,
+        media_type="image",
+        resource_id="S1",
+        status="succeeded",
+        queued_at=BASE_TIME,
+        updated_at=BASE_TIME,
+    )
+
+
+class TestUsageCursor:
+    def test_round_trips_started_at_and_id(self):
+        cursor = UsageCursor(started_at=BASE_TIME, id=42)
+        decoded = UsageCursor.decode(cursor.encode())
+        assert decoded == cursor
+
+    def test_encoded_form_is_opaque_base64(self):
+        encoded = UsageCursor(started_at=BASE_TIME, id=42).encode()
+        assert "2026" not in encoded
+        assert base64.urlsafe_b64decode(encoded.encode("ascii"))
+
+    def test_naive_started_at_encodes_as_utc(self):
+        naive = UsageCursor(started_at=BASE_TIME.replace(tzinfo=None), id=7)
+        assert UsageCursor.decode(naive.encode()).started_at == BASE_TIME
+
+    @pytest.mark.parametrize("raw", ["not-base64!!", "", base64.urlsafe_b64encode(b"{}").decode()])
+    def test_undecodable_cursor_raises(self, raw):
+        with pytest.raises(UsageCursorError):
+            UsageCursor.decode(raw)
+
+
+class TestListRecords:
+    async def test_orders_by_started_at_then_id_desc(self, async_session):
+        async_session.add_all(
+            [
+                make_call(started_at=BASE_TIME, segment_id="older"),
+                make_call(started_at=BASE_TIME + timedelta(minutes=1), segment_id="tie-a"),
+                make_call(started_at=BASE_TIME + timedelta(minutes=1), segment_id="tie-b"),
+            ]
+        )
+        await async_session.commit()
+
+        page = await UsageRepository(async_session).list_records()
+
+        # 同一 started_at 上按 id 倒序，后写入的 tie-b 排在 tie-a 之前。
+        assert [item["segment_id"] for item in page["items"]] == ["tie-b", "tie-a", "older"]
+        assert page["total"] == 3
+        assert page["next_cursor"] is None
+
+    async def test_cursor_walks_every_row_once(self, async_session):
+        async_session.add_all([make_call(started_at=BASE_TIME + timedelta(minutes=i)) for i in range(7)])
+        await async_session.commit()
+        repo = UsageRepository(async_session)
+
+        seen: list[int] = []
+        cursor = None
+        for _ in range(4):
+            page = await repo.list_records(limit=3, cursor=cursor)
+            seen.extend(item["id"] for item in page["items"])
+            assert page["total"] == 7
+            if page["next_cursor"] is None:
+                break
+            cursor = UsageCursor.decode(page["next_cursor"])
+
+        assert len(seen) == len(set(seen)) == 7
+
+    async def test_cursor_steps_over_rows_sharing_started_at(self, async_session):
+        async_session.add_all([make_call(started_at=BASE_TIME) for _ in range(4)])
+        await async_session.commit()
+        repo = UsageRepository(async_session)
+
+        first = await repo.list_records(limit=2)
+        second = await repo.list_records(limit=2, cursor=UsageCursor.decode(first["next_cursor"]))
+
+        ids = [item["id"] for item in first["items"] + second["items"]]
+        assert len(set(ids)) == 4
+        assert ids == sorted(ids, reverse=True)
+
+    async def test_next_cursor_is_none_on_last_page(self, async_session):
+        async_session.add_all([make_call(started_at=BASE_TIME + timedelta(minutes=i)) for i in range(4)])
+        await async_session.commit()
+
+        page = await UsageRepository(async_session).list_records(limit=4)
+
+        assert len(page["items"]) == 4
+        assert page["next_cursor"] is None
+
+    async def test_pending_with_task_hidden_and_taskless_pending_kept(self, async_session):
+        async_session.add(make_task("t-1"))
+        async_session.add_all(
+            [
+                make_call(status=CallStatus.PENDING, task_id="t-1", segment_id="represented-by-task"),
+                make_call(status=CallStatus.PENDING, task_id=None, segment_id="taskless"),
+                make_call(status=CallStatus.SUCCESS, task_id="t-1", segment_id="settled"),
+            ]
+        )
+        await async_session.commit()
+
+        page = await UsageRepository(async_session).list_records()
+
+        assert {item["segment_id"] for item in page["items"]} == {"taskless", "settled"}
+        assert page["total"] == 2
+
+    async def test_task_type_comes_from_tasks_and_is_none_without_task(self, async_session):
+        async_session.add(make_task("t-9", task_type="video_generation"))
+        async_session.add_all(
+            [
+                make_call(task_id="t-9", segment_id="joined"),
+                make_call(task_id="t-gone", segment_id="dangling"),
+                make_call(task_id=None, segment_id="taskless"),
+            ]
+        )
+        await async_session.commit()
+
+        page = await UsageRepository(async_session).list_records()
+        by_segment = {item["segment_id"]: item["task_type"] for item in page["items"]}
+
+        assert by_segment == {"joined": "video_generation", "dangling": None, "taskless": None}
+
+    async def test_user_id_not_projected(self, async_session):
+        async_session.add(make_call())
+        await async_session.commit()
+
+        page = await UsageRepository(async_session).list_records()
+
+        assert "user_id" not in page["items"][0]
+
+    async def test_detail_only_fields_absent_from_list(self, async_session):
+        async_session.add(make_call(prompt="full prompt", inputs={"voice": "v1"}, last_provider_response={"raw": 1}))
+        await async_session.commit()
+
+        item = (await UsageRepository(async_session).list_records())["items"][0]
+
+        assert not {"prompt", "inputs", "last_provider_response"} & set(item)
+
+
+class TestListRecordsFilters:
+    async def test_multi_select_dimensions(self, async_session):
+        async_session.add_all(
+            [
+                make_call(provider="ark", model="doubao", call_type="text", segment_id="S1"),
+                make_call(provider="grok", model="grok-image", call_type="image", segment_id="S2"),
+                make_call(provider="vidu", model="vidu-q1", call_type="video", segment_id="S3"),
+            ]
+        )
+        await async_session.commit()
+        repo = UsageRepository(async_session)
+
+        by_provider = await repo.list_records(filters=UsageFilters(providers=("ark", "vidu")))
+        by_model = await repo.list_records(filters=UsageFilters(models=("doubao", "grok-image")))
+        by_media = await repo.list_records(filters=UsageFilters(media_types=("text", "image")))
+        by_segment = await repo.list_records(segment_ids=("S2", "S3"))
+
+        assert {item["provider"] for item in by_provider["items"]} == {"ark", "vidu"}
+        assert {item["model"] for item in by_model["items"]} == {"doubao", "grok-image"}
+        assert {item["media_type"] for item in by_media["items"]} == {"text", "image"}
+        assert {item["segment_id"] for item in by_segment["items"]} == {"S2", "S3"}
+
+    async def test_status_multi_select(self, async_session):
+        async_session.add_all(
+            [
+                make_call(status=CallStatus.SUCCESS),
+                make_call(status=CallStatus.FAILED),
+                make_call(status=CallStatus.CANCELLED),
+            ]
+        )
+        await async_session.commit()
+
+        page = await UsageRepository(async_session).list_records(statuses=("failed", "cancelled"))
+
+        assert {item["status"] for item in page["items"]} == {"failed", "cancelled"}
+        assert page["total"] == 2
+
+    async def test_empty_project_name_selects_trial_runs(self, async_session):
+        async_session.add_all([make_call(project_name=""), make_call(project_name="demo")])
+        await async_session.commit()
+        repo = UsageRepository(async_session)
+
+        trials = await repo.list_records(filters=UsageFilters(project_name=""))
+        unfiltered = await repo.list_records()
+
+        assert [item["project_name"] for item in trials["items"]] == [""]
+        assert unfiltered["total"] == 2
+
+    async def test_since_until_is_half_open_on_started_at(self, async_session):
+        async_session.add_all(
+            [
+                make_call(started_at=BASE_TIME - timedelta(seconds=1), segment_id="before"),
+                make_call(started_at=BASE_TIME, segment_id="at-since"),
+                make_call(started_at=BASE_TIME + timedelta(hours=1), segment_id="at-until"),
+            ]
+        )
+        await async_session.commit()
+
+        page = await UsageRepository(async_session).list_records(
+            filters=UsageFilters(since=BASE_TIME, until=BASE_TIME + timedelta(hours=1))
+        )
+
+        assert [item["segment_id"] for item in page["items"]] == ["at-since"]
+
+    async def test_naive_bounds_are_read_as_utc(self, async_session):
+        async_session.add(make_call(started_at=BASE_TIME))
+        await async_session.commit()
+
+        page = await UsageRepository(async_session).list_records(
+            filters=UsageFilters(since=BASE_TIME.replace(tzinfo=None), until=None)
+        )
+
+        assert page["total"] == 1
+
+    async def test_total_counts_filtered_rows_not_page(self, async_session):
+        async_session.add_all([make_call(provider="ark") for _ in range(5)])
+        async_session.add_all([make_call(provider="grok") for _ in range(3)])
+        await async_session.commit()
+
+        page = await UsageRepository(async_session).list_records(filters=UsageFilters(providers=("ark",)), limit=2)
+
+        assert len(page["items"]) == 2
+        assert page["total"] == 5
+
+
+class TestGetRecord:
+    async def test_detail_carries_prompt_inputs_and_provider_response(self, async_session):
+        async_session.add(
+            make_call(
+                prompt="a very long prompt",
+                inputs={"reference_images": [{"path": "a.png", "label": "角色", "role": "reference"}]},
+                last_provider_response={"raw": "body"},
+                task_id="t-3",
+            )
+        )
+        async_session.add(make_task("t-3"))
+        await async_session.commit()
+        repo = UsageRepository(async_session)
+        record_id = (await repo.list_records())["items"][0]["id"]
+
+        detail = await repo.get_record(record_id)
+
+        assert detail is not None
+        assert detail["prompt"] == "a very long prompt"
+        assert detail["inputs"]["reference_images"][0]["path"] == "a.png"
+        assert detail["last_provider_response"] == {"raw": "body"}
+        assert detail["task_type"] == "image_generation"
+        assert "user_id" not in detail
+
+    async def test_unknown_id_returns_none(self, async_session):
+        assert await UsageRepository(async_session).get_record(999) is None
+
+    async def test_pending_row_hidden_from_list_is_still_readable_by_id(self, async_session):
+        async_session.add(make_task("t-5"))
+        async_session.add(make_call(status=CallStatus.PENDING, task_id="t-5"))
+        await async_session.commit()
+        repo = UsageRepository(async_session)
+        row_id = (await async_session.execute(select(ApiCall.id))).scalar_one()
+
+        assert (await repo.list_records())["total"] == 0
+        assert (await repo.get_record(row_id)) is not None
+
+    async def test_timestamps_are_utc_iso(self, async_session):
+        async_session.add(make_call(started_at=BASE_TIME, finished_at=BASE_TIME + timedelta(seconds=3)))
+        await async_session.commit()
+        repo = UsageRepository(async_session)
+        item = (await repo.list_records())["items"][0]
+
+        assert item["started_at"] == "2026-03-01T12:00:00+00:00"
+        assert item["finished_at"] == "2026-03-01T12:00:03+00:00"
+
+    async def test_scope_applies_to_page_count_and_detail(self, async_session):
+        class ProjectScopedUsageRepository(UsageRepository):
+            def _scope_query(self, stmt, model):
+                return stmt.where(model.project_name == "visible")
+
+        async_session.add_all(
+            [
+                make_call(project_name="visible", segment_id="in-scope"),
+                make_call(project_name="hidden", segment_id="out-of-scope"),
+            ]
+        )
+        await async_session.commit()
+        repo = ProjectScopedUsageRepository(async_session)
+        ids = {row.segment_id: row.id for row in (await async_session.execute(select(ApiCall))).scalars()}
+
+        page = await repo.list_records()
+
+        assert page["total"] == 1
+        assert [item["segment_id"] for item in page["items"]] == ["in-scope"]
+        assert await repo.get_record(ids["out-of-scope"]) is None
+
+
+class SummaryProjectScopedUsageRepository(UsageRepository):
+    """只看得到一个项目的仓储，用来验证汇总读接口的查询确实经过 ``_scope_query``。"""
+
+    def _scope_query(self, stmt, model):
+        return stmt.where(ApiCall.project_name == "visible")
+
+
+class TestSummaryQueriesRespectScope:
+    async def test_summary_rows_and_filter_options_are_scoped(self, async_session):
+        seeder = UsageRepository(async_session)
+        for project_name in ("visible", "hidden"):
+            call_id = await seeder.start_call(
+                project_name=project_name, call_type="image", model=f"{project_name}-model", provider="gemini"
+            )
+            await seeder.finish_call(call_id, status="success", settlement=SettlementInput())
+
+        scoped = SummaryProjectScopedUsageRepository(async_session)
+        rows = await scoped.fetch_summary_rows()
+        options = await scoped.fetch_usage_filter_options()
+
+        assert [row.project_name for row in rows] == ["visible"]
+        assert options.projects == ["visible"]
+        assert options.models == [("gemini", "visible-model")]
+
+    async def test_pending_rows_stay_out_of_the_projection(self, async_session):
+        repo = UsageRepository(async_session)
+        done = await repo.start_call(project_name="demo", call_type="image", model="m", provider="gemini")
+        await repo.finish_call(done, status="success", settlement=SettlementInput())
+        await repo.start_call(project_name="demo", call_type="image", model="m", provider="gemini")
+
+        rows = await repo.fetch_summary_rows()
+        assert [row.id for row in rows] == [done]
+
+
+class TestNullCostReadPaths:
+    """cost_amount 为 NULL 表示未定价：读路径不报错，NULL 不进合计，也不与 0 混为一谈。"""
+
+    async def _seed_mixed(self, async_session) -> None:
+        async_session.add_all(
+            [
+                make_call(segment_id="S1", cost_amount=null(), unpriced_reason="no_price"),
+                make_call(segment_id="S1", cost_amount=0.0),
+                make_call(segment_id="S1", cost_amount=1.25),
+                make_call(segment_id="S1", cost_amount=0.75),
+                make_call(segment_id="S2", cost_amount=null()),
+                make_call(segment_id=None, cost_amount=null(), output_path="characters/a.png"),
+                make_call(segment_id=None, cost_amount=2.0, output_path="characters/b.png"),
+            ]
+        )
+        await async_session.commit()
+
+    async def test_actual_costs_by_segment_skip_null_and_zero(self, async_session):
+        await self._seed_mixed(async_session)
+
+        costs = await UsageRepository(async_session).get_actual_costs_by_segment("demo")
+
+        assert costs == {
+            "S1": {"image": {"USD": 2.0}},
+            PROJECT_LEVEL_SEGMENT_KEY: {"image": {"USD": 2.0}},
+        }
+
+    async def test_project_image_costs_skip_null(self, async_session):
+        await self._seed_mixed(async_session)
+
+        costs = await UsageRepository(async_session).get_project_image_costs_by_asset_type("demo")
+
+        assert costs == {"characters": {"USD": 2.0}}
+
+    async def test_unpriced_calls_by_model_counts_only_null_rows(self, async_session):
+        await self._seed_mixed(async_session)
+
+        rows = await UsageRepository(async_session).get_unpriced_calls_by_model("demo")
+
+        # 7 行里 4 行 NULL，0 元与已定价的不计。
+        assert rows == [("image", "gemini", "gemini-3.1-flash-image-preview", 3)]
+
+    async def test_summary_rows_keep_null_distinct_from_zero(self, async_session):
+        async_session.add_all([make_call(cost_amount=null()), make_call(cost_amount=0.0), make_call(cost_amount=3.0)])
+        await async_session.commit()
+
+        rows = await UsageRepository(async_session).fetch_summary_rows()
+
+        assert sorted(row.cost_amount is None for row in rows) == [False, False, True]
+        assert sorted(row.cost_amount for row in rows if row.cost_amount is not None) == [0.0, 3.0]
+
+    async def test_records_list_and_detail_return_null_cost(self, async_session):
+        async_session.add(
+            make_call(
+                cost_amount=null(),
+                unpriced_reason="no_price",
+                cache_read_tokens=7,
+                cache_write_5m_tokens=3,
+                cache_write_1h_tokens=2,
+            )
+        )
+        await async_session.commit()
+        repo = UsageRepository(async_session)
+
+        page = await repo.list_records()
+        detail = await repo.get_record(page["items"][0]["id"])
+
+        assert page["items"][0]["cost_amount"] is None
+        assert detail is not None
+        assert detail["cost_amount"] is None
+        for record in (page["items"][0], detail):
+            assert record["unpriced_reason"] == "no_price"
+            assert (record["cache_read_tokens"], record["cache_write_5m_tokens"], record["cache_write_1h_tokens"]) == (
+                7,
+                3,
+                2,
+            )
+
+    async def test_write_path_still_records_priced_cost(self, async_session):
+        """现有写入路径不变：结算后的费用是数值（含 0），新列留空。"""
+        repo = UsageRepository(async_session)
+        call_id = await repo.start_call(project_name="demo", call_type="image", model="m", provider="gemini")
+        await repo.finish_call(call_id, status="success", settlement=SettlementInput(cost_amount=0.0))
+
+        (row,) = await stored_calls(async_session)
+        assert row.cost_amount == 0.0
+        assert (row.unpriced_reason, row.cache_read_tokens) == (None, None)
+        assert (row.cache_write_5m_tokens, row.cache_write_1h_tokens) == (None, None)
+
+
+class TestSettleInterruptedPendingCalls:
+    """启动收口：没有存活任务的 pending 调用行按任务结局翻终态。"""
+
+    async def _seed_task(self, async_session, task_id: str, status: str) -> None:
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        async_session.add(
+            Task(
+                task_id=task_id,
+                project_name="demo",
+                task_type="video",
+                media_type="video",
+                resource_id="E1S01",
+                status=status,
+                queued_at=now,
+                updated_at=now,
+            )
+        )
+        await async_session.commit()
+
+    async def _seed_pending_call(self, async_session, *, task_id: str | None = None) -> int:
+        return await UsageRepository(async_session).start_call(
+            project_name="demo",
+            call_type="video",
+            model="veo-3.1-generate-preview",
+            provider="gemini",
+            duration_seconds=8,
+            task_id=task_id,
+        )
+
+    async def _row(self, async_session, call_id: int) -> ApiCall:
+        return (await async_session.execute(select(ApiCall).where(ApiCall.id == call_id))).scalar_one()
+
+    async def test_call_without_task_flips_failed_with_interrupted_code(self, async_session):
+        call_id = await self._seed_pending_call(async_session)
+
+        settled = await UsageRepository(async_session).settle_interrupted_pending_calls(
+            taskless_started_before=utc_now()
+        )
+
+        assert [(s.call_id, s.project_name, s.status) for s in settled] == [(call_id, "demo", CallStatus.FAILED)]
+        row = await self._row(async_session, call_id)
+        assert row.status == "failed"
+        assert row.error_code == "interrupted"
+        assert row.error_params == {}
+        assert row.cost_amount == 0.0
+        assert row.finished_at is not None
+
+    async def test_stale_taskless_call_settles_without_overflow_and_leaves_duration_null(self, async_session):
+        """30 天前发起的无任务行：墙钟时长超出 int4 毫秒上限，收口不得整批回滚；中断行不记耗时。"""
+        stale_id = await self._seed_pending_call(async_session)
+        await backdate_call(async_session, stale_id, delta=timedelta(days=30))
+        fresh_id = await self._seed_pending_call(async_session)
+        await self._seed_task(async_session, "t-gone", "failed")
+        bound_id = await self._seed_pending_call(async_session, task_id="t-gone")
+        await backdate_call(async_session, bound_id, delta=timedelta(days=30))
+
+        settled = await UsageRepository(async_session).settle_interrupted_pending_calls(
+            taskless_started_before=utc_now() + timedelta(seconds=1)
+        )
+
+        assert sorted(s.call_id for s in settled) == sorted([stale_id, fresh_id, bound_id])
+        for call_id in (stale_id, fresh_id, bound_id):
+            row = await self._row(async_session, call_id)
+            assert row.status == "failed"
+            assert row.duration_ms is None
+        assert (await self._row(async_session, stale_id)).error_code == "interrupted"
+
+    async def test_finish_call_records_positive_duration(self, async_session):
+        """正常结算记真实耗时：finish_call 按 finished_at - started_at 写入，与收口中断行留空的口径不同。"""
+        repo = UsageRepository(async_session)
+        call_id = await self._seed_pending_call(async_session)
+        await backdate_call(async_session, call_id, delta=timedelta(seconds=5))
+
+        await repo.finish_call(call_id, status=CallStatus.SUCCESS, settlement=SettlementInput(cost_amount=1.5))
+
+        row = await self._row(async_session, call_id)
+        assert row.duration_ms is not None
+        assert row.duration_ms >= 5000
+
+    async def test_taskless_call_is_kept_when_excluded_but_task_bound_still_settles(self, async_session):
+        """进程存活期间的重扫只收口绑定任务的行：无任务身份的调用可能正在跑，原样留 pending。"""
+        taskless_id = await self._seed_pending_call(async_session)
+        await self._seed_task(async_session, "t-done", "failed")
+        bound_id = await self._seed_pending_call(async_session, task_id="t-done")
+
+        settled = await UsageRepository(async_session).settle_interrupted_pending_calls(taskless_started_before=None)
+
+        assert [s.call_id for s in settled] == [bound_id]
+        assert (await self._row(async_session, taskless_id)).status == "pending"
+        assert (await self._row(async_session, bound_id)).status == "failed"
+
+    async def test_taskless_call_started_after_the_cutoff_is_left_pending(self, async_session):
+        """进程启动后才发起的无任务调用还在本进程里跑：启动收口只收在启动时刻之前发起的。"""
+        old_id = await self._seed_pending_call(async_session)
+        cutoff = utc_now()
+        await asyncio.sleep(0.001)
+        new_id = await self._seed_pending_call(async_session)
+
+        settled = await UsageRepository(async_session).settle_interrupted_pending_calls(taskless_started_before=cutoff)
+
+        assert [s.call_id for s in settled] == [old_id]
+        assert (await self._row(async_session, new_id)).status == "pending"
+
+    async def test_call_of_cancelled_task_flips_cancelled_without_code(self, async_session):
+        await self._seed_task(async_session, "t-cancelled", "cancelled")
+        call_id = await self._seed_pending_call(async_session, task_id="t-cancelled")
+
+        settled = await UsageRepository(async_session).settle_interrupted_pending_calls(
+            taskless_started_before=utc_now()
+        )
+
+        assert [s.status for s in settled] == [CallStatus.CANCELLED]
+        row = await self._row(async_session, call_id)
+        assert row.status == "cancelled"
+        assert row.error_code is None
+        assert row.cost_amount == 0.0
+
+    @pytest.mark.parametrize("task_status", ["failed", "succeeded"])
+    async def test_call_of_other_terminal_task_flips_failed_without_code(self, async_session, task_status):
+        await self._seed_task(async_session, "t-term", task_status)
+        call_id = await self._seed_pending_call(async_session, task_id="t-term")
+
+        await UsageRepository(async_session).settle_interrupted_pending_calls(taskless_started_before=utc_now())
+
+        row = await self._row(async_session, call_id)
+        assert row.status == "failed"
+        assert row.error_code is None
+
+    @pytest.mark.parametrize("task_status", ["queued", "running"])
+    async def test_call_of_live_task_is_left_pending(self, async_session, task_status):
+        await self._seed_task(async_session, "t-live", task_status)
+        call_id = await self._seed_pending_call(async_session, task_id="t-live")
+
+        settled = await UsageRepository(async_session).settle_interrupted_pending_calls(
+            taskless_started_before=utc_now()
+        )
+
+        assert settled == []
+        row = await self._row(async_session, call_id)
+        assert row.status == "pending"
+        assert row.finished_at is None
+
+    async def test_call_of_missing_task_flips_failed_with_interrupted_code(self, async_session):
+        call_id = await self._seed_pending_call(async_session, task_id="t-purged")
+
+        await UsageRepository(async_session).settle_interrupted_pending_calls(taskless_started_before=utc_now())
+
+        row = await self._row(async_session, call_id)
+        assert row.status == "failed"
+        assert row.error_code == "interrupted"
+
+    async def test_terminal_rows_are_not_touched(self, async_session):
+        repo = UsageRepository(async_session)
+        call_id = await self._seed_pending_call(async_session)
+        await repo.finish_call(call_id, status=CallStatus.SUCCESS, settlement=SettlementInput(cost_amount=1.5))
+
+        settled = await repo.settle_interrupted_pending_calls(taskless_started_before=utc_now())
+
+        assert settled == []
+        row = await self._row(async_session, call_id)
+        assert row.status == "success"
+        assert row.cost_amount == pytest.approx(1.5)
+
+
+class TestCustomProviderSettlement:
+    """自定义供应商的调用按所对应条目的价目表结算，乘供应商倍率 × 模型倍率（docs/adr/0100、0106）。"""
+
+    @staticmethod
+    async def _custom_provider(session, discovery_format: str, *, model_id: str, multiplier: float = 1.0) -> str:
+        from lib.custom_provider import make_provider_id
+        from lib.db.repositories.custom_provider_repo import CustomProviderRepository
+
+        provider = await CustomProviderRepository(session).create_provider(
+            display_name="P",
+            discovery_format=discovery_format,
+            base_url="http://relay.test",
+            api_key="k",
+            models=[
+                {"model_id": model_id, "display_name": model_id, "endpoint": "openai-video", "multiplier": multiplier}
+            ],
+        )
+        await session.commit()
+        return make_provider_id(provider.id)
+
+    @staticmethod
+    async def _settle(session, provider: str, model: str) -> ApiCall:
+        repo = UsageRepository(session)
+        call_id = await repo.start_call(
+            project_name="demo", call_type="video", model=model, duration_seconds=5, provider=provider
+        )
+        usage = Usage(quantities={"output_seconds": 5}, dimensions={"resolution": "1080p", "audio": False})
+        await repo.finalize_pending_by_call_id(call_id=call_id, settlement=SettlementInput(usage=(usage,)))
+        return (await stored_calls(session))[-1]
+
+    async def test_matched_model_is_priced_at_the_entry_times_both_multipliers(self, async_session):
+        from lib.billing.multipliers import set_provider_multiplier
+
+        provider = await self._custom_provider(async_session, "openai", model_id="relay/kling-v2-6", multiplier=2.0)
+        await set_provider_multiplier(async_session, provider, 0.5)
+        await async_session.commit()
+
+        call = await self._settle(async_session, provider, "relay/kling-v2-6")
+
+        # 可灵 2.6：1080p 无声 0.5 CNY/秒 × 5 秒 × 供应商 0.5 × 模型 2
+        assert (call.cost_amount, call.currency, call.unpriced_reason) == (pytest.approx(2.5), "CNY", None)
+
+    async def test_unmatched_model_is_unpriced_with_reason_no_entry(self, async_session):
+        provider = await self._custom_provider(async_session, "openai", model_id="mystery-video")
+
+        call = await self._settle(async_session, provider, "mystery-video")
+
+        assert (call.cost_amount, call.unpriced_reason) == (None, "no_entry")
+
+    async def test_comfyui_provider_without_a_multiplier_records_zero(self, async_session):
+        provider = await self._custom_provider(async_session, "comfyui", model_id="wan-workflow")
+
+        call = await self._settle(async_session, provider, "wan-workflow")
+
+        assert (call.cost_amount, call.unpriced_reason) == (0, None)
+
+    async def test_comfyui_provider_set_to_one_without_an_entry_is_unpriced(self, async_session):
+        from lib.billing.multipliers import set_provider_multiplier
+
+        provider = await self._custom_provider(async_session, "comfyui", model_id="wan-workflow")
+        await set_provider_multiplier(async_session, provider, 1.0)
+        await async_session.commit()
+
+        call = await self._settle(async_session, provider, "wan-workflow")
+
+        assert (call.cost_amount, call.unpriced_reason) == (None, "no_entry")

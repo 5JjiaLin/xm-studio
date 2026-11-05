@@ -1,0 +1,118 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+
+import type { AgentCredential } from "@/types/agent-credential";
+
+import { CredentialList } from "./CredentialList";
+
+const mockCred = (overrides: Partial<AgentCredential> = {}): AgentCredential => ({
+  id: 1,
+  preset_id: "deepseek",
+  display_name: "DeepSeek",
+  icon_key: "DeepSeek",
+  base_url: "https://api.deepseek.com/anthropic",
+  api_key_masked: "sk-x…abcd",
+  model: "deepseek-chat",
+  haiku_model: null,
+  sonnet_model: null,
+  opus_model: null,
+  subagent_model: null,
+  multiplier: 1,
+  tiers: [],
+  is_active: false,
+  created_at: "2026-05-11T00:00:00Z",
+  ...overrides,
+});
+
+describe("CredentialList", () => {
+  it("calls onActivate when activate clicked", () => {
+    const onActivate = vi.fn();
+    render(
+      <CredentialList
+        credentials={[mockCred()]}
+        onActivate={onActivate}
+        onTest={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onBindTier={vi.fn()}
+        onUnbindTier={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "设为生效" }));
+    expect(onActivate).toHaveBeenCalledWith(1);
+  });
+
+  it("disables delete on active credential but keeps it focusable with the reason", () => {
+    const onDelete = vi.fn();
+    render(
+      <CredentialList
+        credentials={[mockCred({ is_active: true })]}
+        onActivate={vi.fn()}
+        onTest={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={onDelete}
+        onBindTier={vi.fn()}
+        onUnbindTier={vi.fn()}
+      />,
+    );
+    const deleteBtn = screen.getByRole("button", { name: /delete|remove|删除|Xoá/i });
+    expect(deleteBtn).toHaveAttribute("aria-disabled", "true");
+    expect(deleteBtn).toHaveAccessibleDescription(/生效中的 Agent 供应商不能删除/);
+    deleteBtn.focus();
+    expect(deleteBtn).toHaveFocus();
+    fireEvent.click(deleteBtn);
+    expect(onDelete).not.toHaveBeenCalled();
+  });
+
+  it("renders empty hint when no credentials", () => {
+    render(
+      <CredentialList
+        credentials={[]}
+        onActivate={vi.fn()}
+        onTest={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onBindTier={vi.fn()}
+        onUnbindTier={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/还没有 Agent 供应商/)).toBeInTheDocument();
+  });
+
+  it("calls onTest with credential id when test clicked", () => {
+    const onTest = vi.fn();
+    render(
+      <CredentialList
+        credentials={[mockCred()]}
+        onActivate={vi.fn()}
+        onTest={onTest}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onBindTier={vi.fn()}
+        onUnbindTier={vi.fn()}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "测试连接" }),
+    );
+    expect(onTest).toHaveBeenCalledWith(1);
+  });
+
+  it("calls onEdit with full credential object when edit clicked", () => {
+    const onEdit = vi.fn();
+    const cred = mockCred();
+    render(
+      <CredentialList
+        credentials={[cred]}
+        onActivate={vi.fn()}
+        onTest={vi.fn()}
+        onEdit={onEdit}
+        onDelete={vi.fn()}
+        onBindTier={vi.fn()}
+        onUnbindTier={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /edit|编辑|Chỉnh sửa/i }));
+    expect(onEdit).toHaveBeenCalledWith(cred);
+  });
+});

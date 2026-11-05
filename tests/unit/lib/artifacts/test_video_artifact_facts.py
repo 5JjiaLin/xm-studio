@@ -1,0 +1,289 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import replace
+
+import pytest
+
+from lib.artifacts.artifact_manifest import ArtifactBasis, compose_video_artifact_basis
+from lib.artifacts.video_artifact_facts import VideoArtifactCurrencyFacts
+from lib.artifacts.visual_artifact_provenance import build_reference_video_artifact_visual_basis
+from lib.speech.speech_artifact_provenance import build_video_duration_basis
+
+
+def _facts() -> VideoArtifactCurrencyFacts:
+    visual = ArtifactBasis.build(
+        "artifact-visual/video-storyboard",
+        kind_version=1,
+        inputs={
+            "resource_id": "E1S01",
+            "visual_prompt": {"action": "run", "camera_motion": "Static"},
+            "canvas": {"aspect_ratio": "9:16"},
+            "frames": [{"role": "storyboard", "sha256": "a" * 64}],
+        },
+    )
+    speech = ArtifactBasis.build(
+        "artifact-speech/video",
+        kind_version=1,
+        inputs={
+            "mode": "character_speech",
+            "utterances": [{"speaker": "阿离", "text": "走。"}],
+            "voices": [{"speaker": "阿离", "voice_style": "", "reference_audio_digest": None}],
+        },
+    )
+    duration = build_video_duration_basis(8)
+    return VideoArtifactCurrencyFacts(
+        episode=1,
+        request_duration_seconds=8,
+        visual_basis=visual,
+        speech_basis=speech,
+        duration_basis=duration,
+        video_basis=compose_video_artifact_basis(visual=visual, speech=speech, duration=duration),
+        voice_style_speakers=("阿离",),
+        duration_tiers=(4, 8, 12),
+        reference_image_limit=None,
+        parent_version=3,
+    )
+
+
+def test_video_artifact_currency_round_trip_preserves_complete_verified_evidence() -> None:
+    facts = _facts()
+
+    restored = VideoArtifactCurrencyFacts.from_dict(facts.to_dict())
+
+    assert restored == facts
+    assert restored.video_descriptor.digest == facts.video_basis.digest
+    assert restored.currency_digest.startswith("sha256-v1:")
+
+
+def test_video_artifact_currency_rejects_component_input_and_route_knob_tampering() -> None:
+    raw = _facts().to_dict()
+    changed_visual = deepcopy(raw)
+    visual_basis = changed_visual["visual_basis"]
+    assert isinstance(visual_basis, dict)
+    visual_basis["inputs"]["unit"] = "E1S02"
+    with pytest.raises(ValueError, match="self-verifying"):
+        VideoArtifactCurrencyFacts.from_dict(changed_visual)
+
+    changed_token = deepcopy(raw)
+    changed_token["parent_version"] = 4
+    with pytest.raises(ValueError, match="currency digest"):
+        VideoArtifactCurrencyFacts.from_dict(changed_token)
+
+
+def test_video_artifact_currency_rejects_incoherent_components_and_request_tier() -> None:
+    facts = _facts()
+    other_duration = build_video_duration_basis(12)
+
+    with pytest.raises(ValueError, match="paid request tier"):
+        VideoArtifactCurrencyFacts(
+            episode=facts.episode,
+            request_duration_seconds=8,
+            visual_basis=facts.visual_basis,
+            speech_basis=facts.speech_basis,
+            duration_basis=other_duration,
+            video_basis=compose_video_artifact_basis(
+                visual=facts.visual_basis,
+                speech=facts.speech_basis,
+                duration=other_duration,
+            ),
+            voice_style_speakers=facts.voice_style_speakers,
+            duration_tiers=(8, 12),
+            reference_image_limit=None,
+            parent_version=0,
+        )
+
+
+def test_video_artifact_currency_rejects_non_integer_duration_tier_as_value_error() -> None:
+    with pytest.raises(ValueError, match="duration_tiers"):
+        replace(_facts(), duration_tiers=(4, "8"))
+
+
+def test_video_artifact_currency_accepts_unlimited_reference_projection_but_rejects_invalid_limits() -> None:
+    facts = _facts()
+    reference = ArtifactBasis.build(
+        "artifact-visual/video-reference",
+        kind_version=1,
+        inputs={
+            "unit_id": "E1U1",
+            "visual_lines": [],
+            "style": "",
+            "canvas": {"aspect_ratio": "9:16"},
+            "request_references": [],
+        },
+    )
+    video = compose_video_artifact_basis(
+        visual=reference,
+        speech=facts.speech_basis,
+        duration=facts.duration_basis,
+    )
+
+    unlimited = VideoArtifactCurrencyFacts(
+        episode=1,
+        request_duration_seconds=8,
+        visual_basis=reference,
+        speech_basis=facts.speech_basis,
+        duration_basis=facts.duration_basis,
+        video_basis=video,
+        voice_style_speakers=facts.voice_style_speakers,
+        duration_tiers=facts.duration_tiers,
+        reference_image_limit=None,
+        parent_version=0,
+    )
+    assert VideoArtifactCurrencyFacts.from_dict(unlimited.to_dict()) == unlimited
+
+    with pytest.raises(ValueError, match="unlimited or non-negative"):
+        VideoArtifactCurrencyFacts(
+            episode=1,
+            request_duration_seconds=8,
+            visual_basis=reference,
+            speech_basis=facts.speech_basis,
+            duration_basis=facts.duration_basis,
+            video_basis=video,
+            voice_style_speakers=facts.voice_style_speakers,
+            duration_tiers=facts.duration_tiers,
+            reference_image_limit=-1,
+            parent_version=0,
+        )
+
+
+@pytest.mark.parametrize("speakers", [[123], [["阿离"]], [{"name": "阿离"}]])
+def test_video_artifact_currency_rejects_non_string_speakers_as_value_error(speakers: list[object]) -> None:
+    """checkpoint JSON 损坏时调用方只接 ValueError，形状错误不得漏成其他异常。"""
+
+    raw = _facts().to_dict()
+    raw["voice_style_speakers"] = speakers
+
+    with pytest.raises(ValueError, match="not self-verifying"):
+        VideoArtifactCurrencyFacts.from_dict(raw)
+
+
+def _reference_facts(visual_inputs: dict[str, object]) -> VideoArtifactCurrencyFacts:
+    facts = _facts()
+    reference = ArtifactBasis.build("artifact-visual/video-reference", kind_version=1, inputs=visual_inputs)
+    return VideoArtifactCurrencyFacts(
+        episode=1,
+        request_duration_seconds=8,
+        visual_basis=reference,
+        speech_basis=facts.speech_basis,
+        duration_basis=facts.duration_basis,
+        video_basis=compose_video_artifact_basis(
+            visual=reference,
+            speech=facts.speech_basis,
+            duration=facts.duration_basis,
+        ),
+        voice_style_speakers=facts.voice_style_speakers,
+        duration_tiers=facts.duration_tiers,
+        reference_image_limit=None,
+        parent_version=0,
+    )
+
+
+_REFERENCE_VISUAL_INPUTS: dict[str, object] = {
+    "unit_id": "E1U1",
+    "visual_lines": ["阿离走入雨巷"],
+    "style": "",
+    "canvas": {"aspect_ratio": "9:16"},
+    "request_references": [],
+}
+
+
+@pytest.mark.parametrize("override", [{}, {"generation_prompt": ""}])
+def test_default_reference_video_basis_keeps_legacy_digest(override: dict[str, str]) -> None:
+    basis = build_reference_video_artifact_visual_basis(
+        unit={"unit_id": "E1U01", "text": "雨落在空街上。", **override},
+        request_assets=[],
+        style="cinematic",
+        aspect_ratio="16:9",
+    )
+
+    # Captured before manual creative text became a canonical dependency.
+    assert basis.digest == "sha256-v1:ed5afe643ebc0f427e4e035ca94649b6d5c0cd3c403d69e124ad52f2b8315119"
+
+
+def test_video_artifact_currency_accepts_reference_visual_style_description() -> None:
+    """自定义风格项目的参考视频依据带非空风格描述，冻结事实照常自证。"""
+    facts = _reference_facts({**_REFERENCE_VISUAL_INPUTS, "style_description": "柔光水彩"})
+
+    assert VideoArtifactCurrencyFacts.from_dict(facts.to_dict()) == facts
+
+
+@pytest.mark.parametrize("prompt", ["人工近景", " "])
+def test_video_artifact_currency_preserves_manual_creative_text(prompt: str) -> None:
+    facts = _reference_facts({**_REFERENCE_VISUAL_INPUTS, "generation_prompt": prompt})
+
+    assert VideoArtifactCurrencyFacts.from_dict(facts.to_dict()) == facts
+
+
+@pytest.mark.parametrize("prompt", ["", 7, None])
+def test_video_artifact_currency_rejects_invalid_manual_creative_text(prompt: object) -> None:
+    with pytest.raises(ValueError, match="reference visual basis has invalid canonical inputs"):
+        _reference_facts({**_REFERENCE_VISUAL_INPUTS, "generation_prompt": prompt})
+
+
+@pytest.mark.parametrize("description", ["", 7])
+def test_video_artifact_currency_rejects_empty_or_non_string_style_description(description: object) -> None:
+    """描述为空时依据不记该键；空串或非字符串不是构造函数能写出的形态。"""
+    with pytest.raises(ValueError, match="reference visual basis has invalid canonical inputs"):
+        _reference_facts({**_REFERENCE_VISUAL_INPUTS, "style_description": description})
+
+
+def _gapped_facts(
+    *, frames: list[dict[str, object]], absent: list[dict[str, object]] | None
+) -> VideoArtifactCurrencyFacts:
+    """分镜图不可用、单位混合发声：视觉与发声依据都带缺席记录（``docs/adr/0098``）。"""
+    visual_inputs: dict[str, object] = {
+        "resource_id": "E1S01",
+        "visual_prompt": None,
+        "canvas": {"aspect_ratio": "9:16"},
+        "frames": frames,
+    }
+    if absent is not None:
+        visual_inputs["absent"] = absent
+    visual = ArtifactBasis.build("artifact-visual/video-storyboard", kind_version=1, inputs=visual_inputs)
+    speech = ArtifactBasis.build(
+        "artifact-speech/video",
+        kind_version=1,
+        inputs={
+            "mode": None,
+            "utterances": [
+                {"owner": "character", "speaker": "阿离", "text": "走。"},
+                {"owner": "narrator", "speaker": None, "text": "雨夜。"},
+            ],
+            "absent": [{"code": "mixed_speech", "id": "E1S01"}],
+        },
+    )
+    duration = build_video_duration_basis(8)
+    return VideoArtifactCurrencyFacts(
+        episode=1,
+        request_duration_seconds=8,
+        visual_basis=visual,
+        speech_basis=speech,
+        duration_basis=duration,
+        video_basis=compose_video_artifact_basis(visual=visual, speech=speech, duration=duration),
+        voice_style_speakers=(),
+        duration_tiers=(4, 8, 12),
+        reference_image_limit=None,
+        parent_version=3,
+    )
+
+
+def test_video_artifact_currency_accepts_components_that_record_generation_input_gaps() -> None:
+    facts = _gapped_facts(
+        frames=[],
+        absent=[{"code": "script_prompt_pending"}, {"code": "generate_storyboard_first", "id": "E1S01"}],
+    )
+
+    assert VideoArtifactCurrencyFacts.from_dict(facts.to_dict()) == facts
+
+
+@pytest.mark.parametrize(
+    "absent",
+    [None, [], [{"type": "storyboard"}], [{"code": "x", "extra": 1}]],
+    ids=["no-record", "empty", "no-code", "unknown-field"],
+)
+def test_video_artifact_currency_rejects_a_missing_storyboard_without_a_valid_absent_record(
+    absent: list[dict[str, object]] | None,
+) -> None:
+    with pytest.raises(ValueError, match="visual basis has invalid"):
+        _gapped_facts(frames=[], absent=absent)

@@ -1,0 +1,69 @@
+{
+  "project": "proj-583d457a",
+  "episode": 1,
+  "unit_id": "E1U8",
+  "page_http_status": 200,
+  "preview_http_status": 200,
+  "parameters": {
+    "provider": "minimax",
+    "model": "MiniMax-H3-Lite",
+    "resolution": null,
+    "aspect_ratio": "9:16",
+    "duration_seconds": 15,
+    "generate_audio": true
+  },
+  "image_references": [
+    {
+      "type": "scene",
+      "name": "黑色石殿",
+      "path": "scenes/黑色石殿.png"
+    },
+    {
+      "type": "character",
+      "name": "吉迪恩",
+      "path": "characters/吉迪恩.png"
+    },
+    {
+      "type": "character",
+      "name": "埃利亚斯",
+      "path": "characters/埃利亚斯.png"
+    },
+    {
+      "type": "prop",
+      "name": "铁链",
+      "path": "props/铁链.png"
+    },
+    {
+      "type": "prop",
+      "name": "破旧木箱",
+      "path": "props/破旧木箱.png"
+    },
+    {
+      "type": "prop",
+      "name": "黑皮手套",
+      "path": "props/黑皮手套.png"
+    },
+    {
+      "type": "prop",
+      "name": "军大衣",
+      "path": "props/军大衣.png"
+    }
+  ],
+  "audio_references": [],
+  "declarations_sha256": "3bd8cab8e8d3c7fd1b91592304aeafae98fd8e813c3beec14d5ffeca561c2abd",
+  "manual_preserves_declarations_and_attachments": true,
+  "all_attachment_files_exist": true,
+  "before": {
+    "api_calls": 93,
+    "tasks": 94,
+    "active": 0
+  },
+  "after": {
+    "api_calls": 93,
+    "tasks": 94,
+    "active": 0
+  },
+  "scripts_unchanged": true,
+  "lease_matches_serving_process": true,
+  "sqlite_quick_check": "ok"
+}

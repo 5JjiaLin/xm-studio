@@ -1,0 +1,11 @@
+{
+  "method": "GET",
+  "path": "/api/v1/production/feedback/settings",
+  "status": 200,
+  "body": {
+    "installation_id": "00000000-0000-4000-8000-000000000001",
+    "test_batch_id": "",
+    "test_case_id": "",
+    "tester_id": ""
+  }
+}

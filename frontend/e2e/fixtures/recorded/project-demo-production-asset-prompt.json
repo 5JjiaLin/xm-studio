@@ -1,0 +1,12 @@
+{
+  "method": "POST",
+  "path": "/api/v1/projects/demo/production/asset-prompt",
+  "status": 200,
+  "body": {
+    "text": "角色「阿明」的资产图。\n\n青年\n\n横版 16:9，纯白背景，四个互不重叠的等宽面板水平排列，从左至右为：正面全身 / 正侧全身（90° 侧视，面向画面右侧）/ 背面全身 / 正面面部特写（含完整发型、下巴与肩部）。前三格头到脚完整可见、站立比例一致，双臂自然下垂；第四格放大面部，五官清晰。各格自然中性表情、均匀柔和光线，不添加面板文字。\n\n四个面板中角色的面部与头部特征、毛发或发型、服装或体表花纹、体型、配饰完全一致。\n\nAvoid: 水印、多余文字、Logo",
+    "aspect_ratio": "16:9",
+    "references": [],
+    "system_message": null,
+    "affected_episodes": []
+  }
+}

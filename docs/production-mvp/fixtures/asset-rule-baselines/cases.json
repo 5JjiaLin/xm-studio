@@ -1,0 +1,285 @@
+{
+  "evidence": "人工标注的离线结构样例；B0_observed_props 为本案现存草稿观察，不冒充原始模型输出；其余不是 B0 模型结果。",
+  "cases": [
+    {
+      "id": "stone_hall",
+      "source": "黑色石殿内，大玉台和黑石柱旁挂着灯笼。吉迪恩脚锁铁链，仍提破旧木箱，被推撞柱后瘫坐；银色纹饰针掉地，最后凝视此针。吉迪恩说：木箱不能丢。",
+      "text": "@[黑色石殿]内，@[吉迪恩]脚锁@[铁链]，仍提@[破旧木箱]，被推撞@[黑石柱]后瘫坐。@[大玉台]旁挂着@[灯笼]。@[银色纹饰针]掉地，最后凝视此针。吉迪恩说：木箱不能丢。",
+      "assets": [
+        {
+          "type": "character",
+          "name": "吉迪恩",
+          "decision": "register",
+          "description": "吉迪恩的原文外观",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        },
+        {
+          "type": "scene",
+          "name": "黑色石殿",
+          "decision": "register",
+          "description": "黑色石殿的原文外观",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        },
+        {
+          "type": "prop",
+          "name": "大玉台",
+          "decision": "skip",
+          "description": "",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        },
+        {
+          "type": "prop",
+          "name": "黑石柱",
+          "decision": "skip",
+          "description": "",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        },
+        {
+          "type": "prop",
+          "name": "灯笼",
+          "decision": "skip",
+          "description": "",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        },
+        {
+          "type": "prop",
+          "name": "铁链",
+          "decision": "skip",
+          "description": "",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        },
+        {
+          "type": "prop",
+          "name": "破旧木箱",
+          "decision": "skip",
+          "description": "",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        },
+        {
+          "type": "prop",
+          "name": "银色纹饰针",
+          "decision": "register",
+          "description": "银色纹饰针的原文外观",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        }
+      ],
+      "props": [
+        "银色纹饰针"
+      ],
+      "preserve": [
+        "脚锁铁链",
+        "仍提破旧木箱",
+        "被推撞黑石柱后瘫坐",
+        "掉地",
+        "凝视此针",
+        "木箱不能丢。"
+      ],
+      "B0_observed_props": [
+        "大玉台",
+        "黑石柱",
+        "灯笼",
+        "铁链",
+        "破旧木箱",
+        "银色纹饰针"
+      ]
+    },
+    {
+      "id": "indoor_dialogue",
+      "source": "两人在客厅交谈，沙发、茶几和吊灯作为陈设。",
+      "text": "客厅内，两人在@[沙发]旁，@[茶几]上亮着@[吊灯]反光。甲说：明天见。",
+      "assets": [
+        {
+          "type": "prop",
+          "name": "沙发",
+          "decision": "skip",
+          "description": "",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        },
+        {
+          "type": "prop",
+          "name": "茶几",
+          "decision": "skip",
+          "description": "",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        },
+        {
+          "type": "prop",
+          "name": "吊灯",
+          "decision": "skip",
+          "description": "",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        }
+      ],
+      "props": [],
+      "preserve": [
+        "沙发",
+        "茶几",
+        "吊灯",
+        "明天见。"
+      ]
+    },
+    {
+      "id": "key_weapon_closeup",
+      "source": "钥匙齿形特写，交给守卫；缺口短剑的血槽特写。",
+      "text": "@[铜钥匙]齿形特写后交给守卫，@[缺口短剑]血槽特写。",
+      "assets": [
+        {
+          "type": "prop",
+          "name": "铜钥匙",
+          "decision": "register",
+          "description": "铜钥匙的原文外观",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        },
+        {
+          "type": "prop",
+          "name": "缺口短剑",
+          "decision": "register",
+          "description": "缺口短剑的原文外观",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        }
+      ],
+      "props": [
+        "铜钥匙",
+        "缺口短剑"
+      ],
+      "preserve": [
+        "齿形特写后交给守卫",
+        "血槽特写"
+      ]
+    },
+    {
+      "id": "open_box",
+      "source": "箱盖龙纹特写，按机关打开箱子，须认出同一箱子。",
+      "text": "@[龙纹箱]箱盖龙纹特写，按机关打开箱子。",
+      "assets": [
+        {
+          "type": "prop",
+          "name": "龙纹箱",
+          "decision": "register",
+          "description": "龙纹箱的原文外观",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        }
+      ],
+      "props": [
+        "龙纹箱"
+      ],
+      "preserve": [
+        "箱盖龙纹特写",
+        "按机关打开箱子"
+      ]
+    },
+    {
+      "id": "costume_change",
+      "source": "阿明由常服换成礼服，扣子和胸针不是叙事焦点。",
+      "text": "@[阿明礼服]扣上@[扣子]并佩戴@[胸针]。阿明说：出发。",
+      "project": {
+        "characters": {
+          "阿明": {
+            "description": "常服青年"
+          }
+        }
+      },
+      "assets": [
+        {
+          "type": "character",
+          "name": "阿明礼服",
+          "decision": "derivative",
+          "description": "阿明礼服的原文外观",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": "阿明"
+        },
+        {
+          "type": "prop",
+          "name": "扣子",
+          "decision": "skip",
+          "description": "",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        },
+        {
+          "type": "prop",
+          "name": "胸针",
+          "decision": "skip",
+          "description": "",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        }
+      ],
+      "props": [],
+      "preserve": [
+        "扣上扣子并佩戴胸针",
+        "出发。"
+      ]
+    },
+    {
+      "id": "same_object_alias",
+      "source": "银针和纹饰针是同一物件，前后连续。",
+      "text": "@[银针]掉地，随后捡起@[纹饰针]。",
+      "assets": [
+        {
+          "type": "prop",
+          "name": "银针",
+          "decision": "register",
+          "description": "银针的原文外观",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        },
+        {
+          "type": "prop",
+          "name": "纹饰针",
+          "decision": "merge",
+          "description": "",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": "银针"
+        }
+      ],
+      "props": [
+        "银针"
+      ],
+      "preserve": [
+        "掉地",
+        "随后捡起"
+      ]
+    },
+    {
+      "id": "existing_reuse",
+      "source": "已登记的铜钥匙再次出现，使用现有图。",
+      "text": "@[铜钥匙]打开房门。",
+      "project": {
+        "props": {
+          "铜钥匙": {
+            "description": "旧图对应的铜钥匙"
+          }
+        }
+      },
+      "assets": [
+        {
+          "type": "prop",
+          "name": "铜钥匙",
+          "decision": "register",
+          "description": "铜钥匙的原文外观",
+          "reason": "人工标注的独立视觉需要或归属判断",
+          "target": ""
+        }
+      ],
+      "props": [],
+      "preserve": [
+        "打开房门。"
+      ]
+    }
+  ]
+}

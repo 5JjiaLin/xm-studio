@@ -1,0 +1,1251 @@
+{
+  "method": "GET",
+  "path": "/api/v1/custom-providers/endpoints",
+  "status": 200,
+  "body": {
+    "endpoints": [
+      {
+        "key": "openai-chat",
+        "media_type": "text",
+        "family": "openai",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_openai_chat_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1/chat/completions",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/chat/completions",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "append_v1"
+          }
+        ]
+      },
+      {
+        "key": "openai-responses",
+        "media_type": "text",
+        "family": "openai",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_openai_responses_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1/responses",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/responses",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "append_v1"
+          }
+        ]
+      },
+      {
+        "key": "gemini-generate",
+        "media_type": "text",
+        "family": "google",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_gemini_generate_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1beta/models/{model}:generateContent",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/v1beta/models/{{ model }}:generateContent",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "strip_version"
+          }
+        ]
+      },
+      {
+        "key": "anthropic-messages",
+        "media_type": "text",
+        "family": "anthropic",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_anthropic_messages_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1/messages",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/v1/messages",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "strip_messages"
+          }
+        ]
+      },
+      {
+        "key": "openai-images",
+        "media_type": "image",
+        "family": "openai",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_openai_images_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1/images/{generations,edits}",
+        "image_capabilities": [
+          "image_to_image",
+          "text_to_image"
+        ],
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/images/generations",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "append_v1"
+          },
+          {
+            "name": "edit",
+            "display_name_key": "cp_request_edit",
+            "default_path": "/images/edits",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "append_v1"
+          }
+        ]
+      },
+      {
+        "key": "openai-images-generations",
+        "media_type": "image",
+        "family": "openai",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_openai_images_generations_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1/images/generations",
+        "image_capabilities": [
+          "text_to_image"
+        ],
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/images/generations",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "append_v1"
+          }
+        ]
+      },
+      {
+        "key": "openai-images-edits",
+        "media_type": "image",
+        "family": "openai",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_openai_images_edits_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1/images/edits",
+        "image_capabilities": [
+          "image_to_image"
+        ],
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "edit",
+            "display_name_key": "cp_request_edit",
+            "default_path": "/images/edits",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "append_v1"
+          }
+        ]
+      },
+      {
+        "key": "openai-chat-image",
+        "media_type": "image",
+        "family": "openai",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_openai_chat_image_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1/chat/completions",
+        "image_capabilities": [
+          "image_to_image",
+          "text_to_image"
+        ],
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/chat/completions",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "append_v1"
+          }
+        ]
+      },
+      {
+        "key": "openrouter-images",
+        "media_type": "image",
+        "family": "openrouter",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_openrouter_images_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/images",
+        "image_capabilities": [
+          "image_to_image",
+          "text_to_image"
+        ],
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/images",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "as_is"
+          },
+          {
+            "name": "model_catalog",
+            "display_name_key": "cp_request_model_catalog",
+            "default_path": "/images/models",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "as_is"
+          }
+        ]
+      },
+      {
+        "key": "gemini-image",
+        "media_type": "image",
+        "family": "google",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_gemini_image_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1beta/models/{model}:generateContent",
+        "image_capabilities": [
+          "image_to_image",
+          "text_to_image"
+        ],
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/v1beta/models/{{ model }}:generateContent",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "strip_version"
+          }
+        ]
+      },
+      {
+        "key": "openai-video",
+        "media_type": "video",
+        "family": "openai",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_openai_video_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1/videos",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/videos",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "append_v1"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/videos/{{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "append_v1"
+          },
+          {
+            "name": "download",
+            "display_name_key": "cp_request_download",
+            "default_path": "/videos/{{ task_id }}/content",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "append_v1"
+          }
+        ]
+      },
+      {
+        "key": "ark-seedance",
+        "media_type": "video",
+        "family": "ark",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_ark_seedance_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/api/v3/contents/generations/tasks",
+        "image_capabilities": null,
+        "end_image_capable": true,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/contents/generations/tasks",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "ensure_api_v3"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/contents/generations/tasks/{{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "ensure_api_v3"
+          }
+        ]
+      },
+      {
+        "key": "ark-seedream",
+        "media_type": "image",
+        "family": "ark",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_ark_seedream_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/api/v3/images/generations",
+        "image_capabilities": [
+          "image_to_image",
+          "text_to_image"
+        ],
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/images/generations",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "ensure_api_v3"
+          }
+        ]
+      },
+      {
+        "key": "vidu-video",
+        "media_type": "video",
+        "family": "vidu",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_vidu_video_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/ent/v2/img2video",
+        "image_capabilities": null,
+        "end_image_capable": true,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit_text2video",
+            "display_name_key": "cp_request_submit_text2video",
+            "default_path": "/text2video",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "ensure_ent_v2"
+          },
+          {
+            "name": "submit_img2video",
+            "display_name_key": "cp_request_submit_img2video",
+            "default_path": "/img2video",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "ensure_ent_v2"
+          },
+          {
+            "name": "submit_start_end2video",
+            "display_name_key": "cp_request_submit_start_end2video",
+            "default_path": "/start-end2video",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "ensure_ent_v2"
+          },
+          {
+            "name": "submit_reference2video",
+            "display_name_key": "cp_request_submit_reference2video",
+            "default_path": "/reference2video",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "ensure_ent_v2"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/tasks/{{ task_id }}/creations",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "ensure_ent_v2"
+          }
+        ]
+      },
+      {
+        "key": "dashscope-image",
+        "media_type": "image",
+        "family": "dashscope",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_dashscope_image_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/api/v1/services/aigc/multimodal-generation/generation",
+        "image_capabilities": [
+          "image_to_image",
+          "text_to_image"
+        ],
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/services/aigc/multimodal-generation/generation",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "dashscope_api_v1"
+          }
+        ]
+      },
+      {
+        "key": "openai-tts",
+        "media_type": "audio",
+        "family": "openai",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_openai_tts_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1/audio/speech",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/audio/speech",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "append_v1"
+          }
+        ]
+      },
+      {
+        "key": "dashscope-tts",
+        "media_type": "audio",
+        "family": "dashscope",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_dashscope_tts_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/api/v1/services/aigc/multimodal-generation/generation",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/services/aigc/multimodal-generation/generation",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "dashscope_api_v1"
+          }
+        ]
+      },
+      {
+        "key": "gemini-video",
+        "media_type": "video",
+        "family": "google",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_gemini_video_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1beta/models/{model}:predictLongRunning",
+        "image_capabilities": null,
+        "end_image_capable": true,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/v1beta/models/{{ model }}:predictLongRunning",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "strip_version"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/v1beta/{{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "strip_version"
+          },
+          {
+            "name": "download",
+            "display_name_key": "cp_request_download",
+            "default_path": "/v1beta/files/{{ file_id }}:download",
+            "placeholders": [
+              "file_id",
+              "model"
+            ],
+            "base_url_rule": "strip_version"
+          }
+        ]
+      },
+      {
+        "key": "minimax-tts",
+        "media_type": "audio",
+        "family": "minimax",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_minimax_tts_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1/t2a_v2",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/t2a_v2",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "ensure_v1"
+          }
+        ]
+      },
+      {
+        "key": "gemini-tts",
+        "media_type": "audio",
+        "family": "google",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_gemini_tts_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1beta/models/{model}:generateContent",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/v1beta/models/{{ model }}:generateContent",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "strip_version"
+          }
+        ]
+      },
+      {
+        "key": "dashscope-async-video",
+        "media_type": "video",
+        "family": "dashscope",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_dashscope_async_video_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/api/v1/services/aigc/video-generation/video-synthesis",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/services/aigc/video-generation/video-synthesis",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "dashscope_api_v1"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/tasks/{{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "dashscope_api_v1"
+          }
+        ]
+      },
+      {
+        "key": "minimax-image",
+        "media_type": "image",
+        "family": "minimax",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_minimax_image_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/image_generation",
+        "image_capabilities": [
+          "image_to_image",
+          "text_to_image"
+        ],
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "generate",
+            "display_name_key": "cp_request_generate",
+            "default_path": "/image_generation",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "ensure_v1"
+          }
+        ]
+      },
+      {
+        "key": "kling-image",
+        "media_type": "image",
+        "family": "kling",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_kling_image_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1/images/generations",
+        "image_capabilities": [
+          "image_to_image",
+          "text_to_image"
+        ],
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/images/generations",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "ensure_v1"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/images/generations/{{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "ensure_v1"
+          }
+        ]
+      },
+      {
+        "key": "kling-video",
+        "media_type": "video",
+        "family": "kling",
+        "kind": "python",
+        "source": "builtin",
+        "display_name_key": "endpoint_kling_video_display",
+        "display_name": null,
+        "request_method": "POST",
+        "request_path_template": "/v1/videos/{text2video,image2video,multi-image2video}",
+        "image_capabilities": null,
+        "end_image_capable": true,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit_text2video",
+            "display_name_key": "cp_request_submit_text2video",
+            "default_path": "/videos/text2video",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "ensure_v1"
+          },
+          {
+            "name": "poll_text2video",
+            "display_name_key": "cp_request_poll_text2video",
+            "default_path": "/videos/text2video/{{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "ensure_v1"
+          },
+          {
+            "name": "submit_image2video",
+            "display_name_key": "cp_request_submit_img2video",
+            "default_path": "/videos/image2video",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "ensure_v1"
+          },
+          {
+            "name": "poll_image2video",
+            "display_name_key": "cp_request_poll_img2video",
+            "default_path": "/videos/image2video/{{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "ensure_v1"
+          },
+          {
+            "name": "submit_multi_image2video",
+            "display_name_key": "cp_request_submit_multi_image2video",
+            "default_path": "/videos/multi-image2video",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "ensure_v1"
+          },
+          {
+            "name": "poll_multi_image2video",
+            "display_name_key": "cp_request_poll_multi_image2video",
+            "default_path": "/videos/multi-image2video/{{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "ensure_v1"
+          }
+        ]
+      },
+      {
+        "key": "minimax-h3",
+        "media_type": "video",
+        "family": "minimax",
+        "kind": "declarative",
+        "source": "builtin",
+        "display_name_key": "",
+        "display_name": "MiniMax H3",
+        "request_method": "POST",
+        "request_path_template": "/v2/video_generation",
+        "image_capabilities": null,
+        "end_image_capable": true,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/v2/video_generation",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "strip_version"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/v2/query/video_generation/{{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "strip_version"
+          }
+        ]
+      },
+      {
+        "key": "minimax-hailuo-v1-fast",
+        "media_type": "video",
+        "family": "minimax",
+        "kind": "declarative",
+        "source": "builtin",
+        "display_name_key": "",
+        "display_name": "MiniMax Hailuo V1 Fast",
+        "request_method": "POST",
+        "request_path_template": "/v1/video_generation",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/v1/video_generation",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "strip_version"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/v1/query/video_generation?task_id={{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "strip_version"
+          },
+          {
+            "name": "result",
+            "display_name_key": "cp_request_result",
+            "default_path": "/v1/files/retrieve?file_id={{ result_id }}",
+            "placeholders": [
+              "model",
+              "result_id",
+              "task_id"
+            ],
+            "base_url_rule": "strip_version"
+          }
+        ]
+      },
+      {
+        "key": "minimax-hailuo-v1",
+        "media_type": "video",
+        "family": "minimax",
+        "kind": "declarative",
+        "source": "builtin",
+        "display_name_key": "",
+        "display_name": "MiniMax Hailuo V1",
+        "request_method": "POST",
+        "request_path_template": "/v1/video_generation",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/v1/video_generation",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "strip_version"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/v1/query/video_generation?task_id={{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "strip_version"
+          },
+          {
+            "name": "result",
+            "display_name_key": "cp_request_result",
+            "default_path": "/v1/files/retrieve?file_id={{ result_id }}",
+            "placeholders": [
+              "model",
+              "result_id",
+              "task_id"
+            ],
+            "base_url_rule": "strip_version"
+          }
+        ]
+      },
+      {
+        "key": "minimax-s2v-01",
+        "media_type": "video",
+        "family": "minimax",
+        "kind": "declarative",
+        "source": "builtin",
+        "display_name_key": "",
+        "display_name": "MiniMax S2V-01",
+        "request_method": "POST",
+        "request_path_template": "/v1/video_generation",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/v1/video_generation",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "strip_version"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/v1/query/video_generation?task_id={{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "strip_version"
+          },
+          {
+            "name": "result",
+            "display_name_key": "cp_request_result",
+            "default_path": "/v1/files/retrieve?file_id={{ result_id }}",
+            "placeholders": [
+              "model",
+              "result_id",
+              "task_id"
+            ],
+            "base_url_rule": "strip_version"
+          }
+        ]
+      },
+      {
+        "key": "newapi-video",
+        "media_type": "video",
+        "family": "newapi",
+        "kind": "declarative",
+        "source": "builtin",
+        "display_name_key": "",
+        "display_name": "NewAPI Video",
+        "request_method": "POST",
+        "request_path_template": "/v1/video/generations",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/v1/video/generations",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "strip_version"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/v1/video/generations/{{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "strip_version"
+          }
+        ]
+      },
+      {
+        "key": "openrouter-video",
+        "media_type": "video",
+        "family": "openrouter",
+        "kind": "declarative",
+        "source": "builtin",
+        "display_name_key": "",
+        "display_name": "OpenRouter Video",
+        "request_method": "POST",
+        "request_path_template": "/videos",
+        "image_capabilities": null,
+        "end_image_capable": true,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/videos",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "as_is"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/videos/{{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "as_is"
+          }
+        ]
+      },
+      {
+        "key": "v2-video-generations",
+        "media_type": "video",
+        "family": "v2",
+        "kind": "declarative",
+        "source": "builtin",
+        "display_name_key": "",
+        "display_name": "V2 Video Generations",
+        "request_method": "POST",
+        "request_path_template": "/v2/video/generations",
+        "image_capabilities": null,
+        "end_image_capable": true,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/v2/video/generations",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "strip_version"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/v2/video/generations?generation_id={{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "strip_version"
+          }
+        ]
+      },
+      {
+        "key": "xai-video",
+        "media_type": "video",
+        "family": "xai",
+        "kind": "declarative",
+        "source": "builtin",
+        "display_name_key": "",
+        "display_name": "xAI Video",
+        "request_method": "POST",
+        "request_path_template": "/v1/videos/generations",
+        "image_capabilities": null,
+        "end_image_capable": false,
+        "size_fixed": false,
+        "duration_fixed": false,
+        "duration_frame_rate_missing": false,
+        "duration_tier_empty": false,
+        "native_resolution": null,
+        "requests": [
+          {
+            "name": "submit",
+            "display_name_key": "cp_request_submit",
+            "default_path": "/v1/videos/generations",
+            "placeholders": [
+              "model"
+            ],
+            "base_url_rule": "strip_version"
+          },
+          {
+            "name": "poll",
+            "display_name_key": "cp_request_poll",
+            "default_path": "/v1/videos/{{ task_id }}",
+            "placeholders": [
+              "model",
+              "task_id"
+            ],
+            "base_url_rule": "strip_version"
+          }
+        ]
+      }
+    ]
+  }
+}
