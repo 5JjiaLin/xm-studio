@@ -24,6 +24,8 @@ export const LANGUAGE_DISPLAY_LABELS: Record<SupportedLanguage, string> = {
   vi: 'Tiếng Việt',
 };
 
+export const LANGUAGE_PREFERENCE_KEY = 'xm_studio_language';
+
 const I18N_NAMESPACES = [
   'common',
   'auth',
@@ -80,6 +82,11 @@ export const i18nReady = i18n
   .use(initReactI18next)
   .init({
     fallbackLng: 'zh',
+    detection: {
+      order: ['localStorage'],
+      lookupLocalStorage: LANGUAGE_PREFERENCE_KEY,
+      caches: [],
+    },
     supportedLngs: SUPPORTED_LANGUAGES,
     debug: false,
     interpolation: { escapeValue: false },

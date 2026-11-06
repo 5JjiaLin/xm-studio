@@ -6,7 +6,7 @@ import { cleanup } from "@testing-library/react";
 // 中文，断言会失败。LanguageDetector 在 init 时读 localStorage：先写入 zh，它就只加载中文
 // 这一套 namespace；不写的话会按 jsdom 的 navigator.language 先加载 en-US 与 en，再切回 zh。
 // 这段 setup 每个测试文件都要跑一遍，多加载的两套资源是纯开销。
-window.localStorage.setItem("i18nextLng", "zh");
+window.localStorage.setItem("xm_studio_language", "zh");
 const { i18nReady } = await import("@/i18n");
 await i18nReady;
 

@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { LANGUAGE_DISPLAY_LABELS, SUPPORTED_LANGUAGES, type SupportedLanguage } from "@/i18n";
+import { LANGUAGE_DISPLAY_LABELS, LANGUAGE_PREFERENCE_KEY, SUPPORTED_LANGUAGES, type SupportedLanguage } from "@/i18n";
 import { useOnboardingStore } from "@/stores/onboarding-store";
 import { isThemePreference, setThemePreference, THEME_PREFERENCES, useThemePreference } from "@/theme";
 
@@ -42,7 +42,10 @@ export function GeneralSection() {
             items={LANGUAGE_ITEMS}
             value={isSupportedLanguage(currentLanguage) ? currentLanguage : null}
             onValueChange={(value) => {
-              if (isSupportedLanguage(value)) void i18n.changeLanguage(value);
+              if (isSupportedLanguage(value)) {
+                window.localStorage.setItem(LANGUAGE_PREFERENCE_KEY, value);
+                void i18n.changeLanguage(value);
+              }
             }}
           >
             <SelectTrigger aria-labelledby={languageLabelId} className="w-44">

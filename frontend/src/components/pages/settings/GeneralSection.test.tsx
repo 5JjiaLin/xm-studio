@@ -2,7 +2,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import i18n from "@/i18n";
+import i18n, { LANGUAGE_PREFERENCE_KEY } from "@/i18n";
 import { useOnboardingStore } from "@/stores/onboarding-store";
 
 import { GeneralSection } from "./GeneralSection";
@@ -13,6 +13,7 @@ describe("GeneralSection", () => {
   });
 
   afterEach(async () => {
+    window.localStorage.setItem(LANGUAGE_PREFERENCE_KEY, "zh");
     await i18n.changeLanguage("zh");
   });
 
@@ -28,6 +29,7 @@ describe("GeneralSection", () => {
 
     expect(await screen.findByRole("combobox", { name: "Interface language" })).toHaveTextContent("English");
     expect(i18n.language).toBe("en");
+    expect(window.localStorage.getItem(LANGUAGE_PREFERENCE_KEY)).toBe("en");
   });
 
   it("选浅色后立即切换，重新打开设置仍是浅色", async () => {
