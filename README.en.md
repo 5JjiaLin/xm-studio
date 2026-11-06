@@ -90,6 +90,17 @@ Project media and edit records stay in the local `projects/` directory. API keys
 
 These instructions were checked against the repository configuration and startup code. A complete production run on a Windows machine remains to be verified by the testing team.
 
+## Continue editing in Jianying
+
+After confirming the selected videos, save the clip order, trims, volume, and subtitles on the **Final Cut** page, then click **Create draft in Jianying**. The draft keeps separate video clips and editable subtitle segments.
+
+1. Expand the local Jianying settings, confirm the application and draft-root paths, then save and enable. If the draft index is missing, create an empty draft in Jianying and quit before checking the paths again.
+2. Create the draft to copy media and prepare the saved timeline. If Jianying is running, save your work and quit normally, then choose continue/retry in XM.
+3. After registration, open Jianying and find the draft by the name displayed in XM. Continue editing and export from Jianying.
+4. After changing the timeline in XM, create a new version. Existing delivered drafts and manual edits are preserved. Page loads, refreshes, and video completion do not register drafts automatically.
+
+MP4 rendering and draft delivery have independent states. Jianying **11.7.0 on Apple Silicon Mac** has been tested; Windows adaptation and automated checks are implemented, but **native opening, editing, and export remain unverified**. Automatic registration requires XM and Jianying on the same computer. Remote deployments provide a media-inclusive package; relocating media paths and registering it on the destination computer are manual steps.
+
 ## License
 
 See [LICENSE](LICENSE), [NOTICE](NOTICE), and [LICENSES](LICENSES/) for license terms and third-party notices.

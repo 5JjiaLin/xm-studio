@@ -18,6 +18,8 @@ const productionBase = {
 
 test.beforeEach(({ api }) => {
   api.override({
+    "GET /api/v1/production/jianying/settings": { status: 200, body: { local: true, settings: { enabled: true, app_path: "/Applications/VideoFusion-macOS.app", draft_root: "/drafts" }, compatibility: { system: "Darwin", architecture: "arm64", version: "11.7.0", build: "11.7.0", ready: true, process: "stopped", verification: "mac_11_7_sample" } } },
+    "GET /api/v1/projects/demo/episodes/1/production/jianying": { status: 200, body: { delivery: null } },
     "GET /api/v1/projects/demo/production/costs": { status: 200, body: { episodes: [1, 2].map((episode) => ({ episode, call_count: 0, known_call_count: 0, amounts: {}, unpriced_count: 0, pending_count: 0, reroll_count: 0, reroll_amounts: {}, unidentified_target_count: 0, categories: {} })), unassigned: { call_count: 0, categories: {} } } },
     "POST /api/v1/projects/demo/reference-videos/episodes/1/units/E1U1/prompt-preview": { status: 200, body: { text: "完整视频框架", creative_text: "完整视频框架", declarations: "", references: [], warnings: [], unavailable: null } },
     "GET /api/v1/auth/status": { status: 200, body: { enabled: false } } });
@@ -1180,7 +1182,7 @@ test("creative prompt typing retains focus and failed previews never authorize g
   const creative = page.locator("#video-creative-E1U1");
   await expect(creative).toHaveValue("原始框架");
   await creative.focus();
-  await creative.press("End");
+  await creative.evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(node.value.length, node.value.length));
   for (const key of ["a", "b", "c"]) {
     const before = calls;
     await creative.press(key);
@@ -1192,7 +1194,7 @@ test("creative prompt typing retains focus and failed previews never authorize g
   await page.getByRole("button", { name: "恢复默认框架", exact: true }).click();
   await expect(page.getByRole("button", { name: "确认提示词并生成当前视频", exact: true })).toBeEnabled();
   fail = true;
-  await page.getByRole("button", { name: "刷新完整预览", exact: true }).click();
+  await page.getByRole("button", { name: "刷新最终提示词", exact: true }).click();
   await expect(page.getByRole("alert").filter({ hasText: "预览暂不可用" })).toBeVisible();
   await expect(page.getByRole("button", { name: "确认提示词并生成当前视频", exact: true })).toBeDisabled();
   await expect(creative).toBeVisible();
@@ -1253,4 +1255,47 @@ test("late video submission stays on the destination after leaving the episode",
   release();
   await expect(page.getByText("任务已提交，将在后台继续处理。", { exact: true })).toBeVisible();
   await expect(page).toHaveURL(/\/app\/projects\/demo$/);
+});
+
+
+test("Jianying handoff is explicit, resumes after exit and keeps MP4 and new versions independent", async ({ page, api }) => {
+  const edit = recorded<import("../../src/types/production.js").ProductionEdit>("project-demo-production-edit.json");
+  let delivery: import("../../src/types/jianying-delivery.js").JianyingDelivery | null = null;
+  const submitted: Record<string, unknown>[] = [];
+  let fail = false;
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "completed", stage: "render", timeline_id: edit.timeline_id, output: { status: "current", artifact_path: "renders/final.mp4", version: 2 } } },
+    "GET /api/v1/projects/demo/episodes/1/production/edit": { status: 200, body: edit },
+  });
+  await page.route("**/api/v1/projects/demo/episodes/1/production/jianying", async (route) => {
+    if (route.request().method() === "POST") {
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      submitted.push(body);
+      if (fail) { fail = false; await route.fulfill({ status: 409, json: { detail: "索引已变化，请重试" } }); return; }
+      delivery = { delivery_id: body.new_version ? "second" : "first", draft_id: body.new_version ? "draft-two" : "draft-one", folder: "测试剪映草稿", revision: 1, local: true, error: null, state: delivery ? "delivered" : "preparing" };
+    }
+    await route.fulfill({ json: { delivery } });
+  });
+  await page.goto("/app/make/demo?step=output&episode=1");
+  const card = page.getByRole("region", { name: "剪映草稿", exact: true });
+  await expect(card.getByRole("button", { name: "在剪映建立草稿", exact: true })).toBeEnabled();
+  await card.getByRole("button", { name: "刷新状态", exact: true }).click();
+  expect(submitted).toHaveLength(0);
+  await card.getByRole("button", { name: "在剪映建立草稿", exact: true }).click();
+  await expect(card.getByRole("status")).toContainText("正在准备");
+  delivery = { ...delivery!, state: "waiting_for_exit" };
+  await expect(card.getByRole("status")).toContainText("退出剪映");
+  fail = true;
+  await card.getByRole("button", { name: "继续登记 / 重试", exact: true }).click();
+  await expect(card.getByRole("alert")).toContainText("索引已变化");
+  await expect(page.getByRole("link", { name: "下载 MP4", exact: true })).toBeVisible();
+  await card.getByRole("button", { name: "继续登记 / 重试", exact: true }).click();
+  await expect(card.getByRole("button", { name: "打开剪映", exact: true })).toBeVisible();
+  await card.getByRole("button", { name: "建立新版本", exact: true }).click();
+  await expect.poll(() => submitted.length).toBe(4);
+  expect(submitted[3]).toMatchObject({ new_version: true, previous_id: "first", local: true });
+  await page.reload();
+  await expect(card.getByRole("status")).toContainText("已在剪映草稿箱建立");
+  expect(submitted).toHaveLength(4);
+  await expectReachableLayout(page);
 });

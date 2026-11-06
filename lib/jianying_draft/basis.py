@@ -25,7 +25,7 @@ from lib.speech.speech_artifact_provenance import RenditionVariant
 from lib.speech.speech_composition import SpeechMode
 
 JIANYING_DRAFT_BASIS_KIND = "artifact-jianying-draft"
-JIANYING_DRAFT_BASIS_VERSION = 1
+JIANYING_DRAFT_BASIS_VERSION = 2
 
 type DraftNarration = Literal["without_narration", "with_narration"]
 """剪映草稿的旁白版本：带旁白版本多一条旁白轨，只对 TTS 配音项目开放。"""

@@ -170,3 +170,26 @@ def test_overlapping_items_are_stacked_onto_the_fewest_tracks_without_overlap_in
     # 首尾相接不算重叠：丁在甲结束时接上第一条轨；戊开始时只有第三条轨已空出。
     assert [[item.text for item in track] for track in tracks] == [["甲", "丁"], ["乙"], ["丙", "戊"]]
     assert stack_tracks(()) == ()
+
+
+def test_manual_subtitle_follows_trim_and_order_and_empty_override_clears_auto():
+    from lib.edit_timeline.model import ClipSubtitle
+
+    cue = ClipSubtitle(
+        id="s1",
+        text="人工字幕",
+        start_us=1_200_000,
+        end_us=1_800_000,
+        basis_version=2,
+        font_size=60,
+        color="#FF0000",
+        position="top",
+    )
+    content = EditTimelineContent(
+        clips=(
+            _clip("c2", "U2", subtitles=()),
+            _clip("c1", "U1", trim=ClipTrim(in_us=S, out_us=2 * S, basis_version=2), subtitles=(cue,)),
+        )
+    )
+    placement = place_timeline(content, {"U1": _unit("U1"), "U2": _unit("U2", cues=(UnitCue(0, S, "自动"),))})
+    assert placement.subtitles == (PlacedSubtitle(4_200_000, 600_000, "人工字幕", True, 60, "#FF0000", "top"),)

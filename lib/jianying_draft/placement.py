@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Literal, Protocol
 
 from lib.bgm.library import BgmSource
 from lib.edit_timeline.bgm import place_bgm
@@ -124,6 +124,10 @@ class PlacedSubtitle:
     start_us: int
     duration_us: int
     text: str
+    manual: bool = False
+    font_size: int = 48
+    color: str = "#FFFFFF"
+    position: Literal["top", "center", "bottom"] = "bottom"
 
     @property
     def end_us(self) -> int:
@@ -230,6 +234,19 @@ def place_timeline(
             narrations.append(PlacedNarration(clip.id, unit.narration_path, cursor, unit.narration_duration_us))
         if clip.subtitles is None:
             subtitles.extend(_clip_subtitles(placed, unit, carries=clip.carries_narration))
+        else:
+            subtitles.extend(
+                PlacedSubtitle(
+                    cursor + cue.start_us - source_in,
+                    cue.end_us - cue.start_us,
+                    cue.text,
+                    True,
+                    cue.font_size,
+                    cue.color,
+                    cue.position,
+                )
+                for cue in clip.subtitles
+            )
         cursor += placed.source_duration_us + placed.hold_us
     if clips and clips[-1].transition_to_next is not None:
         clips[-1] = replace(clips[-1], transition_to_next=None)

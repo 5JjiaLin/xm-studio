@@ -1,3 +1,4 @@
+import type { JianyingDeliveryResponse } from "@/types/jianying-delivery";
 /**
  * API 调用封装 (TypeScript)
  *
@@ -1518,6 +1519,28 @@ class API {
   // ==================== script_plan → prompt_authoring 内容确认 ====================
 
   /** 读取该集 script_plan 结构化中间态 + 内容确认状态（供 web 渲染与编辑）。 */
+  static async getJianyingSettings(): Promise<import("@/types/jianying-delivery").JianyingSettingsResponse> {
+    return this.request("/production/jianying/settings");
+  }
+  static async saveJianyingSettings(settings: import("@/types/jianying-delivery").JianyingLocalSettings): Promise<import("@/types/jianying-delivery").JianyingSettingsResponse> {
+    return this.request("/production/jianying/settings", { method: "PUT", body: JSON.stringify(settings) });
+  }
+  static async getJianyingDelivery(project: string, episode: number): Promise<JianyingDeliveryResponse> {
+    return this.request(`/projects/${encodeURIComponent(project)}/episodes/${episode}/production/jianying`);
+  }
+  static async submitJianyingDelivery(project: string, episode: number, options: { local: boolean; new_version?: boolean; previous_id?: string }): Promise<JianyingDeliveryResponse> {
+    return this.request(`/projects/${encodeURIComponent(project)}/episodes/${episode}/production/jianying`, { method: "POST", body: JSON.stringify(options) });
+  }
+  static async openJianyingDelivery(project: string, episode: number, target: "app" | "folder"): Promise<void> {
+    await this.request(`/projects/${encodeURIComponent(project)}/episodes/${episode}/production/jianying/open`, { method: "POST", body: JSON.stringify({ target }) });
+  }
+  static async downloadJianyingDelivery(project: string, episode: number): Promise<Blob> {
+    const endpoint = `/projects/${encodeURIComponent(project)}/episodes/${episode}/production/jianying/package`;
+    const response = await fetch(`${API_BASE}${endpoint}`, withAuth(endpoint));
+    await throwIfNotOk(response, `HTTP ${response.status}`);
+    return response.blob();
+  }
+
   static async getProductionEdit(project: string, episode: number, options?: { signal?: AbortSignal }): Promise<import("@/types/production").ProductionEdit> {
     return this.request(`/projects/${encodeURIComponent(project)}/episodes/${episode}/production/edit`, options);
   }

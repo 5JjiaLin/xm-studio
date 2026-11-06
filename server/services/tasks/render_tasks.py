@@ -145,6 +145,11 @@ async def execute_jianying_draft_task(task: dict[str, Any], projects: ProjectMan
 
     payload: Mapping[str, Any] = task.get("payload") or {}
     revision = payload.get("revision")
+    if payload.get("delivery_id"):
+        from server.services.presentation.jianying_delivery import execute_delivery
+
+        result = await execute_delivery(projects, str(payload["delivery_id"]))
+        return {"jianying_delivery": result}
     result = await TimelineJianyingDraftService(projects).render(
         str(task["project_name"]),
         str(payload["timeline_id"]),

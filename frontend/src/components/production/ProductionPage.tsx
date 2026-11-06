@@ -10,6 +10,7 @@ import { productionPath, projectPath, PRODUCTION_STEPS } from "./production-path
 import { EpisodeCost } from "./management/ProductionCosts";
 import { WorkPicker } from "./management/WorkPicker";
 import { ScriptInput } from "./script/ScriptInput";
+import { JianyingDeliveryCard } from "./output/JianyingDeliveryCard";
 import { ProductionEditor } from "./output/ProductionEditor";
 import { ProductionAssetCard } from "./assets/ProductionAssetCard";
 import { ProductionVideoCard } from "./videos/ProductionVideoCard";
@@ -186,6 +187,7 @@ export function ProductionPage() {
           </section><div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-4">{episode && units.map((u, i) => <ProductionVideoCard key={u.unit_id} project={projectName} episode={episode} unit={u} index={i} production={production} progress={videoProgress.get(u.unit_id)!} onChanged={refresh} onUploaded={rebuild} />)}</div>{!active && canRebuild && <Button variant="outline" className="self-start" onClick={() => void rebuild()}>{t("production_rebuild_output")}</Button>}</>}
           {step === "output" && (previousOutputUrl ? <><video controls src={previousOutputUrl} className="max-h-[70vh] w-full"><track kind="captions" /></video>{!outputCurrent && <p className="text-sm text-muted-foreground">{t("production_output_changed")}</p>}{!outputCurrent && !active && canRebuild && <Button variant="outline" className="self-start" onClick={() => void rebuild()}>{t("production_rebuild_output")}</Button>}</> : <div className="flex flex-col gap-3"><p className="text-sm text-muted-foreground">{t(output && output.status !== "missing" ? "production_output_changed" : "production_wait_output")}</p>{!active && canRebuild && <Button variant="outline" className="self-start" onClick={() => void rebuild()}>{t("production_rebuild_output")}</Button>}</div>)}
           {step === "output" && production?.timeline_id && <ProductionEditor project={projectName} episode={episode} units={units} busy={active} onChanged={refresh} onRender={() => rebuild(true)} />}
+          {step === "output" && production?.timeline_id && <JianyingDeliveryCard key={`${projectName}/${episode}`} project={projectName} episode={episode} busy={active} revision={JSON.stringify(production)} />}
           {step === "output" && <EpisodeCost project={projectName} episode={episode} revision={JSON.stringify(production)} />}
         </>}
       </div>

@@ -30,8 +30,10 @@ from lib.edit_timeline import (
     TimelineIssue,
 )
 from lib.edit_timeline.bgm import bgm_ids
+from lib.edit_timeline.manual_subtitles import edit_issues
 from lib.edit_timeline.model import microseconds_to_seconds
 from lib.edit_timeline.readout import bgm_missing_issues
+from lib.edit_timeline.sources import load_episode_script_units, load_episode_sources
 from lib.edit_timeline.store import EditTimelineStore
 from lib.episode.episode_ids import episode_file_label
 from lib.i18n import _ as translate_default
@@ -43,6 +45,7 @@ from lib.jianying_draft.archive import (
     JianyingVersion,
     canvas_size,
     package_jianying_draft,
+    portable_name,
     verify_jianying_draft,
     write_jianying_draft,
 )
@@ -90,7 +93,7 @@ def draft_folder_name(
         base = raw_title if isinstance(raw_title, str) and raw_title.strip() else project_name
     name = f"{base}_{timeline_name}" + ("_带旁白" if narration == WITH_NARRATION else "")
     safe = name.translate(_WINDOWS_UNSAFE_NAME_CHARACTERS).replace("..", "_").strip().rstrip(".")
-    return safe or project_name
+    return portable_name(safe or project_name)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -185,6 +188,12 @@ class TimelineJianyingDraftService:
             raise JianyingDraftError(
                 "jianying_draft_narration_unavailable", "只有 TTS 配音项目可以导出带旁白版本", narration=narration
             )
+        document = await asyncio.to_thread(lambda: EditTimelineStore(self._projects, project_name).find(timeline_id))
+        content = document.revision(readout.revision).content
+        script = await asyncio.to_thread(load_episode_script_units, self._projects, project_name, document.episode)
+        sources = await load_episode_sources(self._projects, project_name, script, {c.unit_id for c in content.clips})
+        if invalid := edit_issues(content.clips, sources.media):
+            raise JianyingDraftError("jianying_draft_blocked", "请先修复失效的裁剪或字幕", issues=invalid)
         applicable = _applicable_issues(readout.issues, narration)
         blocking = [issue for issue in applicable if issue.severity is IssueSeverity.BLOCKING]
         if blocking:
@@ -292,6 +301,10 @@ class TimelineJianyingDraftService:
     ) -> JianyingDraftRender:
         """把剪辑时间线的指定修订（缺省为最新修订）导出为剪映草稿并登记。"""
         job = await self.prepare(project_name, timeline_id, narration=narration, revision=revision)
+        return await self.render_prepared(job)
+
+    async def render_prepared(self, job: JianyingDraftJob) -> JianyingDraftRender:
+        """Render the already checked immutable submission snapshot."""
         rendered = await commit_rendered_artifact(
             job.project_dir,
             key=job.key,

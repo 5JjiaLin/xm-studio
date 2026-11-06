@@ -12,8 +12,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import zipfile
 from collections.abc import Callable, Mapping
@@ -41,7 +43,7 @@ from pyJianYingDraft import (
 from lib.edit_timeline.transitions import transition_preset
 from lib.infra.path_safety import PathTraversalError, safe_join
 from lib.jianying_draft.placement import DraftPlacement, PlacedClip, stack_tracks
-from lib.subtitle_style.baseline import subtitle_style_baseline
+from lib.subtitle_style.baseline import JIANYING_FONT_PX_PER_SIZE, subtitle_style_baseline
 
 type JianyingVersion = Literal["5", "6"]
 
@@ -102,6 +104,26 @@ def _track_name(base: str, index: int) -> str:
     return base if index == 0 else f"{base} {index + 1}"
 
 
+def portable_name(name: str) -> str:
+    """One filename usable on both Windows and macOS, including reserved DOS basenames."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().rstrip(". ") or "draft"
+    if name.split(".")[0].upper() in {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }:
+        name = "_" + name
+    return name[:150].rstrip(". ")
+
+
+def file_sha256(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 class _AssetStaging:
     """把草稿引用的文件放进同一个暂存目录，素材名在草稿内唯一。"""
 
@@ -112,9 +134,10 @@ class _AssetStaging:
         self.index: dict[str, dict[str, object]] = {}
 
     def _unique_name(self, name: str) -> str:
+        name = portable_name(name)
         stem, suffix = os.path.splitext(name)
         candidate, counter = name, 1
-        while candidate in self.index:
+        while candidate.casefold() in {key.casefold() for key in self.index}:
             candidate = f"{stem}_{counter}{suffix}"
             counter += 1
         return candidate
@@ -132,13 +155,13 @@ class _AssetStaging:
             except OSError:
                 shutil.copy2(source, self.directory / name)
             self._by_project_path[relative_path] = name
-            self.index[name] = {"project": relative_path}
+            self.index[name] = {"project": relative_path, "sha256": file_sha256(self.directory / name)}
         return str(self.directory / name)
 
     def bundled_file(self, source: Path, name: str) -> str:
         name = self._unique_name(name)
         shutil.copy2(source, self.directory / name)
-        self.index[name] = {"bundled": True}
+        self.index[name] = {"bundled": True, "sha256": file_sha256(self.directory / name)}
         return str(self.directory / name)
 
 
@@ -249,14 +272,26 @@ def write_jianying_draft(
 
     style, border, shadow, transform_y = _subtitle_style(width, height)
     for index, track in enumerate(subtitle_tracks):
-        position = ClipSettings(transform_y=transform_y + index * EXTRA_SUBTITLE_TRACK_RAISE)
         for subtitle in track:
+            item_style = style
+            y = transform_y + index * EXTRA_SUBTITLE_TRACK_RAISE
+            if subtitle.manual:
+                item_style = TextStyle(
+                    size=subtitle.font_size * height / 1080 / JIANYING_FONT_PX_PER_SIZE,
+                    color=tuple(int(subtitle.color[i : i + 2], 16) / 255 for i in (1, 3, 5)),
+                    align=1,
+                    bold=True,
+                    auto_wrapping=True,
+                    max_line_width=style.max_line_width,
+                )
+                y = {"top": 0.75, "center": 0.0, "bottom": -0.75}[subtitle.position]
+            position = ClipSettings(transform_y=y)
             script.add_segment(
                 TextSegment(
                     text=subtitle.text,
                     timerange=trange(subtitle.start_us, subtitle.duration_us),
                     font=SUBTITLE_FONT,
-                    style=style,
+                    style=item_style,
                     border=border,
                     shadow=shadow,
                     clip_settings=position,
@@ -368,6 +403,8 @@ def package_jianying_draft(
     output: Path,
 ) -> None:
     """把剪映草稿产物代入本机草稿目录与剪映版本，连同项目素材打成可直接解压进剪映草稿目录的 zip。"""
+    if portable_name(draft_name) != draft_name:
+        raise JianyingDraftArchiveError("草稿名包含不可迁移的字符")
     assets_dir = f"{draft_root.rstrip('/\\')}/{draft_name}/{ASSETS_DIR}"
     content_name = "draft_info.json" if jianying_version == "6" else CONTENT_NAME
     with zipfile.ZipFile(path) as archive, zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as packed:
@@ -382,13 +419,32 @@ def package_jianying_draft(
             relative = info.filename.removeprefix(f"{DRAFT_DIR}/")
             if relative != CONTENT_NAME:
                 packed.writestr(f"{draft_name}/{relative}", archive.read(info))
+        manifest = {}
         for name, source in assets.items():
+            if portable_name(name) != name:
+                raise JianyingDraftArchiveError("素材名包含不可迁移的字符")
             target = f"{draft_name}/{ASSETS_DIR}/{name}"
             compression = zipfile.ZIP_STORED if Path(name).suffix.lower() in _STORED_SUFFIXES else zipfile.ZIP_DEFLATED
             if source.get("bundled") is True:
-                packed.writestr(target, archive.read(f"{ASSETS_DIR}/{name}"), compress_type=compression)
+                data = archive.read(f"{ASSETS_DIR}/{name}")
+                digest = hashlib.sha256(data).hexdigest()
+                packed.writestr(target, data, compress_type=compression)
             else:
-                packed.write(_resolve_project_asset(project_dir, source), target, compress_type=compression)
+                resolved = _resolve_project_asset(project_dir, source)
+                hasher = hashlib.sha256()
+                info = zipfile.ZipInfo(target)
+                info.compress_type = compression
+                with resolved.open("rb") as src, packed.open(info, "w", force_zip64=True) as dest:
+                    while chunk := src.read(1024 * 1024):
+                        hasher.update(chunk)
+                        dest.write(chunk)
+                digest = hasher.hexdigest()
+            if source.get("sha256") and source["sha256"] != digest:
+                raise JianyingDraftArchiveError(f"素材摘要已变化：{name}")
+            manifest[name] = digest
+        packed.writestr(
+            f"{draft_name}/xm_materials.json", json.dumps({"format": 1, "assets": manifest}, ensure_ascii=False)
+        )
 
 
 __all__ = [

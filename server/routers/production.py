@@ -11,9 +11,10 @@ from lib.db import async_session_factory
 from lib.db.repositories.usage_repo import UsageRepository
 from lib.episode.episode_source_commands import EpisodeSourceError, set_episode_source_text
 from lib.generation.generation_admission import generation_admission_lock
-from lib.generation.generation_queue import get_generation_queue
+from lib.generation.generation_queue import ActiveTaskRequestConflict, get_generation_queue
 from lib.infra.api_errors import ConflictError
 from lib.infra.async_thread import run_sync_transaction
+from lib.jianying_draft.local_delivery import LocalSettings
 from lib.project.production_management import MANAGEMENT_RESOURCE, set_archive
 from lib.project.project_change_hints import project_change_source
 from server.auth import CurrentUser
@@ -465,3 +466,191 @@ async def review_feedback(project_name: str, body: FeedbackReviewRequest, reques
         )
 
     return await run_sync_transaction(write)
+
+
+# Explicit handoff: reads and production completion never submit a draft.
+class JianyingDeliveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    new_version: bool = False
+    previous_id: str | None = None
+    local: bool = True
+
+
+def _is_local_jianying(request: Request) -> bool:
+    return bool(
+        request.client
+        and request.client.host in {"127.0.0.1", "::1"}
+        and request.url.hostname in {"127.0.0.1", "localhost", "::1"}
+        and not request.headers.get("forwarded")
+        and not request.headers.get("x-forwarded-for")
+    )
+
+
+def _require_local_jianying(request: Request):
+    if not _is_local_jianying(request):
+        raise HTTPException(409, "远程部署只能准备草稿包，请在运行 XM 的电脑上配置本机交接")
+
+
+@source_router.get("/production/jianying/settings")
+async def jianying_settings(request: Request, user: CurrentUser):
+    from lib.jianying_draft.local_delivery import compatibility
+    from server.services.presentation.jianying_delivery import delivery_store
+
+    store = delivery_store(service(request).projects)
+    settings = await asyncio.to_thread(store.settings)
+    return {
+        "settings": settings,
+        "compatibility": await asyncio.to_thread(compatibility, settings),
+        "local": _is_local_jianying(request),
+    }
+
+
+@source_router.put("/production/jianying/settings")
+async def save_jianying_settings(body: LocalSettings, request: Request, user: CurrentUser):
+    from lib.jianying_draft.local_delivery import DeliveryError
+    from server.services.presentation.jianying_delivery import delivery_store
+
+    _require_local_jianying(request)
+    try:
+        await asyncio.to_thread(delivery_store(service(request).projects).save_settings, body)
+    except DeliveryError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return await jianying_settings(request, user)
+
+
+@router.get("/projects/{project_name}/episodes/{episode}/production/jianying")
+async def jianying_delivery_status(project_name: str, episode: int, request: Request, user: CurrentUser):
+    from lib.edit_timeline.errors import EditTimelineError
+    from lib.jianying_draft.errors import JianyingDraftError
+    from server.services.presentation.jianying_delivery import delivery_store
+    from server.services.presentation.timeline_jianying_draft import TimelineJianyingDraftService
+
+    pm = service(request).projects
+    store = delivery_store(pm)
+    await asyncio.to_thread(pm.get_project_path, project_name)
+    record = await asyncio.to_thread(store.latest, project_name, episode)
+    if record:
+        record = await asyncio.to_thread(store.observed, record)
+        try:
+            job = await TimelineJianyingDraftService(pm).prepare(
+                project_name, record["timeline_id"], narration=record["narration"]
+            )
+            record["stale"] = job.basis.digest != record["basis"]
+        except (ValueError, FileNotFoundError, JianyingDraftError, EditTimelineError):
+            record["stale"] = True
+        if record["state"] == "preparing":
+            task = await get_generation_queue().get_task(record["task_id"]) if record.get("task_id") else None
+            if not task or task.get("status") in {"failed", "cancelled"}:
+                record.update(state="failed", error="准备任务已中断，请重试")
+    return {"delivery": record}
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/production/jianying")
+async def submit_jianying_delivery(
+    project_name: str, episode: int, body: JianyingDeliveryRequest, request: Request, user: CurrentUser
+):
+    from lib.jianying_draft.errors import JianyingDraftError
+    from lib.jianying_draft.local_delivery import DeliveryError
+    from server.services.presentation.jianying_delivery import delivery_store
+    from server.services.presentation.timeline_jianying_draft import TimelineJianyingDraftService, draft_folder_name
+    from server.services.tasks.render_tasks import jianying_draft_task_request
+
+    if body.local:
+        _require_local_jianying(request)
+    pm = service(request).projects
+    store = delivery_store(pm)
+    try:
+        timelines, timeline_id = await _production_timeline(project_name, episode, request)
+        drafts = TimelineJianyingDraftService(pm)
+        checked = await drafts.check(project_name, timeline_id)
+        job = await drafts.prepare(project_name, timeline_id, revision=checked.revision, narration=checked.narration)
+        readout = await timelines.read(project_name, timeline_id)
+        project = await asyncio.to_thread(pm.load_project, project_name)
+        name = draft_folder_name(
+            project_name, project, episode=episode, timeline_name=readout.timeline.name, narration=checked.narration
+        )
+        record = await asyncio.to_thread(
+            store.reserve,
+            project=project_name,
+            episode=episode,
+            timeline_id=timeline_id,
+            revision=job.revision,
+            narration=job.narration,
+            basis=job.basis.digest,
+            name=name,
+            new_version=body.new_version,
+            previous_id=body.previous_id,
+            local=body.local,
+        )
+        if record["local"]:
+            _require_local_jianying(request)
+        if record["state"] in {"delivered", "package_ready"}:
+            return {"delivery": record}
+        if record["basis"] != job.basis.digest:
+            raise DeliveryError("素材或时间线已变化，请建立新版本")
+        if await asyncio.to_thread(store.package_path(record["delivery_id"]).is_file):
+            try:
+                return {"delivery": await asyncio.to_thread(store.register, record["delivery_id"])}
+            except (DeliveryError, OSError, ValueError) as exc:
+                await asyncio.to_thread(store.patch, record["delivery_id"], state="failed", error=str(exc))
+                raise DeliveryError(str(exc)) from exc
+        task_request = jianying_draft_task_request(
+            episode=episode,
+            timeline_id=record["timeline_id"],
+            revision=record["revision"],
+            narration=record["narration"],
+        )
+        task_request.payload["delivery_id"] = record["delivery_id"]
+        if record["state"] == "failed":
+            await asyncio.to_thread(store.patch, record["delivery_id"], state="preparing", error=None)
+        enqueued = await get_generation_queue().enqueue_task(
+            project_name=project_name, **task_request.enqueue_fields(), source="webui", user_id=user.id
+        )
+        record = await asyncio.to_thread(store.patch, record["delivery_id"], task_id=enqueued["task_id"])
+        return {"delivery": record}
+    except ActiveTaskRequestConflict as exc:
+        if "record" in locals():
+            await asyncio.to_thread(
+                store.patch, record["delivery_id"], state="failed", error="另一个草稿任务正在运行，请稍后重试"
+            )
+        raise HTTPException(409, "另一个草稿任务正在运行，请稍后重试") from exc
+    except (DeliveryError, JianyingDraftError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+class OpenJianyingRequest(BaseModel):
+    target: Literal["app", "folder"]
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/production/jianying/open")
+async def open_jianying_delivery(
+    project_name: str, episode: int, body: OpenJianyingRequest, request: Request, user: CurrentUser
+):
+    from lib.jianying_draft.local_delivery import DeliveryError
+    from server.services.presentation.jianying_delivery import delivery_store
+
+    _require_local_jianying(request)
+    store = delivery_store(service(request).projects)
+    record = await asyncio.to_thread(store.latest, project_name, episode)
+    if not record:
+        raise HTTPException(404, "还没有建立剪映草稿")
+    try:
+        await asyncio.to_thread(store.open_target, record["delivery_id"], body.target)
+    except DeliveryError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"ok": True}
+
+
+@router.get("/projects/{project_name}/episodes/{episode}/production/jianying/package")
+async def download_jianying_delivery(project_name: str, episode: int, request: Request, user: CurrentUser):
+    from fastapi.responses import FileResponse
+
+    from server.services.presentation.jianying_delivery import delivery_store
+
+    store = delivery_store(service(request).projects)
+    record = await asyncio.to_thread(store.latest, project_name, episode)
+    if not record or not await asyncio.to_thread(store.package_path(record["delivery_id"]).is_file):
+        raise HTTPException(404, "草稿包尚未准备完成")
+    return FileResponse(
+        store.package_path(record["delivery_id"]), filename=f"{record['folder']}.zip", media_type="application/zip"
+    )

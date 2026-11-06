@@ -440,7 +440,7 @@ class FinalCutService:
         if placement is not None and variant.burns_subtitles:
             burned = tuple(
                 BurnedSubtitle(start_us=item.start_us, end_us=item.end_us, text=item.text)
-                for item in placement.subtitles
+                for item in placement.subtitles if not item.manual
             )
             by_id = {item.clip.id: item.clip for item in inputs.clips}
             manual = []
