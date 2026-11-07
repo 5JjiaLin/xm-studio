@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 
+import httpx
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
 from lib.backends.transport_layer import TransportLayer, layer_async_client
@@ -23,6 +24,11 @@ from lib.config.url_utils import OFFICIAL_OPENAI_BASE_URL
 logger = logging.getLogger(__name__)
 
 OPENAI_RETRYABLE_ERRORS: tuple[type[Exception], ...] = ()
+
+# 长思考文本请求允许连续 30 分钟无数据；连接建立仍需在 30 秒内完成。
+# 这是本机读取等待，不能覆盖供应商/代理自身的超时。
+OPENAI_TEXT_TIMEOUT = httpx.Timeout(1800.0, connect=30.0)
+LONG_THINKING_TEXT_MODELS = frozenset({"gpt-6-astra"})
 
 OPENAI_IMAGE_QUALITY_MAP: dict[str, str] = {
     "512px": "low",
@@ -55,6 +61,7 @@ def create_openai_client(
     base_url: str | None = None,
     max_retries: int | None = None,
     transport_layer: TransportLayer | None = None,
+    timeout: httpx.Timeout | None = None,
 ) -> AsyncOpenAI:
     """创建 AsyncOpenAI 客户端，统一处理 api_key 和 base_url。
 
@@ -67,6 +74,9 @@ def create_openai_client(
         kwargs["api_key"] = api_key
     if max_retries is not None:
         kwargs["max_retries"] = max_retries
+    if timeout is not None:
+        kwargs["timeout"] = timeout
     if transport_layer is not None:
-        kwargs["http_client"] = layer_async_client(DefaultAsyncHttpxClient(), transport_layer)
+        http_client = DefaultAsyncHttpxClient(timeout=timeout) if timeout is not None else DefaultAsyncHttpxClient()
+        kwargs["http_client"] = layer_async_client(http_client, transport_layer)
     return AsyncOpenAI(**kwargs)

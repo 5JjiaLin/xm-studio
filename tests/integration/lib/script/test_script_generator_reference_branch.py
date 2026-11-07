@@ -1742,3 +1742,30 @@ async def test_rewrite_completed_unit_draft_can_be_hand_fixed_and_adopted(refere
     assert result["adopted"] is True
     assert _formal_units(reference_project)["E1U01"]["text"] == fixed
     assert not _prompt_authoring_quarantine(reference_project).exists()
+
+
+@pytest.mark.asyncio
+async def test_drama_authoring_enforces_timeline_and_preserves_non_targets(tmp_path: Path):
+    project_dir = _write_reference_project(tmp_path, video_backend="vidu/vidu2.0", content_mode="drama")
+    selected = {**SCRIPT_PLAN_UNIT, "generation_prompt": "旧人工完整框架"}
+    untouched = {**SCRIPT_PLAN_UNIT, "unit_id": "E1U02", "pending_authoring": False, "text": "旧自由文本"}
+    _write_formal_units(project_dir, [selected, untouched])
+    text = "【0-4s】\n中景，@[主角]推开@[酒馆]的门，停在门前。"
+    out = await ScriptGenerator(project_dir, generator=_fake_prompt_authoring_generator(text)).generate(
+        episode=1, entry_ids=["E1U01"]
+    )
+    data = _json.loads(out.read_text(encoding="utf-8"))
+    assert data["video_units"][0]["prompt_format_version"] == "timeline_v1"
+    assert data["video_units"][0]["generation_prompt"] == "旧人工完整框架"
+    assert data["video_units"][1] == untouched
+    with pytest.raises(DraftViolation) as rejected:
+        await ScriptGenerator(
+            project_dir, generator=_fake_prompt_authoring_generator("@[主角]推开@[酒馆]的门。")
+        ).generate(
+            episode=1,
+            entry_ids=["E1U01"],
+            rewrite=True,
+            overwrite_revision=script_review.content_fingerprint(project_dir / "scripts" / "episode_1.json"),
+        )
+    assert "timeline_missing" in str(rejected.value)
+    assert _formal_units(project_dir)["E1U01"]["text"] == text

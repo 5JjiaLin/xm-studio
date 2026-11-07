@@ -49,6 +49,7 @@ from lib.episode.episode_sources import (
     sync_source_snapshots,
     whole_source_files,
 )
+from lib.episode.script_batch_state import require_batch_idle
 from lib.infra.text_metrics import count_reading_units, reading_unit_noun
 from lib.project import project_trash
 from lib.script.script_review import ForeignFormalScriptError, formal_script_filename, formal_script_overwrite
@@ -314,6 +315,7 @@ def delete_episode(
 ) -> EpisodeDeletionResult | EpisodeDeletionConfirmationRequired:
     """删除一集，移进项目回收站。``revision`` 与当前丢失清单的指纹不符（含未传）时只返回清单，不写入。"""
     project_dir = pm.get_project_path(project_name)
+    require_batch_idle(project_dir)
     project = pm.load_project(project_name)
     if project.get("content_mode") == "ad":
         raise EpisodeManagementError("ad_episode_locked", "广告/短片项目只有一集，不能新建或删除集")
@@ -325,6 +327,7 @@ def delete_episode(
     committed: dict[str, Any] = {}
 
     def _mutate(p: dict[str, Any]) -> None:
+        require_batch_idle(project_dir)
         locked_impact = episode_deletion_impact(project_dir, p, episode)
         if locked_impact.revision != revision:
             raise _StaleConfirmation(locked_impact)

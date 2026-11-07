@@ -14,6 +14,7 @@ from lib.script.reference_video.request_projection import (
     resolve_reference_assets,
     unit_reference_declarations,
 )
+from lib.script.reference_video.temporal_validation import TIMELINE_CODES
 from lib.script.reference_video.text_parser import speech_speaker_references
 from lib.script.reference_video.voice_settings import VoiceRenderSettings
 
@@ -29,7 +30,7 @@ def render_reference_prompt_preview(
 ) -> dict[str, Any]:
     """只读渲染；时长待确认不妨碍查看文本，其他投影阻断项显式显示为不可用。
 
-    与分镜预览同一口径：``text`` 与 ``unavailable`` 恰有一个非 ``None``，``warnings`` 只随文本出现。
+    时间轴阻断问题仍返回可编辑文本与 problems；能力或附件不可用时保留 unavailable。
     """
     result: dict[str, Any] = {
         "text": None,
@@ -42,17 +43,38 @@ def render_reference_prompt_preview(
     candidates = resolve_reference_assets(project, project_path, unit)
     result["used_assets"] = [
         {
-            "type": ref.type, "name": ref.name,
+            "type": ref.type,
+            "name": ref.name,
             "paths": [a.path.relative_to(project_path).as_posix() for a in candidates if a.reference == ref],
             "request_indices": [i + 1 for i, a in enumerate(projection.request_assets) if a.reference == ref],
-            "status": "sent" if any(a.reference == ref for a in projection.request_assets)
-                else "excluded" if any(a.reference == ref for a in candidates) else "missing",
+            "status": "sent"
+            if any(a.reference == ref for a in projection.request_assets)
+            else "excluded"
+            if any(a.reference == ref for a in candidates)
+            else "missing",
         }
         for ref in logical
     ]
     visual_names = {ref.name for ref in logical}
-    result["voice_only"] = [name for name in speech_speaker_references(str(unit.get("text") or "")) if name not in visual_names]
-    blockers = [problem for problem in projection.blocking_problems if problem.code != DURATION_CONFIRMATION_CODE]
+    result["voice_only"] = [
+        name for name in speech_speaker_references(str(unit.get("text") or "")) if name not in visual_names
+    ]
+    result["prompt_source"] = "manual" if unit.get("generation_prompt") else "default"
+    result["prompt_format_version"] = unit.get("prompt_format_version")
+    result["problems"] = [
+        {
+            **problem.to_payload(unit_id=str(unit.get("unit_id") or "")),
+            "message": render_message(problem.code, problem.parameters(), translate, names),
+        }
+        for problem in projection.problems
+        if problem.code in TIMELINE_CODES
+    ]
+    result["generation_allowed"] = not projection.blocking_problems
+    blockers = [
+        problem
+        for problem in projection.blocking_problems
+        if problem.code != DURATION_CONFIRMATION_CODE and problem.code not in TIMELINE_CODES
+    ]
     if blockers:
         result["unavailable"] = render_message(blockers[0].code, blockers[0].parameters(), translate, names)
         return result

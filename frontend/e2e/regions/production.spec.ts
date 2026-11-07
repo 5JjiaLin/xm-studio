@@ -18,11 +18,28 @@ const productionBase = {
 
 test.beforeEach(({ api }) => {
   api.override({
+    "GET /api/v1/projects/demo/production/script-batch": { status: 200, body: { status: "idle", items: [], imports: [] } },
     "GET /api/v1/production/jianying/settings": { status: 200, body: { local: true, settings: { enabled: true, app_path: "/Applications/VideoFusion-macOS.app", draft_root: "/drafts" }, compatibility: { system: "Darwin", architecture: "arm64", version: "11.7.0", build: "11.7.0", ready: true, process: "stopped", verification: "mac_11_7_sample" } } },
     "GET /api/v1/projects/demo/episodes/1/production/jianying": { status: 200, body: { delivery: null } },
     "GET /api/v1/projects/demo/production/costs": { status: 200, body: { episodes: [1, 2].map((episode) => ({ episode, call_count: 0, known_call_count: 0, amounts: {}, unpriced_count: 0, pending_count: 0, reroll_count: 0, reroll_amounts: {}, unidentified_target_count: 0, categories: {} })), unassigned: { call_count: 0, categories: {} } } },
     "POST /api/v1/projects/demo/reference-videos/episodes/1/units/E1U1/prompt-preview": { status: 200, body: { text: "完整视频框架", creative_text: "完整视频框架", declarations: "", references: [], warnings: [], unavailable: null } },
     "GET /api/v1/auth/status": { status: 200, body: { enabled: false } } });
+});
+
+test("a referenced character variant has its own image and blocks video preparation until ready", async ({ page, api }) => {
+  api.override({ ...productionBase,
+    "GET /api/v1/files/demo/characters/base.png": { status: 204, body: "" },
+    "GET /api/v1/projects/demo": { status: 200, body: { ...projectFixture, project: { ...projectFixture.project, content_mode: "drama", generation_mode: "reference_video", characters: { "阿明": { description: "主角", character_sheet: "characters/base.png", derivatives: { "战斗装": { description: "换上铠甲", character_sheet: "" } } } }, scenes: {}, props: {} } } },
+    "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [{ ...unit, pending_authoring: true, text: "@[阿明/战斗装] 走进房间" }], unit_capabilities: {} } },
+    "POST /api/v1/projects/demo/characters/阿明/derivatives/战斗装/prompt-preview": { status: 200, body: { text: "以人物原图为参考，换上铠甲", unavailable: null, warnings: [], is_text_form: true } },
+  });
+  await page.goto("/app/make/demo?step=assets&episode=1");
+  const variant = page.getByRole("article", { name: "阿明/战斗装" });
+  await expect(variant).toBeVisible();
+  await expect(variant.getByRole("textbox", { name: "完整生图提示词" })).toHaveValue("以人物原图为参考，换上铠甲");
+  await expect(page.getByText(/1\s*\/\s*2/)).toBeVisible();
+  await page.goto("/app/make/demo?step=videos&episode=1");
+  await expect(page.getByRole("button", { name: "编写视频提示词" })).toBeDisabled();
 });
 
 test("mixed unit assets show sent excluded missing and voice-only references at the reported viewport", async ({ page, api }) => {
@@ -44,30 +61,6 @@ test("mixed unit assets show sent excluded missing and voice-only references at 
   await expect(assets.getByText("道具 · 银针", { exact: true })).toBeVisible();
   await expect(assets.getByText(/画外守卫/)).toBeVisible();
   await expect(page.getByText("道具图片尚未准备", { exact: true })).toBeVisible();
-  await expectReachableLayout(page);
-});
-
-test("local tester settings save without generation and export one evidence package", async ({ page, api }) => {
-  api.override({ ...productionBase });
-  let identity = { installation_id: "local-install", tester_id: "", test_batch_id: "", test_case_id: "" };
-  let saves = 0;
-  await page.route("**/api/v1/production/feedback/settings", async (route) => {
-    if (route.request().method() === "PUT") { saves++; identity = { ...identity, ...route.request().postDataJSON() as Partial<typeof identity> }; }
-    await route.fulfill({ json: identity });
-  });
-  await page.route("**/api/v1/projects/demo/production/feedback/export?include_media=false", (route) => route.fulfill({ contentType: "application/zip", headers: { "content-disposition": 'attachment; filename="feedback-demo.zip"' }, body: "fixture-package" }));
-  await page.goto("/app/make/demo?step=videos&episode=1");
-  const settings = page.locator("details").filter({ has: page.locator("summary", { hasText: "测试记录" }) }).first();
-  await settings.locator("summary").click();
-  await settings.locator("#feedback-tester_id").fill("制作A");
-  await settings.locator("#feedback-test_batch_id").fill("B1");
-  await settings.locator("#feedback-test_case_id").fill("石殿");
-  await settings.getByRole("button", { name: "保存", exact: true }).click();
-  await expect.poll(() => saves).toBe(1);
-  const downloaded = page.waitForEvent("download");
-  await settings.getByRole("button", { name: "导出本项目记录", exact: true }).click();
-  expect((await downloaded).suggestedFilename()).toContain(".zip");
-  expect(identity.tester_id).toBe("制作A");
   await expectReachableLayout(page);
 });
 
@@ -152,23 +145,6 @@ test("project header keeps feedback export disabled when no projects exist", asy
   await expect(page.getByRole("banner").getByRole("button", { name: "导出修改记录", exact: true })).toBeDisabled();
 });
 
-test("prompt adoption records the exact reviewed revision and optional reason", async ({ page, api }) => {
-  const revision = "a".repeat(64);
-  const resource = "unit/scripts/episode_1.json/E1U1";
-  let submitted: unknown;
-  api.override({ ...productionBase,
-    "GET /api/v1/projects/demo/production/feedback/objects": { status: 200, body: { objects: { [resource]: { revision } }, reviews: {} } },
-  });
-  await page.route("**/api/v1/projects/demo/production/feedback/review", async (route) => {
-    submitted = route.request().postDataJSON() as unknown;
-    await route.fulfill({ json: { saved: true } });
-  });
-  await page.goto("/app/make/demo?step=videos&episode=1");
-  await page.getByRole("textbox", { name: "修改原因（可选）", exact: true }).fill("对白正确");
-  await page.getByRole("button", { name: "可用", exact: true }).click();
-  await expect.poll(() => submitted).toEqual({ resource, revision, usable: true, layer: "text", reason: "对白正确" });
-  await expect(page.getByRole("status").filter({ hasText: /^可用$/ })).toBeVisible();
-});
 test("five steps fit the viewport and no platform services load", async ({ page }) => {
   const unrelated: string[] = [];
   page.on("request", (r) => { if (/\/api\/.*(assistant|onboarding|market|official|agent-memory|asset-library)/.test(r.url())) unrelated.push(r.url()); });
@@ -259,7 +235,7 @@ test("removed sections and workspace routes never mount the old platform", async
   expect(unrelated).toEqual([]);
 });
 
-test("single video edits save and regenerate directly without a quote", async ({ page, api }) => {
+test("video edits save before generation from the page footer without a quote", async ({ page, api }) => {
   const submitted: unknown[] = [];
   page.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/production/videos")) submitted.push(request.postDataJSON()); });
   api.override({ ...productionBase,
@@ -270,11 +246,13 @@ test("single video edits save and regenerate directly without a quote", async ({
   await page.goto("/app/make/demo?step=videos");
   await page.getByRole("textbox", { name: "视频提示词", exact: true }).fill("@[阿明] 说：欢迎");
   await expect(page.getByRole("button", { name: "查看报价", exact: true })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "确认提示词并生成当前视频", exact: true })).toBeDisabled();
+  await page.getByRole("button", { name: "确认生成视频", exact: true }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "有未保存的修改" })).toBeVisible();
+  expect(submitted).toEqual([]);
   await page.getByRole("button", { name: "保存", exact: true }).click();
-  await page.getByRole("button", { name: "确认提示词并生成当前视频", exact: true }).click();
+  await page.getByRole("button", { name: "确认生成视频", exact: true }).click();
   await expect.poll(() => submitted.length).toBe(1);
-  expect(submitted[0]).toEqual({ unit_ids: ["E1U1"] });
+  expect(submitted[0]).toEqual({});
   await expectReachableLayout(page);
 });
 
@@ -285,23 +263,100 @@ test("refreshing a running batch never submits paid generation", async ({ page, 
     "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "active", stage: "videos", action: "videos", batch_id: "existing-batch", members: [{ unit_id: "E1U1", status: "running" }] } },
   });
   await page.goto("/app/make/demo?step=videos");
-  await expect(page.getByRole("button", { name: "确认提示词并生成当前视频", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "确认生成视频", exact: true })).toBeDisabled();
   await page.reload();
-  await expect(page.getByRole("button", { name: "确认提示词并生成当前视频", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "确认生成视频", exact: true })).toBeDisabled();
   expect(paid).toEqual([]);
 });
 
-test("manual video upload requests only a local render", async ({ page, api }) => {
-  const calls: string[] = [];
-  page.on("request", (request) => { if (request.method() === "POST") calls.push(new URL(request.url()).pathname); });
+test("completed videos stay for review and only a confirmed single clip is regenerated before explicit merge", async ({ page, api }) => {
+  let status = "active";
+  const generated: unknown[] = [];
+  let merged = 0;
+  let saved = unit.text;
   api.override({ ...productionBase,
-    "POST /api/v1/projects/demo/reference-videos/episodes/1/units/E1U1/upload-video": { status: 200, body: { success: true, path: "reference_videos/E1U1.mp4", version: 1, asset_fingerprints: {} } },
-    "POST /api/v1/projects/demo/episodes/1/production/render": { status: 200, body: { episode: 1, action: "videos", stage: "render", status: "active" } },
+    "GET /api/v1/tasks?page=1&page_size=100": { status: 200, body: { items: [], total: 0 } },
+    "GET /api/v1/files/demo/reference_videos/E1U2.mp4": { status: 204, body: "" },
+    "POST /api/v1/projects/demo/reference-videos/episodes/1/units/E1U2/prompt-preview": { status: 200, body: { text: "完整视频框架", creative_text: "完整视频框架", declarations: "", references: [], unavailable: null } },
   });
+  await page.route("**/api/v1/projects/demo/episodes/1/production", (route) => route.fulfill({ json: {
+    episode: 1, status, stage: "videos", action: "videos",
+    // An existing cut must not trigger automatic navigation after a new batch completes.
+    output: { status: "current", artifact_path: "renders/final.mp4", version: 2 },
+    members: ["E1U1", "E1U2"].map((unit_id) => ({ unit_id, status: status === "active" ? "running" : "succeeded" })),
+  } }));
+  await page.route("**/api/v1/projects/demo/reference-videos/episodes/1/units", (route) => route.fulfill({ json: {
+    units: ["E1U1", "E1U2"].map((unit_id) => ({ ...unit, unit_id, text: unit_id === "E1U1" ? saved : unit.text,
+      generated_assets: { video_clip: `reference_videos/${unit_id}.mp4` } })), unit_capabilities: {},
+  } }));
+  await page.route("**/api/v1/projects/demo/reference-videos/episodes/1/units/E1U1", async (route) => {
+    const body = route.request().postDataJSON() as { prompt: string };
+    saved = body.prompt;
+    await route.fulfill({ json: { unit: { ...unit, text: saved } } });
+  });
+  await page.route("**/api/v1/projects/demo/episodes/1/production/videos", async (route) => {
+    generated.push(route.request().postDataJSON()); status = "active";
+    await route.fulfill({ json: { episode: 1, status, stage: "videos", action: "videos" } });
+  });
+  await page.route("**/api/v1/projects/demo/episodes/1/production/render", async (route) => {
+    merged++;
+    await route.fulfill({ json: { episode: 1, status: "active", stage: "render" } });
+  });
+  await page.goto("/app/make/demo?step=videos&episode=1");
+  const first = page.getByRole("article", { name: "单元 1 · 7 秒", exact: true });
+  const second = page.getByRole("article", { name: "单元 2 · 7 秒", exact: true });
+  const regenerate = first.getByRole("button", { name: "确认提示词并重新生成当前视频", exact: true });
+  const merge = page.getByRole("button", { name: "确认视频并合成成片", exact: true });
+  await expect(regenerate).toBeDisabled();
+  await expect(merge).toBeDisabled();
+  status = "completed";
+  await expect(regenerate).toBeEnabled({ timeout: 10000 });
+  await expect(merge).toBeEnabled();
+  await expect(page).toHaveURL(/step=videos&episode=1$/);
+  expect([generated.length, merged]).toEqual([0, 0]);
+  await page.reload();
+  await expect(regenerate).toBeEnabled();
+  await expect(page).toHaveURL(/step=videos&episode=1$/);
+  const prompt = first.getByRole("textbox", { name: "视频提示词", exact: true });
+  await prompt.fill("更新后的当前视频提示词");
+  await expect(regenerate).toBeDisabled();
+  await merge.click();
+  await expect(page.getByRole("alert").filter({ hasText: "有未保存的修改" })).toBeVisible();
+  expect([generated.length, merged]).toEqual([0, 0]);
+  await first.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(regenerate).toBeEnabled();
+  await regenerate.click();
+  await expect.poll(() => generated.length).toBe(1);
+  expect(generated[0]).toEqual({ unit_ids: ["E1U1"] });
+  await expect(regenerate).toBeDisabled();
+  await expect(second.getByRole("button", { name: "确认提示词并重新生成当前视频", exact: true })).toBeDisabled();
+  await expect(prompt).toBeDisabled();
+  await expect(merge).toBeDisabled();
+  await expect(second.locator("video")).toHaveAttribute("src", /reference_videos\/E1U2.mp4/);
+  status = "completed";
+  await expect(regenerate).toBeEnabled({ timeout: 10000 });
+  await expect(page).toHaveURL(/step=videos&episode=1$/);
+  expect(merged).toBe(0);
+  await expectReachableLayout(page);
+  await merge.click();
+  await expect.poll(() => merged).toBe(1);
+  await expect(page).toHaveURL(/step=output&episode=1$/);
+  expect(generated).toHaveLength(1);
+});
+
+test("production prompts keep a fixed reading area and hide per-unit review/upload controls", async ({ page, api }) => {
+  api.override({ ...productionBase });
   await page.goto("/app/make/demo?step=videos");
-  await page.getByLabel("上传替换视频").setInputFiles({ name: "replacement.mp4", mimeType: "video/mp4", buffer: Buffer.from("fixture video") });
-  await expect.poll(() => calls.includes("/api/v1/projects/demo/episodes/1/production/render")).toBe(true);
-  expect(calls.filter((path) => /\/production\/(videos|assets)$/.test(path))).toEqual([]);
+  const prompt = page.getByRole("textbox", { name: "视频提示词", exact: true });
+  const initialHeight = (await prompt.boundingBox())?.height;
+  await prompt.fill(Array.from({ length: 30 }, (_, i) => `提示词第 ${i + 1} 行`).join("\n"));
+  await expect.poll(async () => (await prompt.boundingBox())?.height).toBe(initialHeight);
+  await expect(page.getByRole("textbox", { name: "修改原因（可选）", exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("上传替换视频")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "确认提示词并生成当前视频", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "确认生成视频", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "导出修改记录", exact: true })).toHaveCount(0);
+  await expectReachableLayout(page);
 });
 
 test("asset edits save and regenerate directly without a quote", async ({ page, api }) => {
@@ -364,7 +419,7 @@ test("render failure offers local rebuilding without paid video retry", async ({
   });
   await page.goto("/app/make/demo?step=videos");
   await expect(page.getByRole("button", { name: "重试失败项", exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "重新合成成片", exact: true }).click();
+  await page.getByRole("button", { name: "确认视频并合成成片", exact: true }).click();
   await expect.poll(() => posts.filter((path) => path.endsWith("/production/render")).length).toBe(1);
   expect(posts.filter((path) => path.endsWith("/production/videos"))).toEqual([]);
 });
@@ -413,6 +468,48 @@ test("breakdown saves edited content before confirming its latest fingerprint", 
   expect(content.new_assets[0].generation_prompt).toBe("穿白衬衫的青年");
   expect(content.new_assets[0].description).toBe("青年");
   expect(calls[1].body).toEqual({ fingerprint: "after-edit" });
+});
+
+test("replanning requires a saved draft, reason and explicit confirmation", async ({ page, api }) => {
+  await page.setViewportSize({ width: 835, height: 732 });
+  const content = { units: [{ ...unit, source_text: "阿明说：你好" }], new_assets: [] };
+  let submissions = 0;
+  let submittedBody: unknown;
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: { episode: 1, content_mode: "drama", status: "pending_review", fingerprint: "draft", confirmed_at: null, content, quarantine: null, supported_durations: null, duration_tiers: null, script_overwrite: null } },
+  });
+  await page.route("**/api/v1/projects/demo/episodes/1/script-plan", async (route) => {
+    submittedBody = route.request().postDataJSON();
+    submissions++;
+    await route.fulfill({ json: { batch: { members: [] } } });
+  });
+  await page.goto("/app/make/demo?step=breakdown&episode=1");
+  const replan = page.getByRole("button", { name: "重新拆解", exact: true });
+  await expect(replan).toBeVisible();
+  await replan.click();
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog).toContainText("修改都会丢失");
+  const confirm = dialog.getByRole("button", { name: "重新拆解", exact: true });
+  const reason = dialog.getByRole("textbox", { name: "重新拆解的原因", exact: true });
+  await expect(confirm).toBeDisabled();
+  await reason.fill("   ");
+  await expect(confirm).toBeDisabled();
+  await expectReachableLayout(page);
+  await expectAccessible(page);
+  await dialog.getByRole("button", { name: "取消" }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(submissions).toBe(0);
+  await page.getByRole("textbox", { name: "单元 1 内容", exact: true }).fill("未保存的修改");
+  await replan.click();
+  await expect(dialog).toHaveCount(0);
+  expect(submissions).toBe(0);
+  await page.getByRole("textbox", { name: "单元 1 内容", exact: true }).fill(unit.text);
+  await replan.click();
+  await reason.fill("  手链脚链归入人物束缚形态，不单独建道具；保留束缚状态。  ");
+  await confirm.click();
+  await expect.poll(() => submissions).toBe(1);
+  expect(submittedBody).toEqual({ replan_reason: "手链脚链归入人物束缚形态，不单独建道具；保留束缚状态。" });
+  await expect(dialog).toHaveCount(0);
 });
 
 test("failed asset continuation can resume in place without submitting videos", async ({ page, api }) => {
@@ -498,6 +595,10 @@ test("failed breakdown displays the actual error and requires explicit paid retr
   await expectAccessible(page);
   expect(submitted).toEqual([]);
   await page.getByRole("button", { name: "重新拆解", exact: true }).click();
+  const dialog = page.getByRole("alertdialog");
+  expect(submitted).toEqual([]);
+  await dialog.getByRole("textbox", { name: "重新拆解的原因", exact: true }).fill("上次模型超时，请重新拆解。");
+  await dialog.getByRole("button", { name: "重新拆解", exact: true }).click();
   await expect.poll(() => submitted).toEqual(["/api/v1/projects/demo/episodes/1/script-plan"]);
 });
 
@@ -922,23 +1023,21 @@ test("breakdown adds a fully prompted asset and removes visual references withou
   await expectReachableLayout(page);
 });
 
-test("complete video prompt edits save only the creative text and retain attachment declarations", async ({ page, api }) => {
+test("video prompt edits save the visible unit text", async ({ page, api }) => {
   const preview = { text: "@图片1 是<阿明>的参考图。\n\n原始完整框架", declarations: "@图片1 是<阿明>的参考图。", creative_text: "原始完整框架", references: [], warnings: [], unavailable: null, is_text_form: true, parameters: { model: "fixture" } };
   let patch: Record<string, unknown> | null = null;
   api.override({ ...productionBase, "POST /api/v1/projects/demo/reference-videos/episodes/1/units/E1U1/prompt-preview": { status: 200, body: preview } });
   await page.route("**/api/v1/projects/demo/reference-videos/episodes/1/units/E1U1", async (route) => {
     patch = route.request().postDataJSON() as Record<string, unknown>;
-    await route.fulfill({ json: { unit: { ...unit, generation_prompt: patch.generation_prompt }, unit_capability: {} } });
+    await route.fulfill({ json: { unit: { ...unit, text: patch.prompt }, unit_capability: {} } });
   });
   await page.goto("/app/make/demo?step=videos&episode=1");
-  const creative = page.locator("#video-creative-E1U1");
-  await expect(creative).toHaveValue("原始完整框架");
-  await creative.fill("完整自定义正文、风格与负向规则");
-  await page.getByText("最终视频提示词（与实发请求一致）", { exact: true }).click();
-  await expect(page.locator("pre").filter({ hasText: "完整自定义正文、风格与负向规则" })).toContainText("@图片1 是<阿明>的参考图。");
+  const creative = page.locator("#video-prompt-E1U1");
+  await creative.fill("@[阿明]完整自定义正文");
+  await expect(page.getByText("最终视频提示词（与实发请求一致）", { exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "保存", exact: true }).click();
-  await expect.poll(() => patch?.generation_prompt).toBe("完整自定义正文、风格与负向规则");
-  expect((patch as Record<string, unknown> | null)?.generation_prompt).not.toContain("@图片1");
+  await expect.poll(() => patch?.prompt).toBe("@[阿明]完整自定义正文");
+  expect((patch as Record<string, unknown> | null)?.generation_prompt).toBe("");
 });
 
 test("manual video text survives body edits and reload until explicitly restored", async ({ page, api }) => {
@@ -955,21 +1054,19 @@ test("manual video text survives body edits and reload until explicitly restored
     await route.fulfill({ json: { unit: savedUnit, unit_capability: {} } });
   });
   await page.goto("/app/make/demo?step=videos&episode=1");
-  await expect(page.getByText(/当前使用人工创作段/)).toBeVisible();
   const manual = savedUnit.generation_prompt;
-  await page.locator("#video-prompt-E1U1").fill("@[阿明]转身。@[阿明]{你好}");
-  await expect(page.getByText(/单元正文已修改，人工创作段仍会用于生成/)).toBeVisible();
+  await expect(page.locator("#video-prompt-E1U1")).toHaveValue(manual);
+  await page.locator("#video-prompt-E1U1").fill("更新后的人工创作段");
   await page.getByRole("button", { name: "保存", exact: true }).click();
-  await expect.poll(() => savedUnit.text).toBe("@[阿明]转身。@[阿明]{你好}");
-  expect(savedUnit.generation_prompt).toBe(manual);
+  await expect.poll(() => savedUnit.generation_prompt).toBe("更新后的人工创作段");
+  expect(savedUnit.text).toBe("@[阿明]抬头。@[阿明]{你好}");
   await page.reload();
-  await expect(page.locator("#video-creative-E1U1")).toHaveValue(manual);
-  await expect(page.getByText(/当前使用人工创作段/)).toBeVisible();
+  await expect(page.locator("#video-prompt-E1U1")).toHaveValue("更新后的人工创作段");
   await page.getByRole("button", { name: "恢复默认框架", exact: true }).click();
-  await expect(page.getByText(/当前使用默认框架/)).toBeVisible();
+  await expect(page.locator("#video-prompt-E1U1")).toHaveValue("@[阿明]抬头。@[阿明]{你好}");
   await page.getByRole("button", { name: "保存", exact: true }).click();
   await expect.poll(() => savedUnit.generation_prompt).toBe("");
-  expect(savedUnit.text).toBe("@[阿明]转身。@[阿明]{你好}");
+  expect(savedUnit.text).toBe("@[阿明]抬头。@[阿明]{你好}");
   expect(writes).toEqual([]);
   await expectReachableLayout(page);
   await expectAccessible(page);
@@ -1064,42 +1161,124 @@ test("blank episode opens without reading a missing source and preserves the dra
   expect(reads.length).toBeGreaterThan(0);
 });
 
-test("writing video prompts stops for review and only explicit confirmation generates video", async ({ page, api }) => {
-  let pending = true;
+for (const entry of ["footer", "navigation"] as const) {
+  test(`confirming assets via ${entry} writes prompts once and waits for explicit video generation`, async ({ page, api }) => {
+    let pending = true;
+    let authored = 0;
+    let generated = 0;
+    api.override({ ...productionBase,
+      "GET /api/v1/files/demo/characters/a.png": { status: 204, body: "" },
+      "GET /api/v1/projects/demo": { status: 200, body: { ...assetsProject, project: { ...assetsProject.project, characters: { 阿明: { description: "青年", character_sheet: "characters/a.png" } } } } },
+      "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "idle", stage: null } },
+    });
+    await page.route("**/api/v1/tasks?**", (route) => route.fulfill({ json: { items: authored ? [{ ...planTask, task_id: "prompt-task", task_type: "text_episode_script", status: pending ? "running" : "succeeded" }] : [], total: authored ? 1 : 0 } }));
+    await page.route("**/api/v1/projects/demo/reference-videos/episodes/1/units", (route) => route.fulfill({ json: { units: [{ ...unit, pending_authoring: pending, text: pending ? "@[阿明]：{你好。}" : "@[阿明]面向镜头微笑。@[阿明]：{你好。}" }], unit_capabilities: {} } }));
+    await page.route("**/api/v1/projects/demo/episodes/1/prompt-authoring", async (route) => {
+      authored++;
+      expect(route.request().postDataJSON()).toEqual({});
+      await route.fulfill({ json: { batch: { batch_id: "text-only", members: [{ task_id: "prompt-task" }] } } });
+    });
+    await page.route("**/api/v1/projects/demo/episodes/1/production/videos", async (route) => {
+      generated++;
+      await route.fulfill({ json: { episode: 1, status: "active", stage: "videos", action: "videos" } });
+    });
+    await page.goto("/app/make/demo?step=assets&episode=1");
+    await expect(page.getByRole("button", { name: "确认资产并编写视频提示词", exact: true })).toBeEnabled();
+    if (entry === "footer") await page.getByRole("button", { name: "确认资产并编写视频提示词", exact: true }).click();
+    else await page.getByRole("navigation").getByRole("link", { name: "4 视频", exact: true }).click();
+    await expect(page).toHaveURL(/step=videos&episode=1$/);
+    await expect(page.getByRole("status").filter({ hasText: "正在编写视频提示词" })).toBeVisible();
+    await expect(page.getByRole("textbox", { name: "视频提示词", exact: true })).toHaveCount(0);
+    expect([authored, generated]).toEqual([1, 0]);
+    await expect(page.getByRole("button", { name: "确认生成视频", exact: true })).toBeDisabled();
+    await page.reload();
+    await expect(page.getByRole("status").filter({ hasText: "正在编写视频提示词" })).toBeVisible();
+    expect([authored, generated]).toEqual([1, 0]);
+    pending = false;
+    await expect(page.getByRole("button", { name: "确认生成视频", exact: true })).toBeEnabled();
+    await expect(page.getByRole("textbox", { name: "视频提示词", exact: true })).toHaveValue("@[阿明]面向镜头微笑。@[阿明]：{你好。}");
+    await expect(page.getByRole("button", { name: "编写视频提示词", exact: true })).toHaveCount(0);
+    expect([authored, generated]).toEqual([1, 0]);
+    await page.reload();
+    await expect(page.getByRole("textbox", { name: "视频提示词", exact: true })).toHaveValue("@[阿明]面向镜头微笑。@[阿明]：{你好。}");
+    await page.getByRole("navigation").getByRole("link", { name: "3 资产", exact: true }).click();
+    await page.getByRole("button", { name: "进入视频提示词审查", exact: true }).click();
+    await expect(page.getByRole("button", { name: "确认生成视频", exact: true })).toBeEnabled();
+    expect([authored, generated]).toEqual([1, 0]);
+    await page.getByRole("button", { name: "确认生成视频", exact: true }).click();
+    await expect.poll(() => generated).toBe(1);
+    expect(authored).toBe(1);
+  });
+}
+
+
+const promptAuthoringBase = {
+  ...productionBase,
+  "GET /api/v1/files/demo/characters/a.png": { status: 204, body: "" },
+  "GET /api/v1/projects/demo": { status: 200, body: { ...assetsProject, project: { ...assetsProject.project, characters: { 阿明: { description: "青年", character_sheet: "characters/a.png" } } } } },
+  "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "idle", stage: null } },
+};
+
+test("failed prompt writing survives refresh and only retries on request", async ({ page, api }) => {
   let authored = 0;
-  let generated = 0;
-  api.override({ ...productionBase,
-    "GET /api/v1/files/demo/characters/a.png": { status: 204, body: "" },
-    "GET /api/v1/projects/demo": { status: 200, body: { ...assetsProject, project: { ...assetsProject.project, characters: { 阿明: { description: "青年", character_sheet: "characters/a.png" } } } } },
-    "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "idle", stage: null } },
-    "POST /api/v1/projects/demo/episodes/1/prompt-authoring": { status: 200, body: { batch: { batch_id: "text-only", members: [] } } },
-  });
-  await page.route("**/api/v1/projects/demo/reference-videos/episodes/1/units", (route) => route.fulfill({ json: { units: [{ ...unit, pending_authoring: pending, text: pending ? "@[阿明]：{你好。}" : "@[阿明]面向镜头微笑。@[阿明]：{你好。}" }], unit_capabilities: {} } }));
+  let pending = true;
+  api.override(promptAuthoringBase);
+  await page.route("**/api/v1/tasks?**", (route) => route.fulfill({ json: { items: authored ? [{ ...planTask, task_id: `prompt-${authored}`, task_type: "text_episode_script", status: pending ? "failed" : "succeeded", error_message: pending ? "模型请求超时" : null }] : [], total: authored ? 1 : 0 } }));
+  await page.route("**/api/v1/projects/demo/reference-videos/episodes/1/units", (route) => route.fulfill({ json: { units: [{ ...unit, pending_authoring: pending }], unit_capabilities: {} } }));
   await page.route("**/api/v1/projects/demo/episodes/1/prompt-authoring", async (route) => {
-    authored++; pending = false;
-    await route.fulfill({ json: { batch: { batch_id: "text-only", members: [] } } });
-  });
-  await page.route("**/api/v1/projects/demo/episodes/1/production/videos", async (route) => {
-    generated++;
-    await route.fulfill({ json: { episode: 1, status: "active", stage: "videos", action: "videos" } });
+    authored++;
+    if (authored > 1) pending = false;
+    await route.fulfill({ json: { batch: { batch_id: `batch-${authored}`, members: [{ task_id: `prompt-${authored}` }] } } });
   });
   await page.goto("/app/make/demo?step=assets&episode=1");
-  await page.getByRole("button", { name: "进入视频提示词审查", exact: true }).click();
-  await expect(page).toHaveURL(/step=videos&episode=1$/);
-  expect([authored, generated]).toEqual([0, 0]);
-  await expect(page.getByRole("button", { name: "确认提示词并生成当前视频", exact: true })).toBeDisabled();
-  await page.getByRole("button", { name: "编写视频提示词", exact: true }).click();
-  await expect(page.getByRole("button", { name: "确认生成视频", exact: true })).toBeEnabled();
-  await expect(page.locator("#video-creative-E1U1")).not.toHaveValue("");
-  expect([authored, generated]).toEqual([1, 0]);
+  await page.getByRole("button", { name: "确认资产并编写视频提示词", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("模型请求超时");
   await page.reload();
-  await expect(page.locator("#video-creative-E1U1")).not.toHaveValue("");
-  expect([authored, generated]).toEqual([1, 0]);
-  await page.getByRole("button", { name: "确认生成视频", exact: true }).click();
-  await expect.poll(() => generated).toBe(1);
+  await expect(page.getByRole("alert")).toContainText("模型请求超时");
   expect(authored).toBe(1);
+  await expect(page.getByRole("textbox", { name: "视频提示词", exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "编写视频提示词", exact: true }).click();
+  await expect(page.getByRole("textbox", { name: "视频提示词", exact: true })).toHaveValue(unit.text);
+  expect(authored).toBe(2);
 });
 
+test("unsaved asset prompts block confirming assets and writing video prompts", async ({ page, api }) => {
+  let authored = 0;
+  api.override({ ...promptAuthoringBase,
+    "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [{ ...unit, pending_authoring: true }], unit_capabilities: {} } },
+  });
+  await page.route("**/api/v1/projects/demo/episodes/1/prompt-authoring", async (route) => { authored++; await route.abort(); });
+  await page.goto("/app/make/demo?step=assets&episode=1");
+  await page.getByRole("textbox", { name: "完整生图提示词", exact: true }).fill("保留人物容貌，改为深色衣服");
+  await page.getByRole("button", { name: "确认资产并编写视频提示词", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("未保存");
+  await expect(page).toHaveURL(/step=assets&episode=1$/);
+  await page.getByRole("navigation").getByRole("link", { name: "4 视频", exact: true }).click();
+  await expect(page).toHaveURL(/step=assets&episode=1$/);
+  expect(authored).toBe(0);
+});
+
+test("late prompt submission stays on the destination after leaving assets", async ({ page, api }) => {
+  api.override({ ...promptAuthoringBase,
+    "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [{ ...unit, pending_authoring: true }], unit_capabilities: {} } },
+  });
+  let release!: () => void;
+  let arrived!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { arrived = resolve; });
+  await page.route("**/api/v1/projects/demo/episodes/1/prompt-authoring", async (route) => {
+    arrived(); await pending;
+    await route.fulfill({ json: { batch: { batch_id: "text-only", members: [] } } });
+  });
+  await page.goto("/app/make/demo?step=assets&episode=1");
+  await page.getByRole("button", { name: "确认资产并编写视频提示词", exact: true }).click();
+  await started;
+  await page.getByRole("banner").getByRole("link", { name: "项目管理", exact: true }).click();
+  await expect(page).toHaveURL(/\/app\/projects\/demo$/);
+  release();
+  await expect(page.getByText("任务已提交，将在后台继续处理。", { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/\/app\/projects\/demo$/);
+});
 
 test("character angle selection saves the actual visual reference without changing dialogue", async ({ page, api }) => {
   const sheet = "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="400" height="900"><rect width="400" height="900" fill="red"/></svg>');
@@ -1125,6 +1304,9 @@ test("character angle selection saves the actual visual reference without changi
   expect(patches[0]).toEqual({ prompt: savedUnit.text, generation_prompt: "" });
   await page.reload();
   await expect(page.getByRole("combobox", { name: "阿明 · 人物参考角度" })).toHaveValue("视角-正面特写");
+  const generate = page.getByRole("button", { name: "确认生成视频", exact: true });
+  await expect(generate).toBeEnabled();
+  await expect(generate).toHaveCSS("opacity", "1");
   await expectReachableLayout(page);
   await expectAccessible(page);
 });
@@ -1169,8 +1351,10 @@ test("character angle crop uploads only the selected pixels with no generation c
   expect(paid).toEqual([]);
 });
 
-test("creative prompt typing retains focus and failed previews never authorize generation", async ({ page, api }) => {
-  api.override({ ...productionBase });
+test("creative prompt typing retains focus and preview failures stay visible", async ({ page, api }) => {
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [{ ...unit, text: "原始框架" }] } },
+  });
   let calls = 0;
   let fail = false;
   await page.route("**/api/v1/projects/demo/reference-videos/episodes/1/units/E1U1/prompt-preview", async (route) => {
@@ -1179,7 +1363,7 @@ test("creative prompt typing retains focus and failed previews never authorize g
     await route.fulfill(fail ? { status: 500, json: { detail: "预览暂不可用" } } : { json: { text: body.generation_prompt || "原始框架", creative_text: "原始框架", declarations: "", references: [], unavailable: null } });
   });
   await page.goto("/app/make/demo?step=videos&episode=1");
-  const creative = page.locator("#video-creative-E1U1");
+  const creative = page.getByRole("textbox", { name: "视频提示词", exact: true });
   await expect(creative).toHaveValue("原始框架");
   await creative.focus();
   await creative.evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(node.value.length, node.value.length));
@@ -1190,11 +1374,10 @@ test("creative prompt typing retains focus and failed previews never authorize g
     await expect(creative).toBeFocused();
   }
   await expect(creative).toHaveValue("原始框架abc");
-  // Revert to the saved value, then make the explicit refresh fail.
-  await page.getByRole("button", { name: "恢复默认框架", exact: true }).click();
-  await expect(page.getByRole("button", { name: "确认提示词并生成当前视频", exact: true })).toBeEnabled();
+  await creative.fill("原始框架");
+  await expect(creative).toHaveValue("原始框架");
   fail = true;
-  await page.getByRole("button", { name: "刷新最终提示词", exact: true }).click();
+  await creative.press("d");
   await expect(page.getByRole("alert").filter({ hasText: "预览暂不可用" })).toBeVisible();
   await expect(page.getByRole("button", { name: "确认提示词并生成当前视频", exact: true })).toBeDisabled();
   await expect(creative).toBeVisible();
@@ -1298,4 +1481,121 @@ test("Jianying handoff is explicit, resumes after exit and keeps MP4 and new ver
   await expect(card.getByRole("status")).toContainText("已在剪映草稿箱建立");
   expect(submitted).toHaveLength(4);
   await expectReachableLayout(page);
+});
+
+test("timeline problems keep manual text editable and block generation until explicitly restored", async ({ page, api }) => {
+  const text = "【0-7s】\n@[阿明]抬眼，停住。";
+  let saved = { ...unit, text, prompt_format_version: "timeline_v1", generation_prompt: "旧人工完整框架" };
+  const writes: string[] = [];
+  page.on("request", (request) => { if (request.method() === "POST" && !request.url().endsWith("/prompt-preview")) writes.push(new URL(request.url()).pathname); });
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [saved] } },
+  });
+  await page.route("**/api/v1/projects/demo/reference-videos/episodes/1/units/E1U1/prompt-preview", async (route) => {
+    const body = route.request().postDataJSON() as { prompt: string; generation_prompt?: string };
+    const manual = !!body.generation_prompt;
+    await route.fulfill({ json: { text: body.generation_prompt || body.prompt, creative_text: body.generation_prompt || body.prompt, declarations: "", references: [], warnings: [], unavailable: null, prompt_source: manual ? "manual" : "default", prompt_format_version: "timeline_v1", generation_allowed: !manual, problems: manual ? [{ code: "timeline_missing", blocking: true, message: "第 1 行（人工创作段）：缺少时间轴，请补充后再生成。", params: { line: 1, source: "generation_prompt" } }] : [] } });
+  });
+  await page.route("**/api/v1/projects/demo/reference-videos/episodes/1/units/E1U1", async (route) => {
+    const body = route.request().postDataJSON() as { prompt: string; generation_prompt: string };
+    saved = { ...saved, text: body.prompt, generation_prompt: body.generation_prompt };
+    api.override({ "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [saved] } } });
+    await route.fulfill({ json: { unit: saved } });
+  });
+  await page.goto("/app/make/demo?step=videos&episode=1");
+  const card = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "单元 1 · 7 秒", exact: true }) });
+  const creative = card.getByRole("textbox", { name: "视频提示词", exact: true });
+  await expect(creative).toHaveValue("旧人工完整框架");
+  await expect(card.getByRole("alert")).toContainText("缺少时间轴");
+  await expect(page.getByRole("button", { name: "确认生成视频", exact: true })).toBeDisabled();
+  await card.getByRole("button", { name: "定位到第 1 行", exact: true }).click();
+  await expect(creative).toBeFocused();
+  await card.getByRole("button", { name: "恢复默认框架", exact: true }).click();
+  await expect(creative).toHaveValue(text);
+  await expect(card.getByRole("alert")).toHaveCount(0);
+  await card.getByRole("button", { name: "保存", exact: true }).click();
+  await expect.poll(() => saved.generation_prompt).toBe("");
+  await expect(page.getByRole("button", { name: "确认生成视频", exact: true })).toBeEnabled();
+  expect(writes).toEqual([]);
+  await expectReachableLayout(page);
+  await expectAccessible(page);
+});
+
+test("whole script import previews boundaries and saves without automatic breakdown", async ({ page, api }) => {
+  api.override(multiBase);
+  const text = "第一集 开始\n甲说你好。🙂\n第二集 继续\n甲换上盔甲。";
+  let saved = false;
+  let starts = 0;
+  type Parts = Array<{ start_line: number; number: number; title: string }>;
+  const previews: Array<{ text: string; boundaries?: Parts }> = [];
+  await page.route("**/production/source-preview", (route) => route.fulfill({ json: { text, filename: "整部.txt" } }));
+  await page.route("**/production/whole-script/preview", async (route) => {
+    const request = route.request().postDataJSON() as typeof previews[number];
+    previews.push(request);
+    const parts = request.boundaries ?? [{ start_line: 1, number: 1, title: "第一集 开始" }, { start_line: 3, number: 2, title: "第二集 继续" }];
+    await route.fulfill({ json: { text: request.text, fingerprint: "full-source", project_basis: "project-revision", episodes: parts.map((part) => ({ ...part, start: 0, end: text.length, characters: text.length, head: "正文预览", tail: "保留原文" })), warnings: [], errors: [] } });
+  });
+  await page.route("**/production/whole-script/import", async (route) => {
+    expect(route.request().postData()).toContain("手动修订标题");
+    saved = true;
+    await route.fulfill({ json: { import_id: "import-1", episodes: [3, 4], fingerprint: "full-source" } });
+  });
+  await page.route("**/production/script-batch", async (route) => {
+    if (route.request().method() === "POST") starts++;
+    await route.fulfill({ json: { status: "idle", items: [], imports: saved ? [{ import_id: "import-1", episodes: [3, 4], fingerprint: "full-source" }] : [] } });
+  });
+  await page.goto("/app/projects/demo");
+  await page.getByRole("button", { name: "上传整部剧本", exact: true }).click();
+  await page.locator("#whole-script-file").setInputFiles({ name: "整部.txt", mimeType: "text/plain", buffer: Buffer.from(text) });
+  await expect(page.getByRole("textbox", { name: "整部剧本原文", exact: true })).toHaveValue(text);
+  await page.getByRole("button", { name: "识别分集", exact: true }).click();
+  await expect(page.getByLabel("原集号", { exact: true })).toHaveCount(2);
+  await page.locator("#boundary-title-1").fill("手动修订标题");
+  await expect(page.getByRole("button", { name: "确认分集并保存全部", exact: true })).toBeDisabled();
+  await page.getByRole("button", { name: "校验调整并预览", exact: true }).click();
+  await expect(page.getByRole("button", { name: "确认分集并保存全部", exact: true })).toBeEnabled();
+  await waitForEntrance(page.locator("main"));
+  await expectAccessible(page);
+  await expectReachableLayout(page);
+  await page.getByRole("button", { name: "确认分集并保存全部", exact: true }).click();
+  await expect(page.getByRole("button", { name: "一键拆解全部集", exact: true })).toBeEnabled();
+  expect(previews[1].boundaries?.[1].title).toBe("手动修订标题");
+  expect(starts).toBe(0);
+});
+
+test("whole script batch starts once survives refresh and finishes at review links", async ({ page, api }) => {
+  api.override(multiBase);
+  let starts = 0;
+  let state: { status: string; import_id?: string; items: Array<{ episode: number; status: string }>; imports: Array<{ import_id: string; episodes: number[]; fingerprint: string }> } = { status: "idle", items: [], imports: [{ import_id: "import-1", episodes: [1, 2], fingerprint: "full" }] };
+  await page.route("**/production/script-batch", async (route) => {
+    if (route.request().method() === "POST") {
+      starts++;
+      state = { ...state, status: "active", import_id: "import-1", items: [{ episode: 1, status: "active" }, { episode: 2, status: "pending" }] };
+    }
+    await route.fulfill({ json: state });
+  });
+  await page.goto("/app/projects/demo");
+  await page.getByRole("button", { name: "一键拆解全部集", exact: true }).click();
+  await expect(page.getByText("正在逐集拆解 · 0/2", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "新建单集", exact: true })).toBeDisabled();
+  await page.reload();
+  await expect(page.getByText("正在逐集拆解 · 0/2", { exact: true })).toBeVisible();
+  expect(starts).toBe(1);
+  state = { ...state, status: "completed", items: [{ episode: 1, status: "completed" }, { episode: 2, status: "completed" }] };
+  await expect(page.getByText("全部拆解完成，请逐集审查 · 2/2", { exact: true })).toBeVisible({ timeout: 10000 });
+  await expect(page.getByRole("link", { name: "第 2 集 · 待审查", exact: true })).toHaveAttribute("href", "/app/make/demo?step=breakdown&episode=2");
+  await expectReachableLayout(page);
+  expect(starts).toBe(1);
+});
+
+test("unknown whole script submission remains read-only after refresh", async ({ page, api }) => {
+  api.override({ ...multiBase, "GET /api/v1/projects/demo/production/script-batch": { status: 200, body: { status: "unknown", import_id: "import-1", items: [{ episode: 1, status: "unknown" }], imports: [] } } });
+  const writes: string[] = [];
+  page.on("request", (request) => { if (request.method() !== "GET" && request.url().includes("/api/")) writes.push(request.url()); });
+  await page.goto("/app/projects/demo");
+  await expect(page.getByText("提交结果待核对，不会重复提交 · 0/1", { exact: true })).toBeVisible();
+  await page.reload();
+  await expect(page.getByText("提交结果待核对，不会重复提交 · 0/1", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "继续未完成集", exact: true })).toHaveCount(0);
+  expect(writes).toEqual([]);
 });

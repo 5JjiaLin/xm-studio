@@ -13,7 +13,12 @@ from functools import partial
 
 from openai import BadRequestError
 
-from lib.backends.openai_shared import OPENAI_RETRYABLE_ERRORS, create_openai_client
+from lib.backends.openai_shared import (
+    LONG_THINKING_TEXT_MODELS,
+    OPENAI_RETRYABLE_ERRORS,
+    OPENAI_TEXT_TIMEOUT,
+    create_openai_client,
+)
 from lib.backends.providers import PROVIDER_OPENAI
 from lib.backends.text_backends.base import (
     TextCapability,
@@ -51,7 +56,11 @@ class OpenAIResponsesTextBackend:
     ):
         # 禁用 SDK 内置重试，由本层 _generate_once() 统一管理重试策略
         self._client = create_openai_client(
-            api_key=api_key, base_url=base_url, max_retries=0, transport_layer=transport_layer
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=0,
+            transport_layer=transport_layer,
+            timeout=OPENAI_TEXT_TIMEOUT,
         )
         self._model = model or DEFAULT_MODEL
         self._provider_name = provider_name
@@ -139,7 +148,23 @@ class OpenAIResponsesTextBackend:
             }
 
         logger.info("调用 %s 文本 SDK kwargs=%s", self.name, format_kwargs_for_log(kwargs))
-        response = await self._client.responses.create(**kwargs)
+        if self._model in LONG_THINKING_TEXT_MODELS:
+            # 最终事件携带正文和 usage；中途断开或只有增量时不能视作成功。
+            response = None
+            async with await self._client.responses.create(**kwargs, stream=True) as stream:
+                async for event in stream:
+                    if (
+                        event.type == "response.completed"
+                        or event.type == "response.failed"
+                        or event.type == "response.incomplete"
+                    ):
+                        response = event.response
+                    elif event.type == "error":
+                        raise RuntimeError(f"Responses 文本流失败 (model={self._model}): {event.message}")
+            if response is None:
+                raise RuntimeError("Responses 文本流未收到最终响应，不能保存不完整结果")
+        else:
+            response = await self._client.responses.create(**kwargs)
         if response.status == "failed":
             # 部分网关以 200 + status=failed 回报失败，output_text 为空，不能当成功结果
             detail = response.error.message if response.error else "unknown error"

@@ -58,11 +58,16 @@ _REFERENCE_VIDEO_ENQUEUE_PAYLOAD_KEYS = frozenset({"script_file", "reference_req
 
 #: 旧版本入队的文本任务在载荷里带着入队时的数据根；执行按当前配置解析，判同也不计它。
 _LEGACY_TEXT_PAYLOAD_KEYS = frozenset({"projects_root"})
+_FEEDBACK_PAYLOAD_KEYS = frozenset({"_production_feedback", "_production_feedback_replan"})
 
 
 def text_task_request_facts(payload: dict[str, Any] | None) -> dict[str, Any]:
     """文本任务载荷里描述「这次请求做什么」的部分，用于判断两次提交是否为同一请求。"""
-    return {key: value for key, value in (payload or {}).items() if key not in _LEGACY_TEXT_PAYLOAD_KEYS}
+    return {
+        key: value
+        for key, value in (payload or {}).items()
+        if key not in _LEGACY_TEXT_PAYLOAD_KEYS | _FEEDBACK_PAYLOAD_KEYS
+    }
 
 
 def _text_request_facts(task_type: str, payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -467,11 +472,18 @@ class GenerationQueue:
 
         def feedback_identity():
             store = register_root(DataRootLayout.current().root)
-            return store.settings() if (store.layout.projects_dir / project_name / "project.json").is_file() else None
+            if not (store.layout.projects_dir / project_name / "project.json").is_file():
+                return None
+            return store, store.settings(), store.prepare_replan_submission(project_name, task_type, payload, source)
 
-        identity = await asyncio.to_thread(feedback_identity)
-        if identity is not None:
+        feedback = await asyncio.to_thread(feedback_identity)
+        if feedback is not None:
+            store, identity, replan_submission = feedback
             payload = {**(payload or {}), "_production_feedback": identity}
+            if replan_submission is not None:
+                # The queue commits this evidence with the task, so a crash before the
+                # journal append can be recovered without submitting another task.
+                payload["_production_feedback_replan"] = replan_submission
 
         async def _enqueue_open() -> dict[str, Any]:
             async with self._task_repo() as repo:
@@ -542,6 +554,11 @@ class GenerationQueue:
         # current TTS evidence and other mutable generation intent are re-read by the worker.
         result.pop("_existing_payload", None)
         if not result.get("deduped"):
+            if feedback is not None and replan_submission is not None:
+                try:
+                    await asyncio.to_thread(store.record_replan_submission, replan_submission, result["task_id"])
+                except Exception:
+                    logger.exception("Replan feedback deferred to durable task %s", result["task_id"])
             logger.info("任务入队 task_id=%s type=%s", result["task_id"], task_type)
         else:
             logger.debug("任务去重 task_id=%s", result["task_id"])

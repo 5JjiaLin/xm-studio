@@ -33,7 +33,7 @@ def operation(
         FeedbackContext(
             operation_id or (parent.operation_id if parent else str(uuid4())),
             source,
-            reason,
+            reason if reason is not None else (parent.reason if parent else None),
             action or (parent.action if parent else None),
             identity_links=parent.identity_links if parent else (),
             settings_snapshot=settings_snapshot or (parent.settings_snapshot if parent else None),

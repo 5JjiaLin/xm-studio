@@ -854,4 +854,11 @@ MESSAGES = {
     "trash_restore_needs_character": "Its character “{name}” was deleted too, so it can only be restored with the character: restore the character from the project trash first, then this record",
     "trash_restore_download_only": "This deletion record can no longer be restored; its structure files can only be downloaded",
     "trash_restore_target_blocked": "Cannot restore to {path}: a folder on the path has been replaced with a link",
+    "timeline_missing": "Line {line} ({source}): add timeline headings such as {example} covering the full unit.",
+    "timeline_malformed": "Line {line} ({source}): malformed time heading or speech mark. Expected {expected}; found {actual}.",
+    "timeline_gap_or_overlap": "Line {line} ({source}): ranges must be continuous and positive. Expected start {expected}s; found {actual}s.",
+    "timeline_duration_mismatch": "Line {line} ({source}): timeline ends at {actual}s, expected {expected}s. Replan the timeline; tier confirmation cannot bypass this.",
+    "segment_speech_overflow": "Line {line} ({source}): speech needs about {actual}s; segment budget including tolerance is {expected}s. Reallocate time or revise the breakdown.",
+    "creative_override_mismatch": "Line {line} ({source}): manual creative text changes subjects or original speech. Update body and creative text together, or restore the default.",
+    "timeline_speech_outside_segment": "Line {line} ({source}): each complete speech mark must belong to one time range, not setup or handoff.",
 }

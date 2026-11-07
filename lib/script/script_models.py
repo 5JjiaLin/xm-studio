@@ -373,6 +373,12 @@ class PlanNewAsset(BaseModel):
     target: str = Field(default="", description="merge：归入的同类资产名；derivative：本体角色名；其余留空")
     asset_name: str = Field(default="", description="register：登记名；derivative：衍生名；留空即取 name")
 
+    @model_validator(mode="after")
+    def _registered_asset_needs_visual_input(self) -> "PlanNewAsset":
+        if self.decision == "register" and not self.description.strip():
+            raise ValueError("register 必须提供非空外观描述，才能生成完整生图提示词")
+        return self
+
 
 class NarrationScriptPlanSegment(BaseModel):
     """旁白/解说 script_plan（分镜拆分）产出的结构化分镜：内容层。
@@ -861,6 +867,9 @@ class ReferenceVideoUnit(BaseModel):
     model_config = _STRICT_CONFIG
 
     generation_prompt: SkipJsonSchema[str] = Field(default="", exclude_if=lambda value: not value)
+    prompt_format_version: SkipJsonSchema[Literal["timeline_v1"] | None] = Field(
+        default=None, exclude_if=lambda value: value is None, description="服务端编写格式版本；不包含镜头内容"
+    )
     unit_id: str = Field(description="格式 E{集}U{序号}")
     text: str = Field(description="单元正文，可包含 @[商品]/@[角色]/@[场景]/@[道具] 引用；迁移问题壳可为空")
     duration_seconds: int = Field(

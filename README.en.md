@@ -74,7 +74,7 @@ This command listens only on the local machine and disables login. Keep the Powe
 1. Open model configuration, enter your provider, API key, base URL, and models, then test the connection. Configure text, image, and video capabilities as needed.
 2. Create a project and episode, paste or upload a script, then follow Script → Breakdown → Assets → Videos → Final Cut.
 3. Review and save complete prompts before explicitly generating or regenerating media. Model calls use your configured provider's credits.
-4. Before team testing, save your tester code, batch, and sample in the test records panel. Export a ZIP using the projects page's edit-record export button and send it to the coordinator. See the [team testing guide](docs/production-mvp/team-testing.md).
+4. Saved production edits are recorded automatically. Export a ZIP using the projects page's edit-record export button and send it to the coordinator. See the [team testing guide](docs/production-mvp/team-testing.md).
 
 Project media and edit records stay in the local `projects/` directory. API keys are saved through local model configuration. Keep the project folder to continue later; back up local configuration and `projects/` before changing computers or replacing the source folder.
 

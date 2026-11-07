@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from lib.db import async_session_factory
 from lib.db.repositories.usage_repo import UsageRepository
 from lib.episode.episode_source_commands import EpisodeSourceError, set_episode_source_text
+from lib.episode.script_batch_state import require_batch_idle
 from lib.generation.generation_admission import generation_admission_lock
 from lib.generation.generation_queue import ActiveTaskRequestConflict, get_generation_queue
 from lib.infra.api_errors import ConflictError
@@ -127,6 +128,10 @@ async def _archive(project: str, episode: int | None, archived: bool, request: R
     # Admissions and archive checks share a cross-process lock. No task is cancelled.
     async with generation_admission_lock(project_name=project, script_file="", resource_id=MANAGEMENT_RESOURCE):
         if archived:
+            try:
+                await asyncio.to_thread(lambda: require_batch_idle(manager.get_project_path(project)))
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             queue = get_generation_queue()
             # Shared image tasks may update assets used by any episode: wait for all
             # project writers, rather than guessing ownership of old task payloads.
@@ -215,6 +220,8 @@ async def save_production_source(
         if exc.code == "episode_source_conflict":
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise episode_source_http_error(exc, _t, episode=episode) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post("/projects/{project_name}/production/asset-prompt")
@@ -654,3 +661,8 @@ async def download_jianying_delivery(project_name: str, episode: int, request: R
     return FileResponse(
         store.package_path(record["delivery_id"]), filename=f"{record['folder']}.zip", media_type="application/zip"
     )
+
+# Keep the five-step production router as the single application entry point.
+from server.routers.whole_script import router as whole_script_router
+
+router.include_router(whole_script_router)

@@ -23,11 +23,11 @@ function initialInput() {
   }
   catch { return DEFAULT_INPUT; }
 }
-export function ScriptInput({ projectName, episode: targetEpisode, createOnly = false, source = "", disabled = false }: { projectName?: string; episode?: number; createOnly?: boolean; source?: string; disabled?: boolean }) {
+export function ScriptInput({ projectName, episode: targetEpisode, createOnly = false, source = "", disabled = false, readOnly = false }: { projectName?: string; episode?: number; createOnly?: boolean; source?: string; disabled?: boolean; readOnly?: boolean }) {
   const draftKey = projectName ? `xm:script-draft:${projectName}:${targetEpisode}` : "xm:script-draft";
   const [initial] = useState(() => {
     if (!projectName) return initialInput();
-    return { ...DEFAULT_INPUT, text: sessionStorage.getItem(draftKey) ?? source };
+    return { ...DEFAULT_INPUT, text: readOnly ? source : sessionStorage.getItem(draftKey) ?? source };
   });
   const { t } = useTranslation("dashboard");
   const { t: templateText } = useTranslation("templates");
@@ -117,17 +117,18 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
     </div>
     </>}
     {!createOnly && <div className="flex flex-col gap-2"><Label htmlFor="work-script">{t("production_script")}</Label>
-      <Textarea id="work-script" className="min-h-80" required disabled={busy || extracting || disabled} value={value.text} onChange={(e) => setValue((p) => ({ ...p, text: e.target.value }))} placeholder={t("production_script_hint")} />
+      <Textarea readOnly={readOnly} id="work-script" className="min-h-80" required disabled={busy || extracting || disabled} value={value.text} onChange={(e) => setValue((p) => ({ ...p, text: e.target.value }))} placeholder={t("production_script_hint")} />
       <Label htmlFor="script-upload">{t("production_upload")}</Label>
-      <Input id="script-upload" type="file" disabled={busy || extracting || disabled} accept=".docx,.txt,.md,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(e) => {
+      <Input id="script-upload" type="file" disabled={busy || extracting || disabled || readOnly} accept=".docx,.txt,.md,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(e) => {
         const file = e.target.files?.[0]; e.target.value = ""; if (file) void upload(file);
       }} />
       {extracting && <p role="status">{t("production_source_extracting")}</p>}
       {pendingFile && <p className="text-sm text-muted-foreground">{t("production_source_preview", { filename: pendingFile.name })}</p>}
       {needsConfirmation && <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} />{t("production_source_confirm")}</label>}
-      {projectName && <Button type="button" variant="outline" className="self-start" disabled={busy || extracting || disabled || needsConfirmation && !confirmed} onClick={() => void persist()}>{t("production_source_save")}</Button>}
+      {projectName && !readOnly && <Button type="button" variant="outline" className="self-start" disabled={busy || extracting || disabled || needsConfirmation && !confirmed} onClick={() => void persist()}>{t("production_source_save")}</Button>}
     </div>
     }
+    {readOnly && <p className="text-sm text-muted-foreground">{t("whole_script_source_readonly")}</p>}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
     <p className="text-sm text-muted-foreground">{busy ? t("common:loading") : createOnly ? t("management_create_hint") : t("production_text_cost_unknown")}</p>
   </form>;

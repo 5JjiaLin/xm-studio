@@ -5,14 +5,15 @@
 任务进度经任务事件呈现；产出的脚本规划进入内容确认。附加指令按集保存，重新生成时预填。
 """
 
+import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field
 
-from lib.infra.api_errors import ConflictError, UnprocessableError
+from lib.infra.api_errors import ConflictError, NotFoundError, UnprocessableError
 from lib.infra.async_thread import run_sync_transaction
-from lib.project.project_manager import get_project_manager
+from lib.project.project_manager import find_episode, get_project_manager
 from server.agent_toolset.envelope import json_value
 from server.auth import CurrentUser
 from server.i18n import Translator
@@ -37,6 +38,12 @@ class ScriptPlanInstructions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     instructions: _Instructions | None = Field(default=None, description="附加指令原文；空白视同清除")
+
+
+class ScriptPlanRequest(ScriptPlanInstructions):
+    replan_reason: _Instructions | None = Field(
+        default=None, description="仅本次重新拆解的原因，不作为长期附加指令保存"
+    )
 
 
 def _raise_problem(problem: ToolProblem, episode: int, _t: Translator) -> None:
@@ -73,7 +80,7 @@ async def save_script_plan_instructions(project_name: str, episode: int, req: Sc
 async def plan_script(
     project_name: str,
     episode: int,
-    req: ScriptPlanInstructions,
+    req: ScriptPlanRequest,
     user: CurrentUser,
     _t: Translator,
 ):
@@ -81,10 +88,23 @@ async def plan_script(
 
     新的脚本规划整份替换本集现有的规划与草稿；是否先向用户确认由调用方负责。
     """
-    await _save(project_name, episode, req.instructions)
     pm = get_project_manager()
+    instructions = req.instructions
+    if req.replan_reason and "instructions" not in req.model_fields_set:
+        try:
+            project = await asyncio.to_thread(pm.load_project, project_name)
+        except FileNotFoundError as exc:
+            raise NotFoundError("project_not_found", name=project_name) from exc
+        entry = find_episode(project, episode)
+        if entry is None:
+            raise NotFoundError("episode_not_found", episode=episode)
+        instructions = entry.get("script_plan_instructions")
+    else:
+        await _save(project_name, episode, instructions)
     outcome = await generate_script_plan(
-        ToolRequest(GenerateScriptPlanRequest(episode_id=episode, instructions=req.instructions)),
+        ToolRequest(
+            GenerateScriptPlanRequest(episode_id=episode, instructions=instructions, replan_reason=req.replan_reason)
+        ),
         ProjectScope(project_name=project_name, data_root=pm.data_root),
         CallerContext(user_id=user.id, source="webui"),
         Services.defaults(pm),

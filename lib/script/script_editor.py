@@ -81,6 +81,8 @@ def _set_nested(obj: dict[str, Any], field_path: str, value: Any) -> None:
         raise ScriptEditError("patch_episode_script 不可改 generated_assets；资产的生成/重生是独立的显式动作")
     if parts[0] == "needs_replan":
         raise ScriptEditError("patch_episode_script 不可直接改重规划标记；修改 unit 规划内容后由系统重算")
+    if parts[0] == "prompt_format_version":
+        raise ScriptEditError("prompt_format_version 由提示词编写确定，不能通过字段编辑降级")
     if parts[0] == PENDING_AUTHORING_FIELD:
         # 待编写标记随视觉层是否写齐变化；放行 patch 会让缺视觉层的条目被伪装成已编写。
         raise ScriptEditError(
@@ -122,6 +124,11 @@ def _set_nested(obj: dict[str, Any], field_path: str, value: Any) -> None:
     # 而不是被迫走 remove+insert 重生整个分镜。父节点(中间路径段)不存在仍 fail-loud——那是
     # 真的拼写错误(如 image_prompt.scen 应为 image_prompt.scene),不该在 dict 上凭空新建
     # 中间节点。结构上的错误最终由写盘统一入口的「不更坏」结构校验兜住。
+    if field_path in {"text", "generation_prompt"} and "unit_id" in obj:
+        from lib.script.reference_video.temporal_validation import TIMELINE_V1, has_timeline
+
+        if has_timeline(str(obj.get(field_path) or "")) or has_timeline(str(value or "")):
+            obj["prompt_format_version"] = TIMELINE_V1
     cur[parts[-1]] = value
 
 

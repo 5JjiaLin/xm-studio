@@ -216,7 +216,7 @@ def _remap_mention(outcome: _Outcome | None, speaker: bool) -> str | None:
         return None
     if outcome.kind == "skip":
         return None if speaker else outcome.name
-    return f"@[{outcome.visual}]"
+    return f"@[{outcome.speaker if speaker else outcome.visual}]"
 
 
 def _parse_items(raw_items: object) -> tuple[list[PlanNewAsset | None], list[NewAssetProblem]]:
@@ -544,7 +544,14 @@ def planning_project(project: Mapping[str, Any], raw_items: object) -> dict[str,
 
     只供校验读取，不落盘。与其他类型重名的新增项不叠加（它已由处理决定的校验报出）。
     """
-    overlay = dict(project)
+    # The model may use either a new item's temporary name or the resolved
+    # owner/derivative reference. Include both in the validation-only view.
+    overlay = copy.deepcopy(project)
+    try:
+        resolve_new_assets(project, raw_items).apply_to_project(overlay)
+    except (NewAssetsError, ValueError):
+        # Invalid decisions are reported separately by new_asset_violations.
+        overlay = copy.deepcopy(project)
     items, _problems = _parse_items(raw_items)
     _registered, owners = _registered_names(project)
     for item in items:

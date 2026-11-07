@@ -147,11 +147,19 @@ class ProjectionProblem:
             self.code,
             ("review_request_configuration", (("video_units", unit_id),)),
         )
+        line_number = self.parameters().get("line")
+        source_line = line_number - 1 if type(line_number) is int else None
         payload: dict[str, object] = {
             "code": self.code,
             "blocking": self.blocking,
             "unit_id": unit_id,
-            "locations": [{"path": list(path), "line": None} for path in (self.locations or default_paths)],
+            "locations": [
+                {
+                    "path": list(path),
+                    "line": source_line,
+                }
+                for path in (self.locations or default_paths)
+            ],
             "params": self.parameters(),
             "action": self.action or default_action,
         }
@@ -736,6 +744,27 @@ class ReferenceUnitRequestProjector:
                     aspect_ratio=resolve_video_aspect_ratio(project),
                     reference_image_count=len(request_assets),
                 )
+
+        from lib.script.reference_video.prompt_render import temporal_unit_issues
+        from lib.script.reference_video.voice_settings import VoiceRenderSettings
+
+        temporal_issues = temporal_unit_issues(
+            unit,
+            project,
+            VoiceRenderSettings.from_request_facts(facts) if facts is not None else VoiceRenderSettings(),
+            request_references=[asset.reference for asset in request_assets],
+            request_duration_seconds=request_duration.seconds if request_duration is not None else None,
+        )
+        problems.extend(
+            ProjectionProblem(
+                code=issue.code,
+                blocking=True,
+                params=tuple(issue.parameters().items()),
+                action="fix_input",
+                locations=(("video_units", str(unit.get("unit_id") or ""), issue.source),),
+            )
+            for issue in temporal_issues
+        )
 
         return ReferenceUnitRequestProjection(
             unit_id=str(unit.get("unit_id") or ""),

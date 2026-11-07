@@ -1079,6 +1079,10 @@
           "context_content": "当前集正式脚本全部单元的有序只读上下文，包含编写状态和人工创作段",
           "episode": "当前集号",
           "max_refs": "单个视频单元的参考图上限；不限时传 null",
+          "timeline_enabled": "剧情参考生视频启用统一分段时间轴；其他路线保留旧规则",
+          "speech_rate": "项目口播语速，阅读单位/秒",
+          "speech_unit": "语言对应的字或词",
+          "voice_conditions": "本次已求值的各视频桶声音能力摘要",
           "instructions": "附加指令正文；缺值传 null"
         },
         "protected": false,

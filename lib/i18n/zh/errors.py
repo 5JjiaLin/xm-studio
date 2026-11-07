@@ -793,4 +793,11 @@ MESSAGES = {
     "trash_restore_needs_character": "所属的角色「{name}」也已删除，只能随角色恢复：先在项目回收站里恢复这个角色，再恢复这条记录",
     "trash_restore_download_only": "这条删除记录已无法恢复，其中的结构文件只能下载",
     "trash_restore_target_blocked": "无法恢复到 {path}：路径上的目录已被替换为链接",
+    "timeline_missing": "第 {line} 行（{source}）：缺少分段时间轴，请使用独立标题{example}并覆盖整个单元。",
+    "timeline_malformed": "第 {line} 行（{source}）：时间标题或发声记号不完整，期望 {expected}，当前 {actual}。",
+    "timeline_gap_or_overlap": "第 {line} 行（{source}）：时间段须连续且结束晚于开始，应从 {expected}s 开始，当前 {actual}s。",
+    "timeline_duration_mismatch": "第 {line} 行（{source}）：时间轴结束为 {actual}s，应为 {expected}s；请重新编排，确认档位不能替代此修复。",
+    "segment_speech_overflow": "第 {line} 行（{source}）：本段对白估算 {actual}s，超过含容忍的 {expected}s 预算；请重分时间或回到拆解。",
+    "creative_override_mismatch": "第 {line} 行（{source}）：人工完整提示词的主体或原台词与正文不一致；请同步修订正文与创作段，或恢复默认框架。",
+    "timeline_speech_outside_segment": "第 {line} 行（{source}）：发声记号必须完整位于一个时间段内，设定、开场和组尾不能重复对白。",
 }

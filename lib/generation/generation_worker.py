@@ -831,6 +831,8 @@ class GenerationWorker:
             operation(
                 operation_id=task_id,
                 source="model",
+                reason=(task.get("payload") or {}).get("replan_reason"),
+                action=task.get("task_type"),
                 settings_snapshot=(task.get("payload") or {}).get("_production_feedback"),
             ),
         ):

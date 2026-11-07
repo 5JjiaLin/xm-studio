@@ -1685,6 +1685,18 @@ class ScriptGenerator:
             episode=episode,
             target_language=self.project_json.get("source_language") or "中文",
             instructions=instructions,
+            source_language=self.project_json.get("source_language"),
+            speech_rate_override=project_speech_rate_override(self.project_json),
+            timeline_enabled=self.content_mode == "drama",
+            voice_conditions="\n".join(
+                f"{bucket}: 用户音频意图={'开启' if value.requested_generate_audio else '关闭'}；"
+                f"模型音轨={'支持' if value.has_audio_track else '不支持'}；"
+                f"音频开关={'可控' if value.audio_switch_controllable else '不可控'}；"
+                f"音色能力={value.voice_consistency}；参考音频上限={value.max_reference_audio_count}。"
+                for bucket, value in facts.by_bucket.items()
+                if isinstance(value, VideoRequestFacts)
+            )
+            or "声音能力未知，不承诺生成声音或音频绑定。",
         )
 
     @staticmethod
@@ -1843,12 +1855,41 @@ class ScriptGenerator:
                     tolerated_speakers=dialogue_speakers(str(unit.get("text") or "")),
                 )
                 assert_dialogue_preserved(label, str(unit.get("text") or ""), flat_unit.text)
+                if self.content_mode == "drama":
+                    from lib.script.reference_video.temporal_validation import validate_timeline
+
+                    _, temporal_issues = validate_timeline(
+                        flat_unit.text,
+                        int(unit["duration_seconds"]),
+                        required=True,
+                        language=self.project_json.get("source_language"),
+                        speech_rate_override=project_speech_rate_override(self.project_json),
+                    )
+                    if temporal_issues:
+                        raise DraftViolations(
+                            [
+                                DraftViolation(
+                                    f"{label}: {issue.code} (line {issue.line + 1}, {issue.expected} / {issue.actual})",
+                                    code=issue.code,
+                                    label=label,
+                                    line=issue.line,
+                                    params=issue.parameters(),
+                                )
+                                for issue in temporal_issues
+                            ]
+                        )
             except DraftViolation as exc:
                 items = violation_items(exc)
                 locate_violations(items, item_index=index, item_id=str(unit["unit_id"]))
                 violations.extend(items)
                 continue
-            authored.append({**unit, "text": flat_unit.text})
+            authored.append(
+                {
+                    **unit,
+                    "text": flat_unit.text,
+                    **({"prompt_format_version": "timeline_v1"} if self.content_mode == "drama" else {}),
+                }
+            )
 
         if violations:
             raise DraftViolations(violations)

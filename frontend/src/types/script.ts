@@ -425,6 +425,7 @@ export interface AuthorPromptsResponse {
 /** AI 规划脚本的请求：附加指令（随请求按集保存）。 */
 export interface PlanScriptRequest {
   instructions?: string | null;
+  replan_reason?: string | null;
 }
 
 /** 提交后立即返回的生成批次，形状同提示词编写。 */

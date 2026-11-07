@@ -2450,3 +2450,55 @@ async def test_execute_reference_video_task_stages_actual_request_and_checkpoint
             task_id="task-checkpoint-failure",
         )
     assert not (proj_dir / ".arcreel" / "tasks" / "task-checkpoint-failure" / "provider_media").exists()
+
+
+@pytest.mark.parametrize(
+    ("text", "custom", "duration", "tiers", "code"),
+    [
+        ("@[张三]站着。", "", 3, (3,), "timeline_missing"),
+        ("【0-3s】\n@[张三]站着。", "旧人工框架", 3, (3,), "timeline_missing"),
+        ("【0-5s】\n@[张三]站着。", "", 5, (4, 8), "timeline_duration_mismatch"),
+        ("【0-1s】\n@[张三]{这些话一秒钟之内无法念完。}\n【1-3s】\n静默。", "", 3, (3,), "segment_speech_overflow"),
+    ],
+)
+async def test_worker_rejects_invalid_effective_timeline_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    text,
+    custom,
+    duration,
+    tiers,
+    code,
+):
+    from lib.script.reference_video.request_projection import ReferenceProjectionBlockedError
+    from server.services.tasks import reference_video_tasks as rvt
+
+    project_dir = write_project(tmp_path)
+    script_path = project_dir / "scripts" / "episode_1.json"
+    script = json.loads(script_path.read_text(encoding="utf-8"))
+    script["video_units"][0].update(
+        text=text, generation_prompt=custom, duration_seconds=duration, prompt_format_version="timeline_v1"
+    )
+    script_path.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
+    original = script_path.read_bytes()
+    fake_pm = MagicMock()
+    fake_pm.load_project.return_value = json.loads((project_dir / "project.json").read_text(encoding="utf-8"))
+    fake_pm.get_project_path.return_value = project_dir
+    fake_pm.load_script.side_effect = lambda *_args: json.loads(script_path.read_text(encoding="utf-8"))
+    _wire_locked_script(fake_pm)
+    use_project_manager(monkeypatch, fake_pm)
+    generator = MagicMock()
+    _wire_context(
+        monkeypatch,
+        rvt,
+        generator,
+        backend_name="openai",
+        backend_model="sora-2",
+        max_refs=9,
+        supported_durations=tiers,
+    )
+    with pytest.raises(ReferenceProjectionBlockedError) as refused:
+        await rvt.execute_reference_video_task("demo", "E1U1", {"script_file": "scripts/episode_1.json"}, user_id="u1")
+    assert refused.value.code == code
+    assert script_path.read_bytes() == original
+    assert not (project_dir / "reference_videos" / "E1U1.mp4").exists()

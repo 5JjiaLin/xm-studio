@@ -38,7 +38,9 @@ def _stub_batch_admission_queue(monkeypatch) -> None:
     use_active_tasks_lookup(monkeypatch, _no_active_tasks)
 
 
+@pytest.mark.parametrize("timeline", [False, True])
 async def test_reference_projection_contract_stays_aligned_across_public_consumers(
+    timeline,
     db_factory,
     monkeypatch,
     tmp_path,
@@ -57,6 +59,9 @@ async def test_reference_projection_contract_stays_aligned_across_public_consume
         "duration_seconds": 5,
         "generated_assets": {},
     }
+    if timeline:
+        unit["text"] = "【0-5s】\n" + unit["text"]
+        unit["prompt_format_version"] = "timeline_v1"
     script: dict[str, Any] = {
         "episode": 1,
         "content_mode": "narration",
@@ -203,6 +208,8 @@ async def test_reference_projection_contract_stays_aligned_across_public_consume
             "reference_images_clamped",
             duration_code,
         ]
+        if timeline:
+            expected_codes.append("timeline_duration_mismatch")
         for projection in (quote_projection, precheck_detail, generate_detail, agent_projection):
             problems = cast(list[dict[str, object]], projection["problems"])
             assert [problem["code"] for problem in problems] == expected_codes
@@ -210,4 +217,6 @@ async def test_reference_projection_contract_stays_aligned_across_public_consume
 
     await observe(5, 8)
     unit["duration_seconds"] = 13
+    if timeline:
+        unit["text"] = unit["text"].replace("0-5s", "0-13s")
     await observe(13, 12)

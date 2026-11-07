@@ -200,8 +200,70 @@ async def test_restarted_service_advances_existing_video_batch_without_resubmitt
     submit = AsyncMock()
     monkeypatch.setattr(restarted, "_submit", submit)
     await restarted.advance("demo", 1)
+    state = await restarted.status("demo", 1)
+    assert state["stage"] == "videos"
+    assert state["status"] == "completed"
+    assert state["members"][0]["status"] == "succeeded"
+    # Refresh/restart keeps the review pause. Repeated episode submission needs no timeline.
+    await restarted.advance("demo", 1)
+    await restarted.start_videos("demo", 1, "default")
+    submit.assert_not_awaited()
+
+    # Only an explicit render action starts composition; selected rerolls still work afterwards.
+    await restarted.start_render("demo", 1, "default")
     assert submit.call_args.args[-1] == "render"
-    assert (await restarted.status("demo", 1))["stage"] == "videos"
+
+
+@pytest.mark.asyncio
+async def test_completed_video_review_allows_selected_reroll(production, monkeypatch):
+    await production._write(
+        "demo",
+        1,
+        {
+            "episode": 1,
+            "action": "videos",
+            "status": "completed",
+            "stage": "videos",
+            "basis": "basis",
+            "user_id": "default",
+            "batch_id": "old-batch",
+        },
+    )
+    monkeypatch.setattr(production, "_script_hash", lambda *_: "basis")
+    preview = AsyncMock(return_value={"submittable": True, "confirmed_request_durations": {"E1U2": 8}})
+    submit = AsyncMock()
+    monkeypatch.setattr(production, "preview_videos", preview)
+    monkeypatch.setattr(production, "_submit", submit)
+    state = await production.start_videos("demo", 1, "default", unit_ids=["E1U2"])
+    assert state["unit_ids"] == ["E1U2"]
+    assert state["stage"] == "videos"
+    preview.assert_awaited_once_with("demo", 1, "default", ["E1U2"])
+    submit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_single_video_completion_does_not_prevent_generating_other_missing_clips(production, monkeypatch):
+    await production._write(
+        "demo",
+        1,
+        {
+            "episode": 1,
+            "action": "videos",
+            "status": "completed",
+            "stage": "videos",
+            "basis": "basis",
+            "unit_ids": ["E1U1"],
+            "user_id": "default",
+        },
+    )
+    monkeypatch.setattr(production, "_script_hash", lambda *_: "basis")
+    preview = AsyncMock(return_value={"submittable": True, "confirmed_request_durations": {"E1U2": 8}})
+    submit = AsyncMock()
+    monkeypatch.setattr(production, "preview_videos", preview)
+    monkeypatch.setattr(production, "_submit", submit)
+    state = await production.start_videos("demo", 1, "default")
+    assert state["unit_ids"] is None
+    preview.assert_awaited_once_with("demo", 1, "default", None)
     submit.assert_awaited_once()
 
 

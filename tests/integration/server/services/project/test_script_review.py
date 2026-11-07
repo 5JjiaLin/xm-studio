@@ -533,6 +533,48 @@ class TestConfirmMaterializesScript:
         assert unit["source_text"] == planned["source_text"]
         assert unit["pending_authoring"] is True
 
+    async def test_reference_confirm_registers_complete_restrained_appearance_and_keeps_speaker_identity(
+        self, tmp_path, video_request_facts
+    ):
+        pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
+        pm.add_prop("demo", "铁链", "旧集使用的独立铁链")
+        props_before = pm.load_project("demo")["props"]
+        source = "阿离手腕戴着手链、脚踝戴着脚链，说：别碰我。"
+        (pm.get_project_path("demo") / "source/episode_1.txt").write_text(source, encoding="utf-8")
+        _write_rv_script_plan(
+            pm,
+            {
+                "units": [
+                    {
+                        "unit_id": "E1U01",
+                        "text": "@[阿离（束缚）] 手腕戴着手链、脚踝戴着脚链。\n@[阿离（束缚）]{别碰我。}",
+                        "duration_seconds": 8,
+                        "source_text": source,
+                    }
+                ],
+                "new_assets": [
+                    {
+                        "type": "character",
+                        "name": "阿离（束缚）",
+                        "decision": "derivative",
+                        "target": "阿离",
+                        "asset_name": "束缚形态",
+                        "description": "手腕戴着手链、脚踝戴着脚链",
+                        "reason": "持续佩戴的束缚属于完整人物外观",
+                    }
+                ],
+            },
+        )
+
+        await _service(pm).confirm("demo", 1)
+
+        [unit] = _formal_script(pm)["video_units"]
+        assert unit["text"] == "@[阿离/束缚形态] 手腕戴着手链、脚踝戴着脚链。\n@[阿离]{别碰我。}"
+        project = pm.load_project("demo")
+        assert project["characters"]["阿离"]["description"] == "少女"
+        assert project["characters"]["阿离"]["derivatives"]["束缚形态"]["description"] == "手腕戴着手链、脚踝戴着脚链"
+        assert project["props"] == props_before
+
     async def test_existing_script_without_acknowledgement_is_refused_untouched(self, tmp_path):
         pm = _make_project(tmp_path, "narration")
         _write_script_plan(pm, "narration", _narration_script_plan())

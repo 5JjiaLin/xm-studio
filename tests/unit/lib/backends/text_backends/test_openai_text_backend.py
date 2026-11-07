@@ -13,6 +13,7 @@ from openai import BadRequestError
 from openai.types.completion_usage import CompletionUsage, PromptTokensDetails
 from pydantic import BaseModel
 
+from lib.backends.openai_shared import OPENAI_TEXT_TIMEOUT
 from lib.backends.providers import PROVIDER_OPENAI
 from lib.backends.text_backends.base import (
     ImageInput,
@@ -63,7 +64,14 @@ class TestOpenAITextBackend:
             assert backend.model == "gpt-5.4-mini"
 
         # 未给 base_url 时回填官方端点；SDK 内置重试关闭，由 generate() 统一管理重试
-        assert created == [{"api_key": "test-key", "base_url": "https://api.openai.com/v1", "max_retries": 0}]
+        assert created == [
+            {
+                "api_key": "test-key",
+                "base_url": "https://api.openai.com/v1",
+                "max_retries": 0,
+                "timeout": OPENAI_TEXT_TIMEOUT,
+            }
+        ]
 
     def test_custom_model(self):
         with captured_openai_clients():

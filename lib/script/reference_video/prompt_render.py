@@ -15,7 +15,7 @@
   画面里有两个及以上不同角色时追加分身或双胞胎排除项。带商品参考图时其后再接商品高保真声明
 
 所有创作类型的输入均是 unit 正文这一段自由文本，正文只写第二段；主体绑定与参考图顺序都经
-``@[X]`` mention 解析派生（:func:`render_unit_prompt`）。文本不含绝对秒数，时长走请求字段。
+``@[X]`` mention 解析派生（:func:`render_unit_prompt`）。正文可包含经校验的时间轴，实际时长仍走请求字段。
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from lib.script.reference_video.script_preview import (
     derive_utterances,
     derive_voice_bindings,
 )
+from lib.script.reference_video.temporal_validation import TemporalIssue
 from lib.script.reference_video.text_parser import (
     SpeechMark,
     derive_references_from_text,
@@ -444,3 +445,33 @@ def resolve_reference_audio_paths(project: dict, project_path: Path) -> dict[str
         if path is not None and path.exists():
             resolved[name] = path
     return resolved
+
+
+def temporal_unit_issues(
+    unit: dict,
+    project: dict,
+    settings: VoiceRenderSettings,
+    *,
+    request_references: list[ReferenceResource],
+    request_duration_seconds: int | None,
+) -> tuple[TemporalIssue, ...]:
+    """Validate effective creative content without asking request facts a second time."""
+    from lib.script.reference_video.temporal_validation import has_timeline, validate_effective_timeline
+
+    if not (
+        unit.get("prompt_format_version")
+        or has_timeline(str(unit.get("text") or ""))
+        or has_timeline(str(unit.get("generation_prompt") or ""))
+    ):
+        return ()
+    default = render_video_unit_prompt(
+        {**unit, "generation_prompt": ""}, project, settings, request_references=request_references
+    )
+    custom = str(unit.get("generation_prompt") or "")
+    return validate_effective_timeline(
+        unit=unit,
+        project=project,
+        default_creative=default.creative_text,
+        effective_creative=custom or default.creative_text,
+        request_duration_seconds=request_duration_seconds,
+    )

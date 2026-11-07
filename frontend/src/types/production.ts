@@ -46,3 +46,17 @@ export interface ProductionEdit {
   subtitle_drafts: Record<string, string>;
   issues: { clip_id: string; field: string; subtitle_id?: string; message: string }[];
 }
+
+export interface ScriptBoundary { start_line: number; title: string; number: number }
+export interface WholeScriptPreview {
+  text: string; fingerprint: string; project_basis: string;
+  episodes: Array<ScriptBoundary & { start: number; end: number; characters: number; head: string; tail: string }>;
+  warnings: string[]; errors: string[];
+}
+export interface ScriptImport { import_id: string; episodes: number[]; fingerprint: string }
+export interface ScriptBatchState {
+  status: "idle" | "active" | "submitting" | "unknown" | "stopping" | "stopped" | "failed" | "completed";
+  import_id?: string; error?: string | null; input_changed?: boolean; input_revision?: string;
+  items: Array<{ episode: number; position?: number | null; title?: string; status: "pending" | "submitting" | "active" | "unknown" | "failed" | "completed" }>;
+  imports: ScriptImport[];
+}

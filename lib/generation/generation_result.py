@@ -138,6 +138,13 @@ class GenerationAction(StrEnum):
 # again for the same rejection. The coverage test in
 # ``tests/unit/lib/generation/test_generation_result.py`` is the drift guard.
 _TASK_FAILURE_ACTIONS: dict[str, GenerationAction] = {
+    "timeline_missing": GenerationAction.FIX_INPUT,
+    "timeline_malformed": GenerationAction.FIX_INPUT,
+    "timeline_gap_or_overlap": GenerationAction.FIX_INPUT,
+    "timeline_duration_mismatch": GenerationAction.FIX_INPUT,
+    "segment_speech_overflow": GenerationAction.FIX_INPUT,
+    "creative_override_mismatch": GenerationAction.FIX_INPUT,
+    "timeline_speech_outside_segment": GenerationAction.FIX_INPUT,
     "needs_replan": GenerationAction.REPLAN_UNIT,
     "reference_duration_confirmation_required": GenerationAction.CONFIRM_REQUEST_DURATION,
     "reference_asset_missing": GenerationAction.GENERATE_DEPENDENCY,

@@ -57,6 +57,7 @@ export interface UnitGeneratedAssets {
 }
 
 export interface ReferenceVideoUnit {
+  prompt_format_version?: "timeline_v1";
   generation_prompt?: string;
   /** Format: "E{episode}U{index}" */
   unit_id: string;
@@ -333,6 +334,10 @@ export interface SaveEpisodeDraftResult {
 
 /** 当前草稿按模型能力投影后的最终文本与实发图片，图片顺序对应提示词中的图号。 */
 export interface ReferenceUnitPromptPreview extends RenderedPromptPreview {
+  prompt_source?: "manual" | "default";
+  prompt_format_version?: "timeline_v1" | null;
+  generation_allowed?: boolean;
+  problems?: { code: string; message: string; blocking: boolean; params: { line?: number; source?: string; expected?: string; actual?: string } }[];
   used_assets?: { type: AssetKind; name: string; paths: string[]; request_indices: number[]; status: "sent" | "excluded" | "missing" }[];
   voice_only?: string[];
   parameters?: Record<string, string | number | boolean | null>;

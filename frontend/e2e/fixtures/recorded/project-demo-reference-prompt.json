@@ -9,6 +9,10 @@
     "references": [],
     "warnings": [],
     "used_assets": [],
-    "voice_only": []
+    "voice_only": [],
+    "prompt_source": "default",
+    "prompt_format_version": null,
+    "problems": [],
+    "generation_allowed": false
   }
 }

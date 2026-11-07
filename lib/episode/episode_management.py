@@ -15,6 +15,7 @@ from lib.episode.episode_ledger import normalize_source_text, parse_positive_epi
 from lib.episode.episode_paths import episode_script_relpath
 from lib.episode.episode_source_commands import write_episode_source_file
 from lib.episode.episode_sources import SOURCE_ORIGIN_FIELD, SourceOrigin, cut_episode_placements, discover_sources
+from lib.episode.script_batch_state import require_batch_idle
 from lib.episode.source_kinds import SourceKind, record_episode_kind
 
 if TYPE_CHECKING:
@@ -64,7 +65,9 @@ def create_episode(
     """
     text = normalize_source_text(source_text) if source_text is not None else ""
     project_dir = pm.get_project_path(project_name)
+    require_batch_idle(project_dir)
     with pm.locked_source_registration(project_name) as (_source_dir, project, undo):
+        require_batch_idle(project_dir)
         if project.get("content_mode") == "ad":
             raise EpisodeManagementError("ad_episode_locked", "广告/短片项目只有一集，不能新建或删除集")
         entries = _ledger(project)
@@ -91,8 +94,10 @@ def create_episode(
 def move_episode(pm: ProjectManager, project_name: str, episode: int, *, after: int | None) -> None:
     """把这一集移到 ``after`` 之后，``after`` 为 None 时移到最前。落位的切出集之间须保持源文顺序。"""
     project_dir = pm.get_project_path(project_name)
+    require_batch_idle(project_dir)
 
     def _mutate(project: dict[str, Any]) -> None:
+        require_batch_idle(project_dir)
         entries = list(_ledger(project))
         if after == episode:
             # 移到自己之后即原地不动

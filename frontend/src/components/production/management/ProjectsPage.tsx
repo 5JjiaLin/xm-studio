@@ -13,6 +13,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogBody, DialogFoo
 import { LoadingState } from "@/components/shared/LoadingState";
 import { useEditUnit } from "@/components/shared/edit-unit/useEditUnit";
 import { errMsg } from "@/utils/async";
+import { WholeScriptPanel } from "../script/WholeScriptPanel";
 import { ScriptInput } from "../script/ScriptInput";
 import { FeedbackExportButton } from "../feedback/FeedbackExportButton";
 import { productionPath, projectPath } from "../production-paths";
@@ -111,6 +112,8 @@ function EpisodeList({ name }: { name: string }) {
   const [showArchived, setShowArchived] = useState(false);
   const [editing, setEditing] = useState<EpisodeMeta | "new" | null>(null);
   const [busy, setBusy] = useState(false);
+  const [batchActive, setBatchActive] = useState(false);
+  const refresh = useCallback(() => setRevision((r) => r + 1), []);
   useEffect(() => {
     const c = new AbortController();
     void API.getProject(name, { signal: c.signal }).then((result) => { if (!c.signal.aborted) { setProject(result.project); setError(null); } }).catch((cause) => { if (!c.signal.aborted) setError(errMsg(cause)); });
@@ -134,10 +137,11 @@ function EpisodeList({ name }: { name: string }) {
     <div className="flex flex-wrap items-center gap-3"><h1 className="min-w-0 flex-1 wrap-break-word text-xl font-semibold">{project?.title || t("management_episodes")}</h1>
       <Button variant="outline" onClick={() => setRevision((r) => r + 1)}>{t("management_refresh")}</Button>
       <Button variant="outline" onClick={() => setShowArchived((v) => !v)}>{t(showArchived ? "management_active" : "management_archived")}</Button>
-      <Button disabled={projectArchived || !project} onClick={() => setEditing("new")}>{t("management_new_episode")}</Button>
+      <Button disabled={projectArchived || !project || batchActive} onClick={() => setEditing("new")}>{t("management_new_episode")}</Button>
     </div>
+    {project && <WholeScriptPanel project={name} disabled={projectArchived || busy} onImported={refresh} onActive={setBatchActive} />}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-    {projectArchived && <div className="flex flex-wrap items-center gap-3 rounded-lg border border-border p-4"><p>{t("management_project_archived")}</p><Button disabled={busy} onClick={() => void run(() => API.setProductionArchive(name, false))}>{t("management_restore")}</Button></div>}
+    {projectArchived && <div className="flex flex-wrap items-center gap-3 rounded-lg border border-border p-4"><p>{t("management_project_archived")}</p><Button disabled={busy || batchActive} onClick={() => void run(() => API.setProductionArchive(name, false))}>{t("management_restore")}</Button></div>}
     {!project && !error ? <LoadingState variant="pane" /> : <div className="flex flex-col gap-4">{visible.map((ep, index) => {
       const position = episodes.findIndex((entry) => entry.episode === ep.episode);
       return <article key={ep.episode} className="flex flex-col gap-3 rounded-lg border border-border bg-card p-4">
@@ -146,9 +150,9 @@ function EpisodeList({ name }: { name: string }) {
         {costs.data?.episodes.find((item) => item.episode === ep.episode) ? <ProductionCosts cost={costs.data.episodes.find((item) => item.episode === ep.episode)!} /> : <p className="text-sm text-muted-foreground">{t(costs.error ? "production_cost_load_failed" : "common:loading")}</p>}
         <div className="flex flex-wrap gap-2">
           {!showArchived && !projectArchived && <><Link href={productionPath(name, "script", ep.episode)} className={buttonVariants()}>{t("management_continue")}</Link><EpisodeOutput key={`${ep.episode}/${revision}`} project={name} episode={ep.episode} /></>}
-          <Button variant="outline" disabled={busy || showArchived || projectArchived} onClick={() => setEditing(ep)}>{t("management_rename")}</Button>
-          {!showArchived && !projectArchived && <><Button variant="outline" aria-label={t("management_up", { title: ep.title })} disabled={busy || position === 0} onClick={() => void run(() => API.moveEpisode(name, ep.episode, episodes[position - 2]?.episode ?? null))}><ArrowUp aria-hidden /></Button><Button variant="outline" aria-label={t("management_down", { title: ep.title })} disabled={busy || position === episodes.length - 1} onClick={() => void run(() => API.moveEpisode(name, ep.episode, episodes[position + 1].episode))}><ArrowDown aria-hidden /></Button></>}
-          <Button variant="ghost" disabled={busy || projectArchived} onClick={() => void run(() => API.setProductionArchive(name, !showArchived, ep.episode))}>{t(showArchived ? "management_restore" : "management_archive")}</Button>
+          <Button variant="outline" disabled={busy || batchActive || showArchived || projectArchived} onClick={() => setEditing(ep)}>{t("management_rename")}</Button>
+          {!showArchived && !projectArchived && <><Button variant="outline" aria-label={t("management_up", { title: ep.title })} disabled={busy || batchActive || position === 0} onClick={() => void run(() => API.moveEpisode(name, ep.episode, episodes[position - 2]?.episode ?? null))}><ArrowUp aria-hidden /></Button><Button variant="outline" aria-label={t("management_down", { title: ep.title })} disabled={busy || batchActive || position === episodes.length - 1} onClick={() => void run(() => API.moveEpisode(name, ep.episode, episodes[position + 1].episode))}><ArrowDown aria-hidden /></Button></>}
+          <Button variant="ghost" disabled={busy || batchActive || projectArchived} onClick={() => void run(() => API.setProductionArchive(name, !showArchived, ep.episode))}>{t(showArchived ? "management_restore" : "management_archive")}</Button>
         </div>
       </article>;
     })}{project && visible.length === 0 && <p className="text-sm text-muted-foreground">{t("management_empty")}</p>}</div>}

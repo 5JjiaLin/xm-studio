@@ -856,4 +856,11 @@ MESSAGES = {
     "trash_restore_needs_character": "Nhân vật «{name}» chứa mục này cũng đã bị xóa nên chỉ có thể khôi phục cùng nhân vật: hãy khôi phục nhân vật từ thùng rác dự án trước, rồi khôi phục bản ghi này",
     "trash_restore_download_only": "Không thể khôi phục bản ghi xóa này nữa; các tệp cấu trúc trong đó chỉ có thể tải xuống",
     "trash_restore_target_blocked": "Không thể khôi phục về {path}: một thư mục trên đường dẫn đã bị thay bằng liên kết",
+    "timeline_missing": "Dòng {line} ({source}): thêm mốc như {example} bao phủ toàn bộ đơn vị.",
+    "timeline_malformed": "Dòng {line} ({source}): mốc thời gian hoặc lời thoại không hợp lệ. Cần {expected}; hiện tại {actual}.",
+    "timeline_gap_or_overlap": "Dòng {line} ({source}): các khoảng phải liên tục và dương. Cần bắt đầu {expected}s; hiện tại {actual}s.",
+    "timeline_duration_mismatch": "Dòng {line} ({source}): kết thúc {actual}s, cần {expected}s. Hãy biên soạn lại; xác nhận thời lượng không bỏ qua lỗi này.",
+    "segment_speech_overflow": "Dòng {line} ({source}): lời thoại cần khoảng {actual}s; ngân sách gồm dung sai là {expected}s. Phân bổ lại hoặc sửa phân đoạn.",
+    "creative_override_mismatch": "Dòng {line} ({source}): nội dung thủ công thay đổi chủ thể hoặc lời thoại. Sửa đồng bộ hoặc khôi phục mặc định.",
+    "timeline_speech_outside_segment": "Dòng {line} ({source}): lời thoại phải nằm trọn trong một khoảng thời gian, không đặt ở phần thiết lập hoặc chuyển tiếp.",
 }

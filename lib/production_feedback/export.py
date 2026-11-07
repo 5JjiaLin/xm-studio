@@ -29,14 +29,21 @@ def csv_bytes(rows: list[dict]) -> bytes:
         "project",
         "project_chain_id",
         "local_sequence",
+        "created_at",
+        "operation_id",
+        "episode_id",
         "event_type",
         "source",
+        "action",
         "resource",
         "object_chain_id",
         "before_revision",
         "after_revision",
         "changed_fields",
         "reason",
+        "reason_source",
+        "before",
+        "after",
         "template_digest",
         "task_id",
     ]
@@ -70,6 +77,9 @@ def export_project(store: FeedbackStore, project: str, *, include_media: bool = 
     directory = store.layout.projects_dir / project
     current_chain = store.project_chain(project)
     files = {"events.jsonl": _jsonl(events), "events.csv": csv_bytes(events)}
+    from lib.production_feedback.metrics import difference_report, summarize
+
+    files["report.md"] = difference_report(events, summarize(events)).encode("utf-8")
     template_digests = {event["template_digest"] for event in events if event.get("template_digest")}
     with store.connection() as db:
         for identifier in sorted(template_digests):

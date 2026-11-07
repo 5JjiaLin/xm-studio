@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 from collections.abc import Generator
@@ -309,6 +310,9 @@ class FeedbackStore:
             "template_digest": self.template_snapshot(),
             "application_version": _APPLICATION_VERSION,
         }
+        episode = re.search(r"(?:^|/)episode_(\d+)(?:/|\.json$)", resource)
+        if episode:
+            event["episode_id"] = int(episode[1])
         if resource == "versions/versions.json":
             evidence = {}
             directory = self.layout.projects_dir / project
@@ -577,8 +581,8 @@ class FeedbackStore:
             "template_digest": self._template_digest,
             "application_version": _APPLICATION_VERSION,
             "identity_links": context.identity_links,
-            "reason": None,
-            "reason_source": None,
+            "reason": context.reason,
+            "reason_source": "user" if context.reason else None,
             "action": context.action,
             "recovered_paid_output": True,
             "preparation_owner": self._owner(),
@@ -630,6 +634,7 @@ class FeedbackStore:
 
     def events(self, project: str | None = None) -> list[dict]:
         self.recover()
+        self.recover_replan_submissions(project)
         with self.connection() as db:
             rows = db.execute(
                 "SELECT payload FROM production_feedback_events"
@@ -645,6 +650,69 @@ class FeedbackStore:
                 if project is None or json.loads(row[0])["project"] == project
             )
             return events
+
+    def prepare_replan_submission(self, project: str, task_type: str, payload: dict | None, source: str) -> dict | None:
+        """Freeze only submitted correction input; never treat a preview as a revision."""
+        payload = payload or {}
+        reason = payload.get("replan_reason")
+        if (
+            task_type not in {"text_reference_script_plan", "text_drama_script_plan", "text_narration_script_plan"}
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or payload.get("dry_run")
+        ):
+            return None
+        inputs = {
+            key: payload.get(key) for key in ("episode", "source", "instructions", "replan_reason", "replan_context")
+        }
+        event = self._event(project, "replan/pending", None, inputs, "replan_submitted")
+        event.update(
+            reason=reason,
+            reason_source="user",
+            episode_id=payload.get("episode"),
+            action=task_type,
+            source=(current.get().source if current.get() else "human" if source == "webui" else "system"),
+        )
+        return event
+
+    def record_replan_submission(self, event: dict, task_id: str) -> dict:
+        event = {**event, "resource": f"replan/{task_id}", "task_id": task_id}
+        with self.connection() as db:
+            return self._append(db, event, f"replan:{task_id}")
+
+    def recover_replan_submissions(self, project: str | None = None) -> None:
+        """The task payload is the durable receipt even if generation failed or never ran."""
+        with self.connection() as db:
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").fetchone():
+                return
+            rows = db.execute(
+                "SELECT task_id,project_name,payload_json,status,finished_at FROM tasks "
+                "WHERE json_extract(payload_json,'$._production_feedback_replan') IS NOT NULL"
+                + (" AND project_name=?" if project else "")
+                + " ORDER BY queued_at,task_id",
+                (project,) if project else (),
+            ).fetchall()
+        for row in rows:
+            event = json.loads(row["payload_json"])["_production_feedback_replan"]
+            if event.get("project") != row["project_name"]:
+                continue
+            submitted = self.record_replan_submission(event, row["task_id"])
+            if row["status"] not in {"succeeded", "failed", "cancelled"}:
+                continue
+            outcome = {"status": row["status"], "finished_at": row["finished_at"]}
+            finished = {
+                **submitted,
+                "event_id": str(uuid4()),
+                "event_type": "replan_finished",
+                "source": "system",
+                "created_at": row["finished_at"] or submitted["created_at"],
+                "before": None,
+                "after": outcome,
+                "before_revision": digest(None),
+                "after_revision": digest(outcome),
+            }
+            with self.connection() as db:
+                self._append(db, finished, f"replan_finished:{row['task_id']}")
 
     def record_request(self, project: str, call_id: int, payload: dict) -> dict:
         event = self._event(project, f"request/{call_id}", None, payload, "request_submitted")

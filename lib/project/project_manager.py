@@ -986,6 +986,9 @@ class ProjectManager:
         # 结构校验守卫（「不更坏」语义），置于落盘前，避免脏数据潜伏到 worker 执行层才暴露。
         if validate:
             before_script = self._load_script_or_none(output_path) if isinstance(before, _Unset) else before
+            from lib.script.reference_video.temporal_validation import retain_timeline_contract
+
+            retain_timeline_contract(before_script, script)
             self._guard_no_worse(before_script, script)
 
         # 再做 filename/内部 episode 一致性校验，避免写盘后才在 sync 阶段抛错，

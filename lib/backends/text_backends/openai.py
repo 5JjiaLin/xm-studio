@@ -7,7 +7,12 @@ import logging
 
 from openai import AsyncOpenAI, BadRequestError
 
-from lib.backends.openai_shared import OPENAI_RETRYABLE_ERRORS, create_openai_client
+from lib.backends.openai_shared import (
+    LONG_THINKING_TEXT_MODELS,
+    OPENAI_RETRYABLE_ERRORS,
+    OPENAI_TEXT_TIMEOUT,
+    create_openai_client,
+)
 from lib.backends.providers import PROVIDER_DASHSCOPE, PROVIDER_MINIMAX, PROVIDER_OPENAI
 from lib.backends.text_backends.base import (
     TextCapability,
@@ -47,7 +52,11 @@ class OpenAITextBackend:
     ):
         # 禁用 SDK 内置重试，由本层 generate() 统一管理重试策略
         self._client = create_openai_client(
-            api_key=api_key, base_url=base_url, max_retries=0, transport_layer=transport_layer
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=0,
+            transport_layer=transport_layer,
+            timeout=OPENAI_TEXT_TIMEOUT,
         )
         self._model = model or DEFAULT_MODEL
         # 复用 OpenAI 兼容协议的 provider（如 dashscope）须用真实 provider 记账，
@@ -180,7 +189,18 @@ class OpenAITextBackend:
 
         logger.info("调用 %s 文本 SDK kwargs=%s", self.name, format_kwargs_for_log(kwargs))
         try:
-            response = await self._client.chat.completions.create(**kwargs)
+            if self._model in LONG_THINKING_TEXT_MODELS:
+                # 流式接收让支持心跳的代理在思考期间保持连接；正文仍完整聚合后才返回。
+                # 使用快照保留原有截断判断，避免 SDK 的 parse 抢先抛 length 异常。
+                async with self._client.chat.completions.stream(
+                    **kwargs, stream_options={"include_usage": True}
+                ) as stream:
+                    await stream.until_done()
+                    response = stream.current_completion_snapshot
+                if not response.choices or not response.choices[0].finish_reason:
+                    raise RuntimeError("文本流未收到结束标记，不能保存不完整结果")
+            else:
+                response = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:
             if request.response_schema and _is_schema_error(exc):
                 logger.warning(

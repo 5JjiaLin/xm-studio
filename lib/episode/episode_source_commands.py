@@ -35,6 +35,7 @@ from lib.episode.episode_sources import (
     remove_whole_source_file,
     whole_source_files,
 )
+from lib.episode.script_batch_state import require_batch_idle
 from lib.episode.source_kinds import (
     DEFAULT_SOURCE_KIND,
     SourceKind,
@@ -194,7 +195,9 @@ def set_episode_source_text(
     """
     normalized = _require_text(text)
     project_dir = pm.get_project_path(project_name)
+    require_batch_idle(project_dir)
     with pm.locked_source_registration(project_name) as (_source_dir, project, undo):
+        require_batch_idle(project_dir)
         raw_episodes = project.get("episodes")
         entry = next(
             (
@@ -286,7 +289,9 @@ def _read_source_bytes(path: Path) -> tuple[bytes, str]:
 def adopt_source_file_as_whole_source(pm: ProjectManager, project_name: str, filename: str) -> None:
     """把 ``source/`` 下没有登记的文件加入整本源文，接在清单末尾。"""
     project_dir = pm.get_project_path(project_name)
+    require_batch_idle(project_dir)
     with pm.locked_source_registration(project_name) as (_source_dir, project, _undo):
+        require_batch_idle(project_dir)
         path = _unregistered_source_path(project_dir, project, filename)
         rel = f"source/{filename}"
         if not is_whole_source_file_path(rel):
@@ -303,7 +308,9 @@ def adopt_source_file_as_episode(pm: ProjectManager, project_name: str, filename
     文件内容写进集文件后，原文件删除；登记没有写回时，集文件撤销、原文件按原字节放回。
     """
     project_dir = pm.get_project_path(project_name)
+    require_batch_idle(project_dir)
     with pm.locked_source_registration(project_name) as (_source_dir, project, undo):
+        require_batch_idle(project_dir)
         path = _unregistered_source_path(project_dir, project, filename)
         original, decoded = _read_source_bytes(path)
         text = _require_text(decoded)
@@ -354,8 +361,10 @@ def set_whole_source_file_kind(
     stale 时，``confirm`` 为 False 就不写入，只返回这些集；没有这类集时直接写入。只有剧情演绎项目有类型。
     """
     project_dir = pm.get_project_path(project_name)
+    require_batch_idle(project_dir)
     rel = f"source/{filename}"
     with pm.locked_source_registration(project_name) as (_source_dir, project, _undo):
+        require_batch_idle(project_dir)
         if not source_kind_applies(project):
             raise EpisodeSourceError("source_kind_not_applicable", "只有剧情演绎项目有源文件类型")
         if rel not in whole_source_files(project):

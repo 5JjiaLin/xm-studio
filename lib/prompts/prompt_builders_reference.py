@@ -187,6 +187,10 @@ def build_reference_video_prompt(
     target_language: str = "中文",
     instructions: str | None = None,
     context_units: list[dict] | None = None,
+    source_language: str | None = None,
+    speech_rate_override: float | None = None,
+    voice_conditions: str = "声音能力未确认，不承诺生成声音或已绑定音频。",
+    timeline_enabled: bool = True,
 ) -> str:
     """构建参考生视频 prompt_authoring（提示词编写）的 LLM Prompt。
 
@@ -214,6 +218,10 @@ def build_reference_video_prompt(
         units_content=render_reference_units_for_prompt_authoring(
             script_plan_units, context_units=context_units, output_targets=True
         ),
+        timeline_enabled=timeline_enabled,
+        speech_rate=f"{speech_rate_units_per_second(source_language, speech_rate_override):g}",
+        speech_unit=reading_unit_noun(source_language),
+        voice_conditions=voice_conditions,
         context_content=render_reference_units_for_prompt_authoring(
             context_units if context_units is not None else script_plan_units
         ),

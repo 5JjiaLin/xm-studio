@@ -63,6 +63,16 @@ describe("Textarea 自动撑高", () => {
 
       expect(textarea).toHaveStyle({ height: "360px" });
     });
+
+    it("固定高度文本框保持统一尺寸并由内容区滚动", () => {
+      const { rerender } = render(<Textarea aria-label="提示词" fixedHeight value="" onChange={() => {}} />);
+
+      rerender(<Textarea aria-label="提示词" fixedHeight value={NINE_LINES} onChange={() => {}} />);
+
+      const textarea = screen.getByRole("textbox", { name: "提示词" });
+      expect(textarea).not.toHaveStyle({ height: "180px" });
+      expect(textarea).toHaveClass("h-40", "max-h-40", "overflow-y-auto");
+    });
   });
 
   it("浏览器支持 field-sizing 时交给 CSS 撑高", () => {

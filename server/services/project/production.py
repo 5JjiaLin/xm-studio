@@ -25,8 +25,8 @@ from lib.infra.data_root_layout import list_project_dirs
 from lib.infra.json_io import atomic_write_json
 from lib.project.project_manager import ProjectManager
 from server.media_tools.assets import GenerateAssetsRequest, generate_assets
-from server.media_tools.final_cuts import RenderFinalCutRequest, render_final_cut
-from server.media_tools.videos import GenerateVideosRequest, generate_videos
+from server.media_tools.final_cuts import FinalCutToolResult, RenderFinalCutRequest, render_final_cut
+from server.media_tools.videos import EpisodeTarget, GenerateVideosRequest, SelectedTarget, generate_videos
 from server.services.admission.asset_sheet_batch import AssetSheetScope, load_asset_sheet_batch_plan
 from server.services.admission.cost_estimation import estimate_image_batch_cost
 from server.services.project.script_review import ScriptReviewService
@@ -51,6 +51,9 @@ class ProductionService:
     def __init__(self, projects: ProjectManager, services: Services | None = None):
         self.projects = projects
         self.services = services or Services.defaults(projects)
+        from server.services.project.whole_script_batch import WholeScriptBatchService
+
+        self.script_batch = WholeScriptBatchService(projects, self.services)
         self._runner: asyncio.Task | None = None
 
     def _path(self, project: str, episode: int):
@@ -155,11 +158,16 @@ class ProductionService:
                 and state["status"] == "completed"
                 and not unit_ids
             ):
-                output = await FinalCutService(self.projects).status(
-                    project, state["timeline_id"], narration="without_narration", subtitles=BURNED_SUBTITLES
-                )
-                if output.status == "current":
+                # Completed video batches wait for explicit review, even before a timeline exists.
+                # Rerolls use selected unit_ids; a repeated whole-episode action is idempotent.
+                if state.get("stage") == "videos" and not state.get("unit_ids"):
                     return state
+                if state.get("stage") != "videos" and state.get("timeline_id"):
+                    output = await FinalCutService(self.projects).status(
+                        project, state["timeline_id"], narration="without_narration", subtitles=BURNED_SUBTITLES
+                    )
+                    if output.status == "current":
+                        return state
             if durations is None:
                 admission = await self.preview_videos(project, episode, user_id, unit_ids)
                 if not admission["submittable"]:
@@ -194,7 +202,11 @@ class ProductionService:
         entry = await asyncio.to_thread(
             lambda: next(e for e in self.projects.load_project(project)["episodes"] if e["episode"] == episode)
         )
-        target = {"scope": "selected", "ids": unit_ids} if unit_ids else {"scope": "episode", "episode_id": episode}
+        target = (
+            SelectedTarget(scope="selected", ids=unit_ids)
+            if unit_ids
+            else EpisodeTarget(scope="episode", episode_id=episode)
+        )
         result = await generate_videos(
             ToolRequest(
                 GenerateVideosRequest(
@@ -210,6 +222,8 @@ class ProductionService:
         )
         if result.problem:
             raise ProductionError(result.problem.detail)
+        if not isinstance(result.value, dict):
+            raise ProductionError("video_preview_unavailable")
         return result.value["video_quote"]
 
     async def preview_asset(self, project: str, kind: str, name: str, user_id: str):
@@ -277,7 +291,9 @@ class ProductionService:
                 lambda: next(e for e in self.projects.load_project(project)["episodes"] if e["episode"] == episode)
             )
             ids = state.get("unit_ids")
-            target = {"scope": "selected", "ids": ids} if ids else {"scope": "episode", "episode_id": episode}
+            target = (
+                SelectedTarget(scope="selected", ids=ids) if ids else EpisodeTarget(scope="episode", episode_id=episode)
+            )
             request = GenerateVideosRequest(
                 script=entry["script_file"].removeprefix("scripts/"),
                 target=target,
@@ -323,8 +339,8 @@ class ProductionService:
         batch = result.value
         if isinstance(batch, GenerationBatchReadModel):
             state.update(status="active", batch_id=batch.batch_id)
-        elif hasattr(batch, "batch_id"):
-            # RenderFinalCutToolResult carries the durable render batch beside
+        elif isinstance(batch, FinalCutToolResult):
+            # FinalCutToolResult carries the durable render batch beside
             # its immediate projection. Keep the same polling contract as media
             # generation instead of treating the projection as a terminal state.
             state.update(status="active", batch_id=batch.batch_id)
@@ -360,6 +376,7 @@ class ProductionService:
                 return
             try:
                 batch_id = state.get("batch_id")
+                batch: GenerationBatchReadModel | None = None
                 if batch_id:
                     batch = await self.services.queue.get_generation_batch(
                         project_name=project, batch_id=batch_id, user_id=state["user_id"]
@@ -385,7 +402,10 @@ class ProductionService:
                 elif stage == "videos":
                     if state["basis"] != await asyncio.to_thread(self._script_hash, project, episode):
                         raise ProductionError("script_changed_before_render")
-                    await self._submit(project, episode, state, "render")
+                    state.update(status="completed", error=None)
+                    if batch is not None:
+                        state["members"] = [m.model_dump(mode="json") for m in batch.members]
+                    await self._write(project, episode, state)
                 else:
                     if state.get("basis") != await asyncio.to_thread(self._script_hash, project, episode):
                         raise ProductionError("script_changed_before_completion")
@@ -411,6 +431,18 @@ class ProductionService:
 
     async def _run(self):
         while True:
+            batch_projects = await asyncio.to_thread(
+                lambda: [
+                    d.name
+                    for d in list_project_dirs(self.projects.projects_dir)
+                    if (d / "production" / "script_batch.json").is_file()
+                ]
+            )
+            for batch_project in batch_projects:
+                try:
+                    await self.script_batch.advance(batch_project)
+                except Exception:
+                    logger.exception("Cannot advance screenplay batch project=%s", batch_project)
             for project, episode in await asyncio.to_thread(self._journals):
                 try:
                     await self.advance(project, episode)

@@ -1,3 +1,4 @@
+import type { ScriptBoundary, WholeScriptPreview, ScriptImport, ScriptBatchState } from "@/types/production";
 import type { JianyingDeliveryResponse } from "@/types/jianying-delivery";
 /**
  * API 调用封装 (TypeScript)
@@ -2000,6 +2001,34 @@ class API {
   static async saveProductionAssetPrompt(project: string, kind: "character" | "scene" | "prop", name: string, value: { description?: string; generation_prompt: string }): Promise<SuccessResponse> {
     const paths = { character: "characters", scene: "scenes", prop: "props" };
     return this.request(`/projects/${encodeURIComponent(project)}/${paths[kind]}/${encodeURIComponent(name)}`, { method: "PATCH", body: JSON.stringify(value) });
+  }
+
+  static async previewWholeScript(project: string, text: string, boundaries?: ScriptBoundary[]): Promise<WholeScriptPreview> {
+    return this.request(`/projects/${encodeURIComponent(project)}/production/whole-script/preview`, { method: "POST", body: JSON.stringify({ text, boundaries }) });
+  }
+
+  static async importWholeScript(project: string, preview: WholeScriptPreview, file: File | null): Promise<ScriptImport> {
+    const url = `/projects/${encodeURIComponent(project)}/production/whole-script/import`;
+    const body = new FormData();
+    body.append("text", preview.text);
+    body.append("boundaries", JSON.stringify(preview.episodes.map(({ start_line, title, number }) => ({ start_line, title, number }))));
+    body.append("fingerprint", preview.fingerprint); body.append("expected_project", preview.project_basis);
+    if (file) body.append("file", file);
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url, { method: "POST", body }));
+    await throwIfNotOk(response, i18n.t("errors:upload_failed"));
+    return await response.json() as ScriptImport;
+  }
+
+  static async getScriptBatch(project: string, signal?: AbortSignal): Promise<ScriptBatchState> {
+    return this.request(`/projects/${encodeURIComponent(project)}/production/script-batch`, { signal });
+  }
+
+  static async startScriptBatch(project: string, importId: string): Promise<ScriptBatchState> {
+    return this.request(`/projects/${encodeURIComponent(project)}/production/script-batch`, { method: "POST", body: JSON.stringify({ import_id: importId }) });
+  }
+
+  static async controlScriptBatch(project: string, action: "stop" | "continue", inputRevision?: string): Promise<ScriptBatchState> {
+    return this.request(`/projects/${encodeURIComponent(project)}/production/script-batch/control`, { method: "POST", body: JSON.stringify({ action, input_revision: inputRevision }) });
   }
 
   static async previewProductionSource(file: File): Promise<{ text: string; filename: string }> {

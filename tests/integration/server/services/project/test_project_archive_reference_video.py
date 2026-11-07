@@ -129,6 +129,28 @@ def _create_reference_video_project(
 
 
 class TestProjectArchiveReferenceVideo:
+    @pytest.mark.parametrize("timeline", [False, True])
+    def test_round_trip_preserves_timeline_contract_and_manual_prompt(self, tmp_path, timeline):
+        pm = ProjectManager(tmp_path / "projects")
+        text = "【0-4s】\n空镜。" if timeline else "旧空镜正文。"
+        unit = _build_unit(video_clip=None, generated_assets=None, text=text)
+        unit["generation_prompt"] = "保留人工创作段，导入不静默修订。"
+        if timeline:
+            unit["prompt_format_version"] = "timeline_v1"
+        project_dir = _create_reference_video_project(pm, unit=unit, write_clip=False, write_thumbnail=False)
+        service = ProjectArchiveService(pm)
+        archive_path, _ = service.export_project("refdemo")
+        shutil.rmtree(project_dir)
+
+        result = service.import_project_archive(archive_path, uploaded_filename="refdemo.zip")
+
+        imported = json.loads(
+            (pm.get_project_path(result.project_name) / "scripts" / "episode_1.json").read_text(encoding="utf-8")
+        )["video_units"][0]
+        assert imported["text"] == text
+        assert imported["generation_prompt"] == unit["generation_prompt"]
+        assert imported.get("prompt_format_version") == ("timeline_v1" if timeline else None)
+
     def test_canonical_resource_path_reference_videos(self):
         # 验收项：reference_videos 走 unit_id 无前缀分支（路径形状由 lib.project.resource_paths 独家拥有）
         assert resource_relative_path("reference_videos", "E1U1") == "reference_videos/E1U1.mp4"

@@ -2064,7 +2064,13 @@ def test_prompt_preview_renders_draft_with_projected_references_without_saving(
     assert body["references"] == [{"type": "scene", "name": "酒馆", "path": "scenes/酒馆.png"}]
     assert body["used_assets"] == [
         {"type": "scene", "name": "酒馆", "paths": ["scenes/酒馆.png"], "request_indices": [1], "status": "sent"},
-        {"type": "character", "name": "张三", "paths": ["characters/张三.png"], "request_indices": [], "status": "excluded"},
+        {
+            "type": "character",
+            "name": "张三",
+            "paths": ["characters/张三.png"],
+            "request_indices": [],
+            "status": "excluded",
+        },
     ]
     assert any("上限 1" in warning for warning in body["warnings"])
     saved = reference_videos_client.get("/api/v1/projects/demo/reference-videos/episodes/1/units").json()
@@ -2243,7 +2249,45 @@ def test_unit_writes_return_the_refreshed_capability(reference_videos_client: Te
 def test_prompt_preview_lists_missing_images_and_voice_only_speakers(reference_videos_client, monkeypatch):
     use_reference_projection(monkeypatch, fake_reference_request_projector(durations=(3, 6, 9)))
     uid = _seed_unit(reference_videos_client)
-    response = reference_videos_client.post(f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}/prompt-preview", json={"prompt": "@[酒馆] 空镜。\n@[张三]{你好}"})
+    response = reference_videos_client.post(
+        f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}/prompt-preview",
+        json={"prompt": "@[酒馆] 空镜。\n@[张三]{你好}"},
+    )
     assert response.status_code == 200
     assert response.json()["voice_only"] == ["张三"]
     assert [asset["name"] for asset in response.json()["used_assets"]] == ["酒馆"]
+
+
+def test_timeline_errors_keep_preview_editable_and_saved_format_cannot_downgrade(
+    reference_videos_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    use_reference_projection(monkeypatch, fake_reference_request_projector(durations=(3, 6, 9)))
+    uid = _seed_unit(reference_videos_client)
+    url = f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}"
+    text = "【0-3s】\n@[张三]推门，停在门前。@[张三]{你好。}"
+    saved = reference_videos_client.patch(url, json={"prompt": text}).json()["unit"]
+    assert saved["prompt_format_version"] == "timeline_v1"
+    custom = "旧人工完整框架"
+    response = reference_videos_client.post(f"{url}/prompt-preview", json={"prompt": text, "generation_prompt": custom})
+    assert response.status_code == 200, response.text
+    preview = response.json()
+    assert preview["text"].endswith(custom)
+    assert preview["creative_text"] == custom
+    assert preview["prompt_source"] == "manual"
+    assert preview["generation_allowed"] is False
+    assert preview["unavailable"] is None
+    assert {p["code"] for p in preview["problems"]} >= {"timeline_missing", "creative_override_mismatch"}
+    assert all(p["message"] != p["code"] for p in preview["problems"])
+    assert reference_videos_client.patch(url, json={"generation_prompt": custom}).status_code == 200
+    cleared_titles = reference_videos_client.patch(url, json={"prompt": "@[张三]推门。"})
+    assert cleared_titles.status_code == 200
+    assert cleared_titles.json()["unit"]["prompt_format_version"] == "timeline_v1"
+    precheck = reference_videos_client.get(f"{url}/duration-precheck")
+    assert "timeline_missing" in {p["code"] for p in precheck.json()["detail"]["problems"]}
+    repaired = reference_videos_client.patch(url, json={"prompt": text, "generation_prompt": ""})
+    assert repaired.status_code == 200
+    good = reference_videos_client.post(f"{url}/prompt-preview", json={"prompt": text, "generation_prompt": ""}).json()
+    assert good["generation_allowed"] is True
+    assert good["problems"] == []
+    assert good["prompt_source"] == "default"

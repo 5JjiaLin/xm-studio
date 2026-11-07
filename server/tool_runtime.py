@@ -239,6 +239,7 @@ from server.text_generation import (
     prompt_authoring_preflight,
     require_admitted,
     script_plan_preflight,
+    script_plan_replan_context,
 )
 from server.text_generation import (
     confirm_script_review as confirm_script_review_handler,
@@ -925,11 +926,18 @@ class GenerateScriptPlanRequest(BaseModel):
         default=None, description="可选的项目内源文件相对路径；缺省读取本集派生源文 source/episode_N.txt"
     )
     instructions: _TextInstructions | SkipJsonSchema[None] = None
+    replan_reason: _TextInstructions | SkipJsonSchema[None] = Field(
+        default=None, description="本次重新拆解的原因；提供时结合当前拆解结果针对性修订资产分类、外观与镜头引用"
+    )
     dry_run: bool = Field(default=False, description=_DRY_RUN_DESCRIPTION)
 
     def text_request(self) -> TextGenerationRequest:
         return TextGenerationRequest(
-            episode=self.episode_id, source=self.source, instructions=self.instructions, dry_run=self.dry_run
+            episode=self.episode_id,
+            source=self.source,
+            instructions=self.instructions,
+            replan_reason=self.replan_reason,
+            dry_run=self.dry_run,
         )
 
 
@@ -981,8 +989,27 @@ async def generate_script_plan(
     scope: ProjectScope,
     _caller: CallerContext,
     services: Services,
+    *,
+    batch_context: tuple[str, str, str] | None = None,
 ) -> ToolOutcome[Any]:
     text_request = request.value.text_request()
+    from lib.episode.script_batch_state import require_batch_idle
+
+    try:
+        await asyncio.to_thread(
+            lambda: require_batch_idle(
+                services.projects.get_project_path(scope.project_name), batch_context[0] if batch_context else None
+            )
+        )
+    except ValueError as exc:
+        return ToolOutcome(problem=ToolProblem("generation_refused", str(exc)))
+    if batch_context:
+        text_request = replace(
+            text_request,
+            production_batch_id=batch_context[0],
+            production_attempt=batch_context[1],
+            batch_asset_context=batch_context[2],
+        )
     try:
         project = await asyncio.to_thread(services.projects.load_project, scope.project_name)
         content_mode = project.get("content_mode", "narration")
@@ -996,6 +1023,17 @@ async def generate_script_plan(
                 text_request.source,
             )
         )
+        if text_request.replan_reason and text_request.replan_reason.strip():
+            # Freeze the reviewed result when submitting, so queue recovery uses the same correction context.
+            text_request = replace(
+                text_request,
+                replan_context=await asyncio.to_thread(
+                    script_plan_replan_context,
+                    services.projects.get_project_path(scope.project_name),
+                    project,
+                    text_request.episode,
+                ),
+            )
         if is_reference_video_project(project):
             handler, task_type = generate_reference_script_plan, _TEXT_REFERENCE_SCRIPT_PLAN
         elif content_mode == "narration":
@@ -3286,6 +3324,11 @@ async def execute_queued_text_task(
             rewrite=bool(payload.get("rewrite")),
             overwrite_revision=payload.get("overwrite_revision"),
             regenerate=bool(payload.get("regenerate")),
+            production_batch_id=payload.get("production_batch_id"),
+            production_attempt=payload.get("production_attempt"),
+            batch_asset_context=payload.get("batch_asset_context"),
+            replan_reason=payload.get("replan_reason"),
+            replan_context=payload.get("replan_context"),
         )
         handlers = {
             _TEXT_EPISODE_SCRIPT: ("generate_episode_script", generate_episode_script_handler),

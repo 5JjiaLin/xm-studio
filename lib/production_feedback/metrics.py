@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import json
 from collections import Counter, defaultdict
+from contextlib import suppress
 
 from lib.production_feedback.objects import objects
 
@@ -34,6 +35,8 @@ def summarize(events: list[dict], *, grouped: bool = True, evidence_events: list
     for event in events:
         scope = (event["installation_id"], event["project"], event.get("project_chain_id"))
         key = (*scope, event.get("object_chain_id") or event.get("resource"))
+        if event["event_type"] == "replan_submitted" and event.get("reason"):
+            reasons[event["reason"]] += 1
         if event["event_type"] == "object_revision":
             revisions[key].append(event)
             if event["source"] == "human" and event.get("before") is not None:
@@ -150,6 +153,8 @@ def summarize(events: list[dict], *, grouped: bool = True, evidence_events: list
             else None,
         },
         "reasons": dict(reasons),
+        "replan_requests": sum(e["event_type"] == "replan_submitted" for e in events),
+        "replan_outcomes": dict(Counter(e["after"]["status"] for e in events if e["event_type"] == "replan_finished")),
         "unknown_events": sum(
             evidence_events is None
             or any((*key[:3], row["resource"]) in affected for key, rows in revisions.items() for row in rows)
@@ -253,8 +258,35 @@ def difference_report(events: list[dict], summary: dict) -> str:
         "```",
         "",
     ]
+    replans = {e["task_id"] for e in events if e["event_type"] == "replan_submitted"}
+    outcomes = {e["task_id"]: e["after"]["status"] for e in events if e["event_type"] == "replan_finished"}
     for event in events:
-        if event["event_type"] != "object_revision" or event["source"] != "human":
+        if event["event_type"] == "replan_submitted":
+            inputs = event["after"]
+            result.extend(
+                [
+                    f"## 重新拆解 · {event['project']} · 第 {event.get('episode_id', '?')} 集",
+                    "",
+                    f"时间：{event['created_at']}；任务：{event['task_id']}；状态：{outcomes.get(event['task_id'], '已提交，尚无终态记录')}",
+                    "",
+                    "### 重新拆解输入",
+                    "",
+                    *_fenced(event.get("reason") or "", "text"),
+                    "### 本次附加指令",
+                    "",
+                    *_fenced(inputs.get("instructions") or "无", "text"),
+                    "### 重拆前的结果快照",
+                    "",
+                ]
+            )
+            snapshot = inputs.get("replan_context")
+            with suppress(ValueError):
+                snapshot = json.loads(snapshot) if isinstance(snapshot, str) else snapshot
+            result.extend(_fenced(json.dumps(snapshot, ensure_ascii=False, indent=2), "json"))
+            continue
+        if event["event_type"] != "object_revision" or not (
+            event["source"] == "human" or (event["source"] == "model" and event.get("task_id") in replans)
+        ):
             continue
         result.extend(
             [
@@ -262,11 +294,36 @@ def difference_report(events: list[dict], summary: dict) -> str:
                 "",
                 f"批次：{event['test_batch_id']}；样例：{event['test_case_id']}；模板：{event['template_digest']}",
                 "",
-                "```diff",
+                f"时间：{event['created_at']}；来源：{event['source']}；任务：{event.get('task_id') or '无'}；操作：{event['operation_id']}",
+                "",
             ]
         )
-        before = json.dumps(event.get("before"), ensure_ascii=False, indent=2).splitlines()
-        after = json.dumps(event.get("after"), ensure_ascii=False, indent=2).splitlines()
-        result.extend(difflib.unified_diff(before, after, fromfile="before", tofile="after", lineterm=""))
-        result.extend(["```", ""])
+        if event.get("reason"):
+            result.extend(["修改原因：", "", *_fenced(event["reason"], "text")])
+        before, after = event.get("before"), event.get("after")
+        if isinstance(before, dict) or isinstance(after, dict):
+            before, after = before or {}, after or {}
+            for field in sorted(set(before) | set(after)):
+                if before.get(field) == after.get(field):
+                    continue
+                result.extend([f"### {field}", ""])
+                result.extend(_value_diff(before.get(field), after.get(field)))
+        else:
+            result.extend(_value_diff(before, after))
     return "\n".join(result)
+
+
+def _fenced(value: str, language: str) -> list[str]:
+    # User text may contain Markdown fences; keep the whole input inside one block.
+    fence = "```"
+    while fence in value:
+        fence += "`"
+    return [f"{fence}{language}", value, fence, ""]
+
+
+def _value_diff(before, after) -> list[str]:
+    def lines(value):
+        return (value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)).splitlines()
+
+    diff = "\n".join(difflib.unified_diff(lines(before), lines(after), fromfile="before", tofile="after", lineterm=""))
+    return _fenced(diff, "diff")
