@@ -102,6 +102,13 @@ def _settlement_from_result(call_type: CallType, result: Any, *, usage: Usage | 
             usage=(result.usage,) if result.usage is not None else (),
         )
     if call_type == "audio":
+        from lib.backends.music import MusicResult
+
+        if isinstance(result, MusicResult):
+            return SettlementInput(
+                billed_duration_seconds=result.duration_seconds,
+                usage=(Usage(quantities={"requests": 1}),),
+            )
         return SettlementInput(
             usage_tokens=len(result.text),
             input_tokens=result.input_tokens,

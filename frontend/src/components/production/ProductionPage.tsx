@@ -19,7 +19,7 @@ import { ProductionVideoCard } from "./videos/ProductionVideoCard";
 import { BreakdownEditor } from "./breakdown/BreakdownEditor";
 import { dialogueSpeakers, extractMentions } from "@/utils/reference-mentions";
 import { errMsg } from "@/utils/async";
-import { enqueuePromptAuthoring, enqueueProductionAssets, enqueueProductionRender, enqueueProductionVideos, enqueueScriptPlan } from "@/actions/generation";
+import { enqueuePromptAuthoring, enqueueProductionAssets, enqueueProductionRender, enqueueProductionFinish, enqueueProductionVideos, enqueueScriptPlan } from "@/actions/generation";
 import { API } from "@/api";
 import { useAppStore } from "@/stores/app-store";
 import { useHasUnsavedChanges } from "@/components/shared/edit-unit/LeaveGuard";
@@ -30,6 +30,16 @@ import { scriptPlanResourceId, promptAuthoringResourceId } from "@/actions/gener
 import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
 import { useProductionVideoProgress } from "./videos/useProductionVideoProgress";
 import { AlertDialog, AlertDialogAction, AlertDialogBody, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
+
+const finishErrors = [
+  "finish_music_too_short", "finish_requires_local", "finish_inputs_changed", "finish_timeline_changed",
+  "finish_video_not_ready", "finish_configure_jianying", "finish_music_result_unavailable",
+  "finish_configure_minimax", "finish_render_failed", "finish_output_not_current",
+  "finish_draft_conflict", "finish_close_jianying", "finish_draft_failed",
+] as const;
+function isFinishError(value: string): value is typeof finishErrors[number] {
+  return finishErrors.some((key) => key === value);
+}
 
 export function ProductionPage() {
   const { t } = useTranslation("dashboard");
@@ -152,12 +162,20 @@ export function ProductionPage() {
     const scope = actionScope.current;
     setStarting(true); setActionError(null);
     try {
-      await enqueueProductionRender(projectName, episode);
+      if (step === "videos" && !afterEditSave) await enqueueProductionFinish(projectName, episode);
+      else await enqueueProductionRender(projectName, episode);
       if (scope?.signal.aborted) { reportBackground(t("production_submitted_background")); return; }
       refresh();
       if (step === "videos") navigate(productionPath(projectName, "output", episode));
     }
     catch (cause) { if (scope?.signal.aborted) reportBackground(errMsg(cause), true); else setActionError(errMsg(cause)); }
+    finally { setStarting(false); }
+  };
+  const resumeFinish = async () => {
+    if (!projectName || !episode || active || hasUnsavedChanges()) return;
+    setStarting(true); setActionError(null);
+    try { await enqueueProductionFinish(projectName, episode, true); refresh(); }
+    catch (cause) { setActionError(errMsg(cause)); }
     finally { setStarting(false); }
   };
   const resumeAssets = async () => {
@@ -216,7 +234,9 @@ export function ProductionPage() {
       <div className="mx-auto flex max-w-300 flex-col gap-6">
         <h1 className="text-xl font-semibold">{t(`production_step_${step}`)}</h1>
         {actionError && <p role="alert" className="text-sm text-destructive">{actionError}</p>}
-        {production?.error && <p role="alert" className="text-sm text-destructive">{production.status === "unknown" ? t("production_unknown") : production.error}</p>}
+        {production?.error && <p role="alert" className="text-sm text-destructive">{production.action === "finish" && isFinishError(production.error) ? t(production.error) : production.status === "unknown" ? t("production_unknown") : production.error}</p>}
+        {production?.action === "finish" && production.status === "failed" && <Button variant="outline" className="self-start" disabled={active} onClick={() => void resumeFinish()}>{t("finish_resume")}</Button>}
+        {production?.action === "finish" && production.status === "active" && <p role="status" className="text-sm">{t(production.stage === "draft" ? "finish_draft" : "finish_render")}</p>}
         {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
         {loading ? <LoadingState variant="pane" /> : !projectName ? <ScriptInput /> : project && episode && <>
           {step === "script" && <ScriptInput key={`${projectName}/${episode}`} projectName={projectName} episode={episode} source={source ?? ""} disabled={active} readOnly={project.episodes?.find((entry) => entry.episode === episode)?.source_origin === "whole_source"} />}
@@ -247,7 +267,7 @@ export function ProductionPage() {
         </>}
       </div>
     </main>
-    <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border bg-card px-4 py-3"><p className="text-sm text-muted-foreground">{active ? t("production_running") : step === "assets" ? t("production_video_targets", { count: units.length }) : t("production_saved")}</p>{step === "output" && outputUrl ? <a className={buttonVariants()} href={outputUrl} download>{t("production_download")}</a> : <Button form={step === "breakdown" && !retryPlan || !projectName || step === "script" ? "production-action" : undefined} type={step === "breakdown" && !retryPlan || !projectName || step === "script" ? "submit" : "button"} onClick={retryPlan && projectName ? requestReplan : step === "assets" ? assetAction : step === "videos" ? () => void (canRebuild ? rebuild() : startVideos()) : undefined} disabled={active || (step !== "script" && step !== "breakdown" && step !== "assets" && step !== "videos") || (step === "breakdown" && !retryPlan && (!review?.content || !!review.quarantine)) || (step === "assets" && !allImagesReady && (!review?.fingerprint || review.status !== "confirmed")) || (step === "videos" && !canRebuild && (!allImagesReady || !promptsReady || videoTimelineBlocked))}>{t(planning ? "production_breakdown_running" : retryPlan ? "production_breakdown_retry" : step === "script" ? "production_start" : step === "breakdown" ? "production_confirm_assets" : step === "assets" ? allImagesReady ? promptsReady ? "production_review_videos" : "production_confirm_assets_write_prompts" : "production_confirm_image_prompts" : step === "videos" && canRebuild ? "production_confirm_merge" : step === "videos" && retryVideos ? "production_retry_failed" : step === "videos" ? "production_confirm_videos" : "production_download")}</Button>}</footer>
+    <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border bg-card px-4 py-3"><p className="text-sm text-muted-foreground">{active ? t("production_running") : step === "assets" ? t("production_video_targets", { count: units.length }) : step === "videos" && canRebuild ? t("finish_merge_hint") : t("production_saved")}</p>{step === "output" && outputUrl ? <a className={buttonVariants()} href={outputUrl} download>{t("production_download")}</a> : <Button form={step === "breakdown" && !retryPlan || !projectName || step === "script" ? "production-action" : undefined} type={step === "breakdown" && !retryPlan || !projectName || step === "script" ? "submit" : "button"} onClick={retryPlan && projectName ? requestReplan : step === "assets" ? assetAction : step === "videos" ? () => void (canRebuild ? rebuild() : startVideos()) : undefined} disabled={active || (step !== "script" && step !== "breakdown" && step !== "assets" && step !== "videos") || (step === "breakdown" && !retryPlan && (!review?.content || !!review.quarantine)) || (step === "assets" && !allImagesReady && (!review?.fingerprint || review.status !== "confirmed")) || (step === "videos" && !canRebuild && (!allImagesReady || !promptsReady || videoTimelineBlocked))}>{t(planning ? "production_breakdown_running" : retryPlan ? "production_breakdown_retry" : step === "script" ? "production_start" : step === "breakdown" ? "production_confirm_assets" : step === "assets" ? allImagesReady ? promptsReady ? "production_review_videos" : "production_confirm_assets_write_prompts" : "production_confirm_image_prompts" : step === "videos" && canRebuild ? "production_confirm_merge" : step === "videos" && retryVideos ? "production_retry_failed" : step === "videos" ? "production_confirm_videos" : "production_download")}</Button>}</footer>
     {picker && <WorkPicker onClose={() => setPicker(false)} />}
     <AlertDialog open={confirmReplan} onOpenChange={(open) => { if (!starting) setConfirmReplan(open); }}>
       <AlertDialogContent>
@@ -255,7 +275,7 @@ export function ProductionPage() {
         <AlertDialogBody><div className="flex flex-col gap-3">
           <AlertDialogDescription>{t(review?.status === "confirmed" ? "script_plan_replace_confirmed_hint" : review?.quarantine ? "script_plan_replace_draft_warning" : review?.content ? "script_plan_replace_pending_warning" : "script_plan_retry_failed_hint")}</AlertDialogDescription>
           <Label htmlFor="replan-reason">{t("script_plan_replan_reason")}</Label>
-          <Textarea id="replan-reason" value={replanReason} onChange={(event) => setReplanReason(event.target.value)} placeholder={t("script_plan_replan_reason_placeholder")} maxLength={4000} rows={5} disabled={starting} aria-describedby="replan-reason-hint" />
+          <Textarea id="replan-reason" className="placeholder:text-subtle-foreground" value={replanReason} onChange={(event) => setReplanReason(event.target.value)} placeholder={t("script_plan_replan_reason_placeholder")} maxLength={4000} rows={5} disabled={starting} aria-describedby="replan-reason-hint" />
           <p id="replan-reason-hint">{t("script_plan_replan_reason_hint")}</p>
           {actionError && <p role="alert" className="text-destructive">{actionError}</p>}
         </div></AlertDialogBody>

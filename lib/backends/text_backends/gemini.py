@@ -6,10 +6,14 @@ import logging
 from functools import partial
 from pathlib import Path
 
+import httpx
 from google import genai
+from google.genai.errors import APIError
+from google.genai.types import HttpOptions, HttpRetryOptions
 from PIL import Image
 
 from lib.config.url_utils import normalize_base_url
+from lib.infra.content_digest import canonical_json_digest
 from lib.infra.logging_utils import format_kwargs_for_log
 
 from ..gemini_shared import VERTEX_SCOPES, gemini_http_options, with_retry_async
@@ -26,6 +30,16 @@ from .base import (
     structured_fallback_reason,
     truncate_for_log,
 )
+from .request_policy import explicit_parameter_rejection, retry_before_acceptance
+
+
+def _retry_gemini_text(exc: BaseException) -> bool:
+    if isinstance(exc, APIError):
+        return retry_before_acceptance(exc, status_code=exc.code)
+    if isinstance(exc, httpx.TransportError):
+        return retry_before_acceptance(exc)
+    return False
+
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +114,16 @@ def _to_response_schema(schema: dict | type) -> dict:
     return normalized
 
 
+def _text_http_options(base_url: str | None, transport_layer: TransportLayer | None) -> HttpOptions:
+    options = HttpOptions.model_validate(gemini_http_options(base_url, transport_layer) or {})
+    options.retry_options = HttpRetryOptions(attempts=1)
+    if options.httpx_async_client is None:
+        # The SDK's aiohttp path unconditionally replays disconnects, even with
+        # attempts=1. An SDK-owned httpx transport keeps retries under our policy.
+        options.async_client_args = {"transport": httpx.AsyncHTTPTransport(retries=0)}
+    return options
+
+
 class GeminiTextBackend:
     """Gemini 文本生成后端，支持 AI Studio 和 Vertex AI 两种模式。"""
 
@@ -117,6 +141,8 @@ class GeminiTextBackend:
         self._model = model or DEFAULT_MODEL
         raw_backend = backend or "aistudio"
         self._backend = str(raw_backend).strip().lower() or "aistudio"
+        self._configuration_endpoint = normalize_base_url(base_url) or "official"
+        self._vertex_project: str | None = None
 
         if self._backend == "vertex":
             import json as json_module
@@ -132,6 +158,7 @@ class GeminiTextBackend:
             with open(credentials_file, encoding="utf-8") as f:
                 creds_data = json_module.load(f)
             project_id = creds_data.get("project_id")
+            self._vertex_project = project_id
 
             if not project_id:
                 raise ValueError(f"凭证文件 {credentials_file} 中未找到 project_id")
@@ -145,15 +172,15 @@ class GeminiTextBackend:
                 project=project_id,
                 location="global",
                 credentials=credentials,
+                http_options=_text_http_options(None, transport_layer),
             )
             logger.info("GeminiTextBackend: 使用 Vertex AI 后端（凭证: %s）", credentials_file.name)
         else:
             if not api_key:
                 raise ValueError("Gemini API Key 未提供（API Key is required for AI Studio mode）。")
             effective_base_url = normalize_base_url(base_url)
-            self._client = genai.Client(
-                api_key=api_key, http_options=gemini_http_options(effective_base_url, transport_layer)
-            )
+            options = _text_http_options(effective_base_url, transport_layer)
+            self._client = genai.Client(api_key=api_key, http_options=options)
             if base_url:
                 logger.info("GeminiTextBackend: 使用 AI Studio 后端（Base URL: %s）", base_url)
             else:
@@ -208,13 +235,37 @@ class GeminiTextBackend:
         contents.append(request.prompt)
         return contents
 
+    @property
+    def configuration_fingerprint(self) -> str:
+        return canonical_json_digest(
+            {
+                "endpoint": self._configuration_endpoint,
+                "backend": self._backend,
+                "project": self._vertex_project,
+                "capabilities": sorted(self.capabilities),
+            }
+        )
+
     async def generate(self, request: TextGenerationRequest) -> TextGenerationResult:
         """异步生成文本，支持结构化输出和 vision。
 
         本方法不带重试装饰器：瞬态错误重试在 :meth:`_generate_native` 层完成。若把复验/
         降级也包进重试范围，降级尝试的失败会连带重放已成功的原生调用（重试叠乘）。
         """
-        native = await self._generate_native(request, structured=bool(request.response_schema))
+        try:
+            native = await self._generate_native(request, structured=bool(request.response_schema))
+        except APIError as exc:
+            if not (
+                request.response_schema
+                and exc.code in (400, 422)
+                and explicit_parameter_rejection(
+                    str(exc), "response_schema", "responseschema", "schema", "response_mime_type"
+                )
+            ):
+                raise
+            return await prompt_json_fallback(
+                request, partial(self._generate_native, structured=True), provider=PROVIDER_GEMINI, model=self._model
+            )
 
         if request.response_schema:
             # 成功路径复验：HTTP 200 后校验返回是否真满足 schema。代理网关可能静默忽略
@@ -243,7 +294,7 @@ class GeminiTextBackend:
 
         return native
 
-    @with_retry_async()
+    @with_retry_async(retry_if=_retry_gemini_text)
     async def _generate_native(self, request: TextGenerationRequest, *, structured: bool) -> TextGenerationResult:
         """单次原生 SDK 调用：构造 config/contents、发请求、截断处理与瞬态错误重试。
 

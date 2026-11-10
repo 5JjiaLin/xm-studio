@@ -54,6 +54,7 @@ class BgmTrack(BaseModel):
     gain_db: float
     content_digest: str = Field(min_length=1)
     uploaded_at: str
+    generation_id: str | None = None
 
     @property
     def gain(self) -> float:

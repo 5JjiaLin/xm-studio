@@ -30,15 +30,26 @@ from lib.backends.text_backends.base import TextBackend, TextCapability, TextGen
 from lib.billing.metering import Usage
 from lib.custom_provider.metering import custom_video_usage, with_image_counts
 from lib.custom_provider.path_overrides import NO_PATH_OVERRIDES, PathOverrides, endpoint_guard, replaying_base_url
+from lib.infra.content_digest import canonical_json_digest
 
 
 class CustomTextBackend:
     """自定义供应商文本生成后端包装类。"""
 
-    def __init__(self, *, provider_id: str, delegate: TextBackend, model: str) -> None:
+    def __init__(
+        self,
+        *,
+        provider_id: str,
+        delegate: TextBackend,
+        model: str,
+        endpoint: str = "",
+        path_overrides: PathOverrides = NO_PATH_OVERRIDES,
+    ) -> None:
         self._provider_id = provider_id
         self._delegate = delegate
         self._model = model
+        self._endpoint = endpoint
+        self._path_overrides = dict(path_overrides)
 
     @property
     def name(self) -> str:
@@ -51,6 +62,16 @@ class CustomTextBackend:
     @property
     def capabilities(self) -> set[TextCapability]:
         return self._delegate.capabilities
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        return canonical_json_digest(
+            {
+                "delegate": self._delegate.configuration_fingerprint,
+                "endpoint": self._endpoint,
+                "paths": self._path_overrides,
+            }
+        )
 
     async def generate(self, request: TextGenerationRequest) -> TextGenerationResult:
         return await self._delegate.generate(request)

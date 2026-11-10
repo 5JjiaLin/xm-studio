@@ -44,9 +44,9 @@ class AgnesTextBackend(OpenAITextBackend):
         self._capabilities = {TextCapability.TEXT_GENERATION, TextCapability.STRUCTURED_OUTPUT}
 
     async def _generate_native(
-        self, request: TextGenerationRequest, messages: list[dict]
+        self, request: TextGenerationRequest, messages: list[dict], *, structured: bool = False
     ) -> TextGenerationResult | None:
-        result = await super()._generate_native(request, messages)
+        result = await super()._generate_native(request, messages, structured=structured)
         if result is not None and request.response_schema:
             result.text = strip_json_code_fence(result.text)
         return result

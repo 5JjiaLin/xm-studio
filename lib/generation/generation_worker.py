@@ -438,6 +438,8 @@ async def _extract_provider(task: dict[str, Any]) -> str:
                 payload=payload,
                 resource_id=task.get("resource_id"),
             )
+        elif task.get("task_type") == "music":
+            return "minimax"
         elif is_audio:
             resolved = await resolver.resolve_audio_backend(project, payload)
         else:

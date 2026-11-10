@@ -11,11 +11,8 @@ import asyncio
 import logging
 from functools import partial
 
-from openai import BadRequestError
-
 from lib.backends.openai_shared import (
     LONG_THINKING_TEXT_MODELS,
-    OPENAI_RETRYABLE_ERRORS,
     OPENAI_TEXT_TIMEOUT,
     create_openai_client,
 )
@@ -32,7 +29,9 @@ from lib.backends.text_backends.base import (
     truncate_for_log,
 )
 from lib.backends.text_backends.openai import DEFAULT_MODEL
+from lib.backends.text_backends.openai_policy import is_schema_rejection, rejects_parameter, retry_text_request
 from lib.backends.transport_layer import TransportLayer
+from lib.infra.content_digest import canonical_json_digest
 from lib.infra.logging_utils import format_kwargs_for_log
 from lib.infra.retry import with_retry_async
 
@@ -82,6 +81,12 @@ class OpenAIResponsesTextBackend:
     def capabilities(self) -> set[TextCapability]:
         return self._capabilities
 
+    @property
+    def configuration_fingerprint(self) -> str:
+        return canonical_json_digest(
+            {"endpoint": str(self._client.base_url), "capabilities": sorted(self.capabilities)}
+        )
+
     async def generate(self, request: TextGenerationRequest) -> TextGenerationResult:
         """生成文本回复。
 
@@ -91,8 +96,8 @@ class OpenAIResponsesTextBackend:
         structured = request.response_schema is not None
         try:
             native = await self._generate_once(request, structured=structured)
-        except BadRequestError as exc:
-            if not structured:
+        except Exception as exc:
+            if not structured or not is_schema_rejection(exc):
                 raise
             logger.warning("原生 text.format 被拒收 (%s)，降级到 prompt 注入路径", exc)
             return await self._prompt_json_fallback(request)
@@ -121,7 +126,7 @@ class OpenAIResponsesTextBackend:
             model=self._model,
         )
 
-    @with_retry_async(max_attempts=4, backoff_seconds=(2, 4, 8), retryable_errors=OPENAI_RETRYABLE_ERRORS)
+    @with_retry_async(max_attempts=4, backoff_seconds=(2, 4, 8), retry_if=retry_text_request)
     async def _generate_once(self, request: TextGenerationRequest, *, structured: bool) -> TextGenerationResult:
         """单次 Responses 调用：构造请求、解析与截断处理，瞬态错误重试。
 
@@ -148,27 +153,20 @@ class OpenAIResponsesTextBackend:
             }
 
         logger.info("调用 %s 文本 SDK kwargs=%s", self.name, format_kwargs_for_log(kwargs))
-        if self._model in LONG_THINKING_TEXT_MODELS:
-            # 最终事件携带正文和 usage；中途断开或只有增量时不能视作成功。
-            response = None
-            async with await self._client.responses.create(**kwargs, stream=True) as stream:
-                async for event in stream:
-                    if (
-                        event.type == "response.completed"
-                        or event.type == "response.failed"
-                        or event.type == "response.incomplete"
-                    ):
-                        response = event.response
-                    elif event.type == "error":
-                        raise RuntimeError(f"Responses 文本流失败 (model={self._model}): {event.message}")
-            if response is None:
-                raise RuntimeError("Responses 文本流未收到最终响应，不能保存不完整结果")
+        if request.prefer_stream or self._model in LONG_THINKING_TEXT_MODELS:
+            try:
+                response = await self._receive_stream(kwargs)
+            except Exception as exc:
+                if not rejects_parameter(exc, "stream"):
+                    raise
+                response = await self._client.responses.create(**kwargs)
         else:
             response = await self._client.responses.create(**kwargs)
         if response.status == "failed":
-            # 部分网关以 200 + status=failed 回报失败，output_text 为空，不能当成功结果
             detail = response.error.message if response.error else "unknown error"
             raise RuntimeError(f"Responses 调用失败 (model={self._model}): {detail}")
+        if response.status not in ("completed", "incomplete"):
+            raise RuntimeError(f"Responses 调用未完成 (model={self._model}): {response.status}")
 
         usage = response.usage
         output_tokens = usage.output_tokens if usage else None
@@ -181,16 +179,36 @@ class OpenAIResponsesTextBackend:
             structured=structured,
             truncation_values=_TRUNCATION_REASONS,
         )
+        if response.status == "incomplete" and not truncated:
+            raise RuntimeError(f"Responses 调用未完成 (model={self._model})")
         return TextGenerationResult(
             text=response.output_text,
             provider=self._provider_name,
             model=self._model,
-            # Responses 的 input_tokens 是总输入，其中缓存命中的部分在 input_tokens_details.cached_tokens。
             input_tokens=usage.input_tokens if usage else None,
             output_tokens=output_tokens,
             truncated=truncated,
-            cache_read_tokens=usage.input_tokens_details.cached_tokens if usage else None,
+            cache_read_tokens=usage.input_tokens_details.cached_tokens
+            if usage and usage.input_tokens_details
+            else None,
         )
+
+    async def _receive_stream(self, kwargs: dict):
+        # 最终事件携带正文和 usage；中途断开或只有增量时不能视作成功。
+        response = None
+        async with await self._client.responses.create(**kwargs, stream=True) as stream:
+            async for event in stream:
+                if (
+                    event.type == "response.completed"
+                    or event.type == "response.failed"
+                    or event.type == "response.incomplete"
+                ):
+                    response = event.response
+                elif event.type == "error":
+                    raise RuntimeError(f"Responses 文本流失败 (model={self._model}): {event.message}")
+        if response is None:
+            raise RuntimeError("Responses 文本流未收到最终响应，不能保存不完整结果")
+        return response
 
 
 def _build_input(request: TextGenerationRequest) -> list[dict]:

@@ -12,6 +12,8 @@ Ark (火山方舟) 共享工具模块
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 
 from lib.backends.transport_layer import TransportLayer, layer_sync_client
@@ -38,7 +40,11 @@ def ark_base_url(configured: str | None = None) -> str:
 
 
 def create_ark_client(
-    *, api_key: str | None = None, base_url: str | None = None, transport_layer: TransportLayer | None = None
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    transport_layer: TransportLayer | None = None,
+    max_retries: int | None = None,
 ):
     """创建 Ark 客户端；base_url 缺省走 ARK_BASE_URL（即 /api/v3），经 ark_base_url 归一化。
 
@@ -48,8 +54,12 @@ def create_ark_client(
 
     base = ark_base_url(base_url)
     key = resolve_ark_api_key(api_key)
+    retry_options: dict[str, Any] = {"max_retries": max_retries} if max_retries is not None else {}
     if transport_layer is None:
-        return Ark(base_url=base, api_key=key)
+        return Ark(base_url=base, api_key=key, **retry_options)
     return Ark(
-        base_url=base, api_key=key, http_client=layer_sync_client(httpx.Client(follow_redirects=True), transport_layer)
+        base_url=base,
+        api_key=key,
+        http_client=layer_sync_client(httpx.Client(follow_redirects=True), transport_layer),
+        **retry_options,
     )

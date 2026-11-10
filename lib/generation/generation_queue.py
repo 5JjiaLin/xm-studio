@@ -336,6 +336,11 @@ async def _derive_execution_model_for_enqueue(
                 payload=payload,
                 resource_id=resource_id,
             )
+        elif task_type == "music":
+            from lib.backends.music import DEFAULT_MUSIC_MODEL, MUSIC_PROVIDER
+            from lib.config.resolver import ProviderModel
+
+            resolved = ProviderModel(MUSIC_PROVIDER, DEFAULT_MUSIC_MODEL)
         elif is_audio:
             resolved = await resolver.resolve_audio_backend(project, payload or {})
         else:

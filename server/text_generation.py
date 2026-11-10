@@ -48,10 +48,10 @@ from lib.infra.content_digest import prefixed_sha256_file
 from lib.infra.json_io import load_json_or_none
 from lib.infra.path_safety import PathTraversalError, safe_join
 from lib.infra.schema_guards import is_int, is_str
-from lib.infra.text_utils import strip_json_code_fences
+from lib.infra.text_utils import DuplicateJSONKeyError, strict_json_loads, strip_json_code_fences
 from lib.project.asset_types import ASSET_SPECS, BUCKET_KEY, asset_name_comparison_key
 from lib.project.project_manager import ProjectManager, is_reference_video_project
-from lib.prompts.prompt_builders_reference import build_reference_units_split_prompt
+from lib.prompts.prompt_builders_reference import build_reference_units_split_prompt, reference_source_spans
 from lib.prompts.prompt_builders_script import build_narration_split_prompt, build_normalize_prompt
 from lib.references.reference_catalog import ReferenceCatalog, build_reference_catalog
 from lib.script import script_review
@@ -79,6 +79,7 @@ from lib.script.plan_new_assets import (
 )
 from lib.script.prompt_authoring_scope import PromptOverwriteRequired, prompt_overwrite_with_text
 from lib.script.reference_video.draft_validation import (
+    out_of_order_source_anchor_indices,
     validate_dialogue_load,
     validate_source_text_anchor,
     validate_unit_text,
@@ -547,8 +548,8 @@ def _parse_script_plan_json(response_text: str, model: type[BaseModel], *, label
     """
     text = strip_json_code_fences(response_text)
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
+        data = strict_json_loads(text)
+    except (json.JSONDecodeError, DuplicateJSONKeyError) as e:
         raise ValueError(f"{label} JSON 解析失败: {e}") from e
     if not isinstance(data, dict):
         raise ValueError(f"{label}结构异常：顶层应为对象 {top_shape}")
@@ -556,6 +557,41 @@ def _parse_script_plan_json(response_text: str, model: type[BaseModel], *, label
         return model.model_validate(data).model_dump()
     except ValidationError as e:
         raise ValueError(f"{label}结构校验失败: {e}") from e
+
+
+def _parse_reference_script_plan_json(
+    response_text: str, schema: type[BaseModel], supported_durations: list[int], novel_text: str
+) -> dict:
+    """仅在生成边界解析跨度响应，交给草稿/晋升流程前还原既有三字段单元。
+
+    纯旧响应继续使用逐字原文锚校验。出现任一跨度字段就必须满足完整跨度 schema，
+    不能用 source_text 或响应内的兼容标记绕过跨度校验。
+    """
+    try:
+        data = strict_json_loads(strip_json_code_fences(response_text))
+    except (json.JSONDecodeError, DuplicateJSONKeyError):
+        data = None  # 交给统一解析器报告原始 JSON 错误。
+    units = data.get("units") if isinstance(data, dict) else None
+    uses_spans = isinstance(units, list) and any(
+        isinstance(unit, dict) and ("source_span_start" in unit or "source_span_end" in unit) for unit in units
+    )
+    model = schema if uses_spans else build_reference_units_script_plan_model(supported_durations)
+    flat = _parse_script_plan_json(response_text, model, label="script_plan 拆分内容", top_shape="{units}")
+    if not uses_spans:
+        return flat
+    span_offsets = {span_id: (start, end) for span_id, start, end, _text in reference_source_spans(novel_text)}
+    canonical_units = []
+    for unit in flat["units"]:
+        start_range = span_offsets.get(unit["source_span_start"])
+        end_range = span_offsets.get(unit["source_span_end"])
+        valid = start_range is not None and end_range is not None and start_range[0] <= end_range[0]
+        # 无效跨度保留正文，交既有内容校验落入可修复草稿；不采信模型附带的 source_text。
+        source_text = novel_text[start_range[0] : end_range[1]] if valid else ""
+        canonical_units.append(
+            {"duration_seconds": unit["duration_seconds"], "source_text": source_text, "text": unit["text"]}
+        )
+    flat["units"] = canonical_units
+    return flat
 
 
 def _parse_normalized_content(response_text: str, model: type[BaseModel]) -> dict:
@@ -1341,6 +1377,17 @@ def collect_reference_flat_violations(
                 item_id=_reference_unit_id(episode, index),
             )
         )
+    for index in out_of_order_source_anchor_indices([str(unit["source_text"]) for unit in flat_units], novel_text):
+        label = _reference_unit_label(episode, index + 1)
+        violations.append(
+            DraftViolation(
+                f"{label} 的 source_text 对应原文位置早于前一个 unit；请按原文叙事顺序调整 units",
+                code="source_text_out_of_order",
+                label=label,
+                item_index=index,
+                item_id=_reference_unit_id(episode, index + 1),
+            )
+        )
     violations.extend(asset_problem_violations(validation.asset_problems))
     return violations
 
@@ -1840,7 +1887,7 @@ async def generate_reference_script_plan(
                 draft_path,
                 formal_script_plan_path,
             )
-        schema = build_reference_units_script_plan_model(split_caps.durations)
+        schema = build_reference_units_script_plan_model(split_caps.durations, use_source_spans=True)
         generator = await TextGenerator.create(
             TextTaskType.SCRIPT, project_name=project_name, purpose=CallPurpose.SCRIPT_GENERATION
         )
@@ -1852,7 +1899,9 @@ async def generate_reference_script_plan(
             ),
             project_name=project_name,
         )
-        flat = _parse_script_plan_json(result.text, schema, label="script_plan 拆分内容", top_shape="{units}")
+        flat = await asyncio.to_thread(
+            _parse_reference_script_plan_json, result.text, schema, split_caps.durations, novel_text
+        )
         flat_units = flat.get("units")
         if not isinstance(flat_units, list) or not flat_units:
             raise ValueError("script_plan 拆分内容结构异常：units 必须是非空的 unit 对象数组")

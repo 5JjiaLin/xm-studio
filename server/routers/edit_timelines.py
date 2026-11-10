@@ -368,9 +368,10 @@ async def read_edit_timeline_preview_media(
     project_name: str,
     timeline_id: str,
     service: TimelinePreviewServiceDep,
+    narration: DraftNarration | None = None,
 ) -> TimelinePreviewMedia:
     try:
-        return await service.media(project_name, timeline_id)
+        return await service.media(project_name, timeline_id, narration=narration)
     except EditTimelineError as exc:
         raise edit_timeline_api_error(exc) from exc
 

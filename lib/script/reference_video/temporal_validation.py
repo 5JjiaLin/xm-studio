@@ -22,6 +22,11 @@ TIMELINE_CODES = frozenset(
     }
 )
 _HEADING = re.compile(r"^\s*【([0-9]+(?:\.[0-9]{1,3})?)-([0-9]+(?:\.[0-9]{1,3})?)s】\s*$")
+_TIMELINE_HEADING = re.compile(r"【[0-9]+(?:\.[0-9]{1,3})?-[0-9]+(?:\.[0-9]{1,3})?s】")
+_STRUCTURAL_HEADING = re.compile(
+    r"【(?:本组设定|开场承接|分段时间轴|组尾交接|必要限制|"
+    r"[0-9]+(?:\.[0-9]{1,3})?-[0-9]+(?:\.[0-9]{1,3})?s)】"
+)
 # Recognize broken numeric/time titles as intentional timelines, never as legacy prose.
 _TIME_TITLE = re.compile(r"^\s*[【\[]\s*(?:[-+]?\d|NaN|inf|[Tab](?=\s*[-–—~～])).*(?:[-–—~～]|s|秒).*", re.I)
 _RENDERED_SPEAKER = re.compile(r"<([^<>\n]+)>说\s*(?=\{)")
@@ -52,6 +57,22 @@ class TemporalSegment:
     end: Decimal
     line: int
     text: str
+
+
+def normalize_model_timeline_newlines(text: str) -> str:
+    """Recover bare `n` separators around structural headings in model output.
+
+    Only complete, single-line model output opts in; speech and asset names are
+    opaque. Validation remains strict and the quarantined raw output is retained.
+    """
+    if "\n" in text or "\r" in text or "【分段时间轴】" not in text or not _TIMELINE_HEADING.search(text):
+        return text
+    pattern = _STRUCTURAL_HEADING.pattern
+    parts = re.split(r"(@\[[^\]\n]+\]|\{[^{}]*\})", text)
+    for index in range(0, len(parts), 2):
+        normalized = re.sub(rf"n(?={pattern})", "\n", parts[index])
+        parts[index] = re.sub(rf"({pattern})n", r"\1\n", normalized)
+    return "".join(parts)
 
 
 def has_timeline(text: str) -> bool:

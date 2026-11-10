@@ -1868,7 +1868,10 @@ async def execute_grid_task(
     return grid_result
 
 
+from server.services.tasks.music_tasks import execute_music_task
+
 _TASK_EXECUTORS = {
+    "music": execute_music_task,
     "storyboard": execute_storyboard_task,
     "video": execute_video_task,
     "tts": execute_tts_task,

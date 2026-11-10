@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import pairwise
@@ -354,12 +355,15 @@ class EditTimelineService:
         episode: int,
         number: int,
         author: RevisionAuthor,
+        expected_latest: int | None = None,
     ) -> _Written:
         store = self._store(project_name)
         with store.locked_episode(episode):
             document = store.find(timeline_id)
             target = self._base_revision(document, number)
             latest = document.latest
+            if expected_latest is not None and latest.number != expected_latest:
+                raise EditTimelineError("revision_conflict", "Timeline changed; refresh before undo")
             if target.content == latest.content:
                 raise EditTimelineError(
                     "revision_unchanged",
@@ -399,10 +403,11 @@ class EditTimelineService:
         *,
         revision: int,
         author: RevisionAuthor,
+        expected_latest: int | None = None,
     ) -> EditTimelineWriteResult:
         """回滚：以旧修订的内容追加一个新修订，历史不改写。
 
-        回滚总是作用在最新修订上，不做乐观并发判定：它整段替换内容，被还原掉的修订仍在历史里，可以再回滚回去。
+        可用 expected_latest 限定当前修订；未指定时作用在最新修订上：它整段替换内容，被还原掉的修订仍在历史里，可以再回滚回去。
         """
         document = await asyncio.to_thread(lambda: self._store(project_name).find(timeline_id))
         target = self._base_revision(document, revision)
@@ -410,7 +415,7 @@ class EditTimelineService:
         unit_ids = {clip.unit_id for clip in (*target.content.clips, *document.latest.content.clips)}
         sources = await load_episode_sources(self._projects, project_name, script, unit_ids)
         written = await run_sync_transaction(
-            self._restore_sync, project_name, timeline_id, document.episode, revision, author
+            self._restore_sync, project_name, timeline_id, document.episode, revision, author, expected_latest
         )
         message = (
             f"剪辑时间线「{document.name}」已回滚：新修订 {written.document.latest.number} 的内容取自修订 {revision}，"
@@ -447,6 +452,8 @@ class EditTimelineService:
         summary: str,
         operations: Sequence[TimelineOperation],
         author: RevisionAuthor,
+        strict_revision: bool = False,
+        source_guard: Callable[[], AbstractContextManager] | None = None,
     ) -> EditTimelineWriteResult:
         """按 ``base_revision`` 解读一批操作，原子追加一个修订。
 
@@ -478,6 +485,8 @@ class EditTimelineService:
             operations,
             sources,
             author,
+            strict_revision,
+            source_guard,
         )
         concurrent = tuple(
             ConcurrentRevision(number=revision.number, author=revision.author, summary=revision.summary)
@@ -543,12 +552,16 @@ class EditTimelineService:
         operations: Sequence[TimelineOperation],
         sources: EpisodeSources,
         author: RevisionAuthor,
+        strict_revision: bool = False,
+        source_guard: Callable[[], AbstractContextManager] | None = None,
     ) -> _Written:
         store = self._store(project_name)
-        with store.locked_episode(episode):
+        with store.locked_episode(episode), source_guard() if source_guard else nullcontext():
             document = store.find(timeline_id)
             base = self._base_revision(document, base_number)
             latest = document.latest
+            if strict_revision and base.number != latest.number:
+                raise EditTimelineError("revision_conflict", "Timeline changed; analyze again")
             if base.number != latest.number:
                 applied = self._check_conflicts(document, base, operations, sources)
             else:

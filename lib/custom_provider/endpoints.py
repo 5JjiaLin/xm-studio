@@ -274,7 +274,13 @@ def _build_openai_chat(provider, model_id: str, path_overrides: PathOverrides = 
             _OPENAI_CHAT_REQUESTS, path_overrides, provider.base_url, base_url, model_id
         ),
     )
-    return CustomTextBackend(provider_id=provider.provider_id, delegate=delegate, model=model_id)
+    return CustomTextBackend(
+        provider_id=provider.provider_id,
+        delegate=delegate,
+        model=model_id,
+        endpoint="openai-chat",
+        path_overrides=path_overrides,
+    )
 
 
 def _build_openai_responses(
@@ -289,7 +295,13 @@ def _build_openai_responses(
             _OPENAI_RESPONSES_REQUESTS, path_overrides, provider.base_url, base_url, model_id
         ),
     )
-    return CustomTextBackend(provider_id=provider.provider_id, delegate=delegate, model=model_id)
+    return CustomTextBackend(
+        provider_id=provider.provider_id,
+        delegate=delegate,
+        model=model_id,
+        endpoint="openai-responses",
+        path_overrides=path_overrides,
+    )
 
 
 def _build_gemini_generate(
@@ -302,7 +314,13 @@ def _build_gemini_generate(
         model=model_id,
         transport_layer=_google_path_layer(_GEMINI_GENERATE_REQUESTS, provider.base_url, model_id, path_overrides),
     )
-    return CustomTextBackend(provider_id=provider.provider_id, delegate=delegate, model=model_id)
+    return CustomTextBackend(
+        provider_id=provider.provider_id,
+        delegate=delegate,
+        model=model_id,
+        endpoint="gemini-generate",
+        path_overrides=path_overrides,
+    )
 
 
 def _build_anthropic_messages(
@@ -318,7 +336,13 @@ def _build_anthropic_messages(
             _ANTHROPIC_MESSAGES_REQUESTS, path_overrides, provider.base_url, base_url, model_id
         ),
     )
-    return CustomTextBackend(provider_id=provider.provider_id, delegate=delegate, model=model_id)
+    return CustomTextBackend(
+        provider_id=provider.provider_id,
+        delegate=delegate,
+        model=model_id,
+        endpoint="anthropic-messages",
+        path_overrides=path_overrides,
+    )
 
 
 def _build_openai_images(

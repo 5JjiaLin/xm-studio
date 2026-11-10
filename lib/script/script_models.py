@@ -989,7 +989,7 @@ class ReferenceScriptPlanDraft(BaseModel):
 
 
 class ReferenceScriptPlanFlatUnit(BaseModel):
-    """script_plan 的 LLM 产出单元：时长 + 原文锚 + 引用语法正文。"""
+    """script_plan 的兼容响应与修复草稿：时长 + 原文锚 + 引用语法正文。"""
 
     model_config = _STRICT_CONFIG
 
@@ -1002,6 +1002,14 @@ class ReferenceScriptPlanFlatUnit(BaseModel):
     text: str = Field(min_length=1, description="该单元的引用语法正文：画面描述 + 行内的台词 / 画外音记号")
 
 
+class ReferenceScriptPlanSpanUnit(ReferenceScriptPlanFlatUnit):
+    """模型选择原文范围；服务端转成既有扁平草稿形状后再校验内容。"""
+
+    source_span_start: str = Field(min_length=1, description="该单元依据源文跨度的起始 ID")
+    source_span_end: str = Field(min_length=1, description="该单元依据源文跨度的结束 ID")
+    source_text: SkipJsonSchema[str] = Field(default="", description="服务端从源文回填，不由模型生成")
+
+
 class ReferenceScriptPlanFlatDraft(BaseModel):
     """script_plan 的 LLM 产出顶层形状。"""
 
@@ -1011,6 +1019,12 @@ class ReferenceScriptPlanFlatDraft(BaseModel):
     new_assets: list[PlanNewAsset] = Field(
         default_factory=list, description="本集规划引用的、尚未登记的角色 / 场景 / 道具及其处理决定"
     )
+
+
+class ReferenceScriptPlanSpanDraft(ReferenceScriptPlanFlatDraft):
+    """仅用于新生成响应；写入草稿前转成 ReferenceScriptPlanFlatDraft。"""
+
+    units: list[ReferenceScriptPlanSpanUnit] = Field(min_length=1, description="按叙事顺序排列的 unit 列表")
 
 
 class ReferencePromptAuthoringFlatUnit(BaseModel):
@@ -1185,7 +1199,9 @@ def with_new_assets_field(model: type[BaseModel]) -> type[BaseModel]:
     )
 
 
-def build_reference_units_script_plan_model(supported_durations: list[int]) -> type[BaseModel]:
+def build_reference_units_script_plan_model(
+    supported_durations: list[int], *, use_source_spans: bool = False
+) -> type[BaseModel]:
     """构造 unit 时长被 ``supported_durations`` 枚举硬约束的参考生视频 script_plan 模型（扁平形状）。
 
     unit 是一次生成调用的单元，拆分阶段决定的就是发给供应商的那个秒数，故枚举约束加在
@@ -1197,12 +1213,13 @@ def build_reference_units_script_plan_model(supported_durations: list[int]) -> t
     ``ReferencePromptAuthoringFlatScript``。
     """
     unit = _constrained_duration_item(
-        ReferenceScriptPlanFlatUnit,
+        ReferenceScriptPlanSpanUnit if use_source_spans else ReferenceScriptPlanFlatUnit,
         _duration_literal(supported_durations),
         "该单元时长（秒），必须取 supported_durations 中的值",
     )
+    base = ReferenceScriptPlanSpanDraft if use_source_spans else ReferenceScriptPlanFlatDraft
     return create_model(
-        "ReferenceScriptPlanFlatDraft",
-        __base__=ReferenceScriptPlanFlatDraft,
+        base.__name__,
+        __base__=base,
         units=(_list_of(unit), Field(min_length=1, description="按叙事顺序排列的 unit 列表")),
     )

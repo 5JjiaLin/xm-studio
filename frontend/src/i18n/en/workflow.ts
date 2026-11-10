@@ -199,6 +199,7 @@ export default {
   'tasks_title_other': '{{count}} attempts in progress',
   'task_type_storyboard': 'Storyboard',
   'task_type_grid': 'Multi-grid storyboard',
+  'task_type_music': 'Music candidate',
   'task_type_tts': 'Narration audio',
   'task_type_video': 'Video',
   'task_type_reference_video': 'Video',

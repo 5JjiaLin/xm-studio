@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Collection, Container
+from collections.abc import Collection, Container, Sequence
 from typing import Any
 
 from lib.project.asset_types import asset_name_comparison_key
@@ -92,6 +92,28 @@ def validate_source_text_anchor(label: str, source_text: str, novel_text: str) -
             code="source_text_not_verbatim",
             label=label,
         )
+
+
+def out_of_order_source_anchor_indices(source_texts: Sequence[str], novel_text: str) -> list[int]:
+    """Return anchors that exist in the source but cannot follow the preceding unit anchors.
+
+    Gaps and overlapping anchors are allowed: a visual unit need not quote every source
+    sentence, and multiple shots may share one source passage. The check only rejects a
+    provable reversal in the narrative order.
+    """
+    source = _normalize_for_anchor(novel_text)
+    previous_start = 0
+    out_of_order: list[int] = []
+    for index, source_text in enumerate(source_texts):
+        anchor = _normalize_for_anchor(source_text)
+        if not anchor or anchor not in source:
+            continue
+        position = source.find(anchor, previous_start)
+        if position < 0:
+            out_of_order.append(index)
+            continue
+        previous_start = position
+    return out_of_order
 
 
 #: 全角花括号。语法只认半角，但中文输入法下模型很容易写出全角形；行里出现全角花括号时

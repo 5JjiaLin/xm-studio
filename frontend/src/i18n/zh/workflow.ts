@@ -201,6 +201,7 @@ export default {
   'tasks_title_other': '{{count}} 次尝试进行中',
   'task_type_storyboard': '分镜图',
   'task_type_grid': '多宫格分镜',
+  'task_type_music': '配乐候选',
   'task_type_tts': '旁白配音',
   'task_type_video': '视频',
   'task_type_reference_video': '视频',

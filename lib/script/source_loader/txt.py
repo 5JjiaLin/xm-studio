@@ -20,12 +20,17 @@ _REPLACE_THRESHOLD = 0.05
 
 
 def decode_txt(raw: bytes) -> tuple[str, str]:
-    if raw.startswith(b"\xef\xbb\xbf"):
-        return raw[3:].decode("utf-8"), "utf-8-sig"
-    if raw.startswith(b"\xff\xfe"):
-        return raw[2:].decode("utf-16-le"), "utf-16-le"
-    if raw.startswith(b"\xfe\xff"):
-        return raw[2:].decode("utf-16-be"), "utf-16-be"
+    bom_encodings = (
+        (b"\xef\xbb\xbf", "utf-8", "utf-8-sig"),
+        (b"\xff\xfe", "utf-16-le", "utf-16-le"),
+        (b"\xfe\xff", "utf-16-be", "utf-16-be"),
+    )
+    for bom, encoding, label in bom_encodings:
+        if raw.startswith(bom):
+            try:
+                return raw[len(bom) :].decode(encoding), label
+            except UnicodeDecodeError as exc:
+                raise SourceDecodeError(filename="<bytes>", tried_encodings=[label]) from exc
 
     try:
         return raw.decode("utf-8"), "utf-8"

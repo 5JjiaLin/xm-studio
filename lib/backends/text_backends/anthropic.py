@@ -11,12 +11,10 @@ import logging
 
 from anthropic import (
     APIConnectionError,
-    APITimeoutError,
+    APIStatusError,
     AsyncAnthropic,
     BadRequestError,
     DefaultAsyncHttpxClient,
-    InternalServerError,
-    RateLimitError,
     transform_schema,
 )
 
@@ -36,17 +34,21 @@ from lib.backends.text_backends.base import (
 )
 from lib.backends.transport_layer import TransportLayer, layer_async_client
 from lib.config.url_utils import OFFICIAL_ANTHROPIC_BASE_URL
+from lib.infra.content_digest import canonical_json_digest
 from lib.infra.logging_utils import format_kwargs_for_log
 from lib.infra.retry import with_retry_async
 
+from .request_policy import explicit_parameter_rejection, retry_before_acceptance
+
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_RETRYABLE_ERRORS: tuple[type[Exception], ...] = (
-    APIConnectionError,
-    APITimeoutError,
-    InternalServerError,
-    RateLimitError,
-)
+
+def _retry_anthropic_text(exc: BaseException) -> bool:
+    if isinstance(exc, APIStatusError):
+        return retry_before_acceptance(exc, status_code=exc.status_code)
+    if isinstance(exc, APIConnectionError):
+        return retry_before_acceptance(exc)
+    return False
 
 
 class AnthropicTextBackend:
@@ -85,6 +87,12 @@ class AnthropicTextBackend:
             TextCapability.STRUCTURED_OUTPUT,
             TextCapability.VISION,
         }
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        return canonical_json_digest(
+            {"endpoint": str(self._client.base_url), "capabilities": sorted(self.capabilities)}
+        )
 
     async def generate(self, request: TextGenerationRequest) -> TextGenerationResult:
         """生成文本回复。
@@ -128,7 +136,7 @@ class AnthropicTextBackend:
 
         return await prompt_json_fallback(request, _once, provider=PROVIDER_ANTHROPIC, model=self._model)
 
-    @with_retry_async(max_attempts=4, backoff_seconds=(2, 4, 8), retryable_errors=ANTHROPIC_RETRYABLE_ERRORS)
+    @with_retry_async(max_attempts=4, backoff_seconds=(2, 4, 8), retry_if=_retry_anthropic_text)
     async def _generate_native(
         self, request: TextGenerationRequest, content: list[dict], *, structured: bool
     ) -> TextGenerationResult | None:
@@ -153,10 +161,13 @@ class AnthropicTextBackend:
             async with self._client.messages.stream(**kwargs) as stream:
                 message = await stream.get_final_message()
         except BadRequestError as exc:
-            if request.response_schema:
+            if request.response_schema and explicit_parameter_rejection(str(exc), "output_config", "schema", "format"):
                 logger.warning("原生 output_config 失败 (%s)，降级到 prompt 注入路径", exc)
                 return None
             raise
+
+        if message.stop_reason is None:
+            raise RuntimeError("文本流未收到结束标记，不能保存不完整结果")
 
         usage = message.usage
         # Anthropic 的 input_tokens 不含缓存读写：总输入须加回缓存读与缓存写。缓存写按 TTL 分两档上报；

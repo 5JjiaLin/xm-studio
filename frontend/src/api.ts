@@ -929,10 +929,10 @@ class API {
   static async getEditTimelinePreviewMedia(
     projectName: string,
     timelineId: string,
-    options: { signal?: AbortSignal } = {},
+    options: { signal?: AbortSignal; narration?: "without_narration" | "with_narration" } = {},
   ): Promise<EditTimelinePreviewMedia> {
     return this.request(
-      `${this.editTimelinePath(projectName, timelineId)}/preview-media`,
+      `${this.editTimelinePath(projectName, timelineId)}/preview-media${options.narration ? `?narration=${options.narration}` : ""}`,
       { signal: options.signal },
     );
   }
@@ -1549,6 +1549,34 @@ class API {
     return this.request(`/projects/${encodeURIComponent(project)}/episodes/${episode}/production/edit`, { method: "PUT", body: JSON.stringify({ timeline_id: timelineId, base_revision: revision, operations }) });
   }
 
+
+  static productionMusicPath(project: string, episode: number) {
+    return "/projects/" + encodeURIComponent(project) + "/episodes/" + episode + "/production/";
+  }
+  static async previewProductionMusic(project: string, episode: number, draft: import("@/types/production").MusicDraft): Promise<import("@/types/production").MusicReview> {
+    return this.request(this.productionMusicPath(project, episode) + "music/preview", { method: "POST", body: JSON.stringify(draft) });
+  }
+  /** @enqueue */
+  static async submitProductionMusic(project: string, episode: number, review: import("@/types/production").MusicReview, candidateId: string): Promise<{ task_id: string }> {
+    return this.request(this.productionMusicPath(project, episode) + "music", { method: "POST", body: JSON.stringify({ ...review.draft, basis: review.basis, confirmed: true, candidate_id: candidateId }) });
+  }
+  static async getProductionMusic(project: string, episode: number, options: { signal?: AbortSignal } = {}): Promise<{ items: import("@/types/production").MusicTask[] }> {
+    return this.request(this.productionMusicPath(project, episode) + "music", { signal: options.signal });
+  }
+  /** @enqueue */
+  static async recoverProductionMusic(project: string, episode: number, task: string): Promise<{ task_id: string }> {
+    return this.request(this.productionMusicPath(project, episode) + "music/" + encodeURIComponent(task) + "/recover", { method: "POST" });
+  }
+  static async analyzeProductionBeats(project: string, episode: number): Promise<import("@/types/production").BeatReport> {
+    return this.request(this.productionMusicPath(project, episode) + "beats");
+  }
+  static async applyProductionBeats(project: string, episode: number, basis: string, ids: string[]): Promise<import("@/types/production").ProductionEdit> {
+    return this.request(this.productionMusicPath(project, episode) + "beats/apply", { method: "POST", body: JSON.stringify({ basis, ids }) });
+  }
+  static async undoProductionMusic(project: string, episode: number, revision: number): Promise<import("@/types/production").ProductionEdit> {
+    return this.request(this.productionMusicPath(project, episode) + "music-undo", { method: "POST", body: JSON.stringify({ base_revision: revision }) });
+  }
+
   static async getProductionCosts(project: string, options: { signal?: AbortSignal } = {}): Promise<import("@/types/production").ProjectCosts> {
     return this.request(`/projects/${encodeURIComponent(project)}/production/costs`, { signal: options.signal });
   }
@@ -1571,6 +1599,11 @@ class API {
   /** @enqueue */
   static async startProductionRender(project: string, episode: number): Promise<import("@/types/production").ProductionState> {
     return this.request(`/projects/${encodeURIComponent(project)}/episodes/${episode}/production/render`, { method: "POST" });
+  }
+
+  /** @enqueue */
+  static async finishProduction(project: string, episode: number, resume = false): Promise<import("@/types/production").ProductionState> {
+    return this.request(`/projects/${encodeURIComponent(project)}/episodes/${episode}/production/finish${resume ? "/resume" : ""}`, { method: "POST" });
   }
 
   static async getScriptReview(

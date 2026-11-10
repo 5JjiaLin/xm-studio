@@ -106,7 +106,9 @@ class TimelinePreviewService:
         self._projects = projects
         self._presentations = presentation_reader or PresentationReadModelService(projects)
 
-    async def media(self, project_name: str, timeline_id: str) -> TimelinePreviewMedia:
+    async def media(
+        self, project_name: str, timeline_id: str, *, narration: DraftNarration | None = None
+    ) -> TimelinePreviewMedia:
         """按最新修订取素材层；已从脚本删除的视频单元不在结果里。"""
         document = await asyncio.to_thread(lambda: EditTimelineStore(self._projects, project_name).find(timeline_id))
         project = await asyncio.to_thread(self._projects.load_project, project_name)
@@ -115,7 +117,7 @@ class TimelinePreviewService:
             load_episode_items, self._projects, project_name, project, document.episode
         )
         resource_type = "reference_videos" if kind == "video_units" else "videos"
-        narration = default_draft_narration(project)
+        narration = narration or default_draft_narration(project)
         versions = await asyncio.to_thread(VersionManager, project_dir)
         units: list[PreviewUnitMedia] = []
         for unit_id in draft_unit_ids(document.latest.content, items):

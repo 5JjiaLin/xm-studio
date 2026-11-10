@@ -677,3 +677,19 @@ export async function enqueueProductionRender(project: string, episode: number) 
   await useTasksStore.getState().refreshTasks();
   return state;
 }
+
+
+/** Music candidates occupy the existing audio queue under their immutable candidate ID. */
+export async function enqueueMusic(project: string, episode: number, review: import("@/types/production").MusicReview, candidate: string) {
+  return submit([markResource(project, "music", candidate, "music")], () => API.submitProductionMusic(project, episode, review, candidate), (result) => [result.task_id]);
+}
+export async function recoverMusic(project: string, episode: number, task: string, candidate: string) {
+  return submit([markResource(project, "music", candidate, "music")], () => API.recoverProductionMusic(project, episode, task), (result) => [result.task_id]);
+}
+
+/** Explicit merge also authorizes music and the editable draft; polling only reads status. */
+export async function enqueueProductionFinish(project: string, episode: number, resume = false) {
+  const state = await API.finishProduction(project, episode, resume);
+  await useTasksStore.getState().refreshTasks();
+  return state;
+}

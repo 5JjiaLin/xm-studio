@@ -483,7 +483,7 @@ class FinalCutService:
             )
 
         async def accept_step(output: Path) -> FinalCutAcceptance:
-            return await accept_final_cut(output, plan, spawn=self._spawn)
+            return await accept_final_cut(output, plan, spawn=self._spawn, narrations=narrations, bgm=bgm, subtitles=burned)
 
         rendered = await commit_rendered_artifact(
             project_dir,

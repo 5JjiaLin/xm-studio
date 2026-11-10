@@ -15,7 +15,7 @@ from pydantic import BaseModel, ValidationError
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaMode, JsonSchemaValue
 
 from lib.infra.retry import NonRetryableError
-from lib.infra.text_utils import strip_json_code_fences
+from lib.infra.text_utils import DuplicateJSONKeyError, strict_json_loads, strip_json_code_fences
 
 _logger = logging.getLogger(__name__)
 
@@ -267,6 +267,8 @@ class TextGenerationRequest:
     images: list[ImageInput] | None = None
     system_prompt: str | None = None
     max_output_tokens: int | None = None
+    # 长正文可优先流式接收；结果仍须完整聚合并校验后才返回。
+    prefer_stream: bool = False
 
 
 @dataclass
@@ -507,6 +509,13 @@ def structured_fallback_reason(text: str, response_schema: dict | type | None, *
     if response_schema is None:
         # 纯文本生成无结构化诉求，原生输出直接采用，不能按「非 JSON」误判触发降级。
         return None
+    try:
+        strict_json_loads(text)
+    except DuplicateJSONKeyError:
+        # 重复键是响应内容歧义，不能靠更弱通道或额外计费请求隐藏。
+        raise
+    except (ValueError, TypeError):
+        pass  # 格式和 schema 错误继续使用既有诊断。
     if isinstance(response_schema, type) and issubclass(response_schema, BaseModel):
         # model_validate_json 单次解析即同时覆盖「非 JSON」与「违反 schema」两种情况。
         try:
@@ -581,6 +590,12 @@ def _validate_fallback_text(text: str, schema_model: type | None) -> tuple[str |
     Pydantic 模型走完整 schema 校验并以 model_dump_json 规范化；dict schema 无对应模型，
     沿用「合法 JSON 即放行」口径（与 structured_fallback_reason 对 dict schema 的行为对齐）。
     """
+    try:
+        strict_json_loads(text)
+    except DuplicateJSONKeyError:
+        raise
+    except (ValueError, TypeError):
+        pass  # 格式错误继续由既有 schema 校验生成字段定位。
     if schema_model is not None and issubclass(schema_model, BaseModel):
         try:
             return schema_model.model_validate_json(text).model_dump_json(), ""
@@ -602,5 +617,10 @@ class TextBackend(Protocol):
 
     @property
     def capabilities(self) -> set[TextCapability]: ...
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        """不含明文凭据的端点与能力摘要，供分批恢复判定输入依据。"""
+        ...
 
     async def generate(self, request: TextGenerationRequest) -> TextGenerationResult: ...

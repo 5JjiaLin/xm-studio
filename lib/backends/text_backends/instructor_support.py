@@ -20,6 +20,7 @@ from instructor.core import (
     InstructorRetryException,
     ResponseParsingError,
 )
+from instructor.utils import extract_json_from_codeblock
 from pydantic import BaseModel, ValidationError
 
 from lib.backends.text_backends.base import (
@@ -34,6 +35,8 @@ from lib.backends.text_backends.base import (
     strip_leading_think_block,
     truncate_for_log,
 )
+from lib.backends.text_backends.openai_policy import rejects_parameter
+from lib.infra.text_utils import strict_json_loads
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
@@ -46,8 +49,7 @@ logger = logging.getLogger(__name__)
 _STRUCTURED_MODE_CHAIN: tuple[Mode, ...] = (Mode.TOOLS, Mode.MD_JSON)
 
 # 上游不接受 tools 参数时的错误关键字，匹配前把错误文本转小写（各家代理的大小写不统一）。
-# 与 openai backend 的 _SCHEMA_ERROR_KEYWORDS 同构：代理网关会把上游的参数不兼容包装成非 400
-# 状态码，只认 BadRequestError 会漏判。
+# 同时要求明确的参数拒收与 400/422；服务故障里提到工具不能证明协议不兼容。
 _TOOLS_UNSUPPORTED_KEYWORDS = (
     "tools",
     "tool_calls",
@@ -222,7 +224,7 @@ def _classify_mode_failure(exc: BaseException) -> _ModeFailure:
     """判定某一档的失败该降档、判终局，还是原样冒泡。
 
     只有 wire 层不兼容才降档，两种形态：上游拒收 tools 参数（API 调用异常，须由错误文本指名
-    tools / functions 才算数），或收下了却不回 tool call（见 :func:`_tool_call_absent`）。后者
+    tools / functions、明确拒收且状态为 400/422 才算数），或收下了却不回 tool call（见 :func:`_tool_call_absent`）。后者
     要等 Instructor 在本档内 reask 重试耗尽才降档：纠正提示可能让偶尔漏调工具的模型在约束更强的
     本档内成功，代价是上游确实不产 tool call 时多花档内重试的请求。
 
@@ -233,8 +235,8 @@ def _classify_mode_failure(exc: BaseException) -> _ModeFailure:
 
     上游确实回了 tool call、只是参数结构反复不合规，属校验类失败，判终局。
 
-    其余一律冒泡：瞬态 5xx 与连接错误交调用方的 ``@with_retry_async`` 判定，不被降级链吞成
-    不可重试的终局异常；``TextOutputTruncatedError`` 是可操作硬错误，重发同一份必然再截断的
+    其余一律冒泡：由调用方按供应商受理边界判断是否重试，5xx 和读写超时不在此改成降级请求；
+    ``TextOutputTruncatedError`` 是可操作硬错误，重发同一份必然再截断的
     请求没有意义（见 docs/adr/0044），它自身已是 NonRetryableError，原样传给调用方即可。
     """
     if not isinstance(exc, InstructorRetryException):
@@ -244,7 +246,7 @@ def _classify_mode_failure(exc: BaseException) -> _ModeFailure:
         if _tool_call_absent(_model_output_failure(exc)):
             return _ModeFailure.DOWNGRADE
         return _ModeFailure.TERMINAL
-    if any(kw in str(api_failure).lower() for kw in _TOOLS_UNSUPPORTED_KEYWORDS):
+    if rejects_parameter(api_failure, *_TOOLS_UNSUPPORTED_KEYWORDS):
         return _ModeFailure.DOWNGRADE
     return _ModeFailure.PROPAGATE
 
@@ -301,6 +303,7 @@ def generate_structured_via_instructor(
         raise TextOutputTruncatedError(
             provider=provider, model=model, output_tokens=_output_tokens_from_incomplete(exc)
         ) from exc
+    _check_completion_json_keys(completion)
     return chat_completion_result(text=result.model_dump_json(), provider=provider, model=model, usage=completion.usage)
 
 
@@ -337,7 +340,20 @@ async def generate_structured_via_instructor_async(
         raise TextOutputTruncatedError(
             provider=provider, model=model, output_tokens=_output_tokens_from_incomplete(exc)
         ) from exc
+    _check_completion_json_keys(completion)
     return chat_completion_result(text=result.model_dump_json(), provider=provider, model=model, usage=completion.usage)
+
+
+def _check_completion_json_keys(completion: Any) -> None:
+    """Instructor 规范化前的原始响应同样不能含歧义对象键。"""
+    for choice in getattr(completion, "choices", None) or []:
+        message = choice.message
+        tool_calls = getattr(message, "tool_calls", None) or []
+        for tool_call in tool_calls:
+            strict_json_loads(tool_call.function.arguments)
+        content = getattr(message, "content", None)
+        if not tool_calls and isinstance(content, str):
+            strict_json_loads(extract_json_from_codeblock(strip_leading_think_block(content)))
 
 
 def inject_json_instruction(messages: list[dict]) -> list[dict]:
@@ -372,8 +388,7 @@ def _handle_mode_failure(
     """
     failure = _classify_mode_failure(exc)
     if failure is _ModeFailure.PROPAGATE:
-        # 冒泡时剥掉 Instructor 的包装：调用方的 @with_retry_async 先按异常类型判瞬态
-        # （ConnectionError / TimeoutError），包着一层就只剩消息文本匹配，漏判连接类错误。
+        # 剥掉包装，让调用方按原始 API 状态与连接异常判断受理边界。
         raise _propagated_cause(exc)
     if failure is _ModeFailure.DOWNGRADE and next_mode is not None:
         logger.warning(

@@ -23,12 +23,14 @@ from lib.generation.generation_result import GenerationBatchResult
 from lib.infra.async_thread import run_sync_transaction
 from lib.infra.data_root_layout import list_project_dirs
 from lib.infra.json_io import atomic_write_json
+from lib.jianying_draft.basis import WITHOUT_NARRATION
 from lib.project.project_manager import ProjectManager
 from server.media_tools.assets import GenerateAssetsRequest, generate_assets
 from server.media_tools.final_cuts import FinalCutToolResult, RenderFinalCutRequest, render_final_cut
 from server.media_tools.videos import EpisodeTarget, GenerateVideosRequest, SelectedTarget, generate_videos
 from server.services.admission.asset_sheet_batch import AssetSheetScope, load_asset_sheet_batch_plan
 from server.services.admission.cost_estimation import estimate_image_batch_cost
+from server.services.project.post_production import PostProduction, ProductionError
 from server.services.project.script_review import ScriptReviewService
 from server.services.tasks.formal_image_commit import get_aspect_ratio
 from server.tool_runtime import (
@@ -43,10 +45,6 @@ from server.tool_runtime import (
 logger = logging.getLogger(__name__)
 
 
-class ProductionError(Exception):
-    pass
-
-
 class ProductionService:
     def __init__(self, projects: ProjectManager, services: Services | None = None):
         self.projects = projects
@@ -54,6 +52,7 @@ class ProductionService:
         from server.services.project.whole_script_batch import WholeScriptBatchService
 
         self.script_batch = WholeScriptBatchService(projects, self.services)
+        self.post_production = PostProduction(self)
         self._runner: asyncio.Task | None = None
 
     def _path(self, project: str, episode: int):
@@ -75,7 +74,10 @@ class ProductionService:
             state["members"] = [member.model_dump(mode="json") for member in batch.members]
         if state.get("output") and state.get("timeline_id"):
             output = await FinalCutService(self.projects).status(
-                project, state["timeline_id"], narration="without_narration", subtitles=BURNED_SUBTITLES
+                project,
+                state["timeline_id"],
+                narration=state.get("narration", "without_narration"),
+                subtitles=BURNED_SUBTITLES,
             )
             state["output"] = output.model_dump(mode="json")
             if state.get("basis") != await asyncio.to_thread(self._script_hash, project, episode):
@@ -260,6 +262,7 @@ class ProductionService:
                 "user_id": user_id,
                 "status": "submitting",
                 "stage": "render",
+                "narration": WITHOUT_NARRATION,
                 "basis": basis,
             }
             await self._write(project, episode, state)
@@ -324,11 +327,17 @@ class ProductionService:
                 )
                 state["timeline_id"] = timeline_id
                 await self._write(project, episode, state)
+            state["narration"] = WITHOUT_NARRATION
             # Mechanical creation supplies defaults once. Keep every creator revision on rerender.
             # MCP host semantics return the durable render handle immediately.
             result = await render_final_cut(
                 ToolRequest(
-                    RenderFinalCutRequest(timeline=timeline_id, narration="without_narration", burn_subtitles=True)
+                    RenderFinalCutRequest(
+                        timeline=timeline_id,
+                        **({"revision": state["revision"]} if state.get("revision") is not None else {}),
+                        narration=state.get("narration", "without_narration"),
+                        burn_subtitles=True,
+                    )
                 ),
                 scope,
                 CallerContext(user_id=state["user_id"], source="mcp"),
@@ -365,6 +374,15 @@ class ProductionService:
         path = await asyncio.to_thread(self._path, project, episode)
         async with self.projects.async_file_lock(path):
             state = await asyncio.to_thread(self._read, project, episode)
+            if state.get("action") == "finish":
+                if state["status"] == "submitting":
+                    # The local render submission may have been accepted before
+                    # its handle was saved. Do not silently submit it again.
+                    state.update(status="failed", error="finish_render_failed")
+                    await self._write(project, episode, state)
+                    return
+                await self.post_production.advance(project, episode, state)
+                return
             if state["status"] == "submitting":
                 # The submission holds this same lock until its handle is saved.
                 # Reaching it here means that process was interrupted. Do not

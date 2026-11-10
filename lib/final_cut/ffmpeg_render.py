@@ -12,6 +12,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import math
+import re
 import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -21,7 +24,7 @@ from lib.final_cut.errors import FinalCutError
 from lib.final_cut.render_plan import PlannedClip, RenderPlan, RenderSegment
 from lib.final_cut.subtitles import BurnedSubtitle, ass_document
 from lib.infra.async_thread import run_sync_transaction
-from lib.infra.ffmpeg import local_file_input
+from lib.infra.ffmpeg import ffmpeg_executable, local_file_input
 from lib.infra.media_probe import MediaProbeError, probe_media
 from lib.infra.subprocess_deadline import (
     DEFAULT_TERMINATE_GRACE_SECONDS,
@@ -398,8 +401,16 @@ class FinalCutAcceptance:
     tolerance: float = ACCEPTANCE_TOLERANCE_SECONDS
 
 
-async def accept_final_cut(path: Path, plan: RenderPlan, *, spawn: Spawner | None = None) -> FinalCutAcceptance:
-    """经媒体探测接口验收成片：音视频流齐全，两者时长都与剪辑时间线时长相差不超过容差。"""
+async def accept_final_cut(path: Path, plan: RenderPlan, *, spawn: Spawner | None = None,
+                          narrations: Sequence[NarrationInput] = (), bgm: Sequence[BgmInput] = (),
+                          subtitles: Sequence[BurnedSubtitle] | None = None) -> FinalCutAcceptance:
+    """Probe, fully decode and validate placed audio/captions before publishing bytes."""
+    try:
+        valid_file = await asyncio.to_thread(lambda: path.is_file() and path.stat().st_size > 0)
+    except OSError as exc:
+        raise FinalCutError("final_cut_acceptance_failed", "成片文件无法读取，重新导出") from exc
+    if not valid_file:
+        raise FinalCutError("final_cut_acceptance_failed", "成片文件为空或不存在，重新导出")
     try:
         probe = await probe_media(path, spawn=spawn)
     except MediaProbeError as exc:
@@ -430,6 +441,54 @@ async def accept_final_cut(path: Path, plan: RenderPlan, *, spawn: Spawner | Non
             video_duration=acceptance.video_duration,
             audio_duration=acceptance.audio_duration,
         )
+    ffmpeg = await asyncio.to_thread(ffmpeg_executable)
+    total_us = round(plan.duration_seconds * 1_000_000)
+    for cue in subtitles or ():
+        if not 0 <= cue.start_us < cue.end_us <= total_us:
+            raise FinalCutError("final_cut_acceptance_failed", "字幕超出成片范围，调整字幕起止时间")
+    for narration in narrations:
+        try:
+            source = await probe_media(narration.path, spawn=spawn)
+        except MediaProbeError as exc:
+            raise FinalCutError("final_cut_acceptance_failed", "旁白无法读取，重新生成旁白") from exc
+        stream = source.first_stream("audio")
+        length = stream.duration_seconds if stream else None
+        if length is None or narration.start_us < 0 or narration.start_us / 1e6 + length > plan.duration_seconds + ACCEPTANCE_TOLERANCE_SECONDS:
+            raise FinalCutError("final_cut_acceptance_failed", "旁白超出成片范围，延长画面或调整旁白落点")
+    try:
+        for music in bgm:
+            if (not 0 <= music.start_us < total_us or music.source_in_us < 0 or music.duration_us <= 0
+                    or music.start_us + music.duration_us > total_us or not math.isfinite(music.volume)
+                    or music.volume < 0 or min(music.fade_in_us, music.fade_out_us) < 0
+                    or music.fade_in_us + music.fade_out_us > music.duration_us):
+                raise FinalCutError("final_cut_acceptance_failed", "BGM 时间范围无效，调整裁剪和淡入淡出")
+            source = await probe_media(music.path, spawn=spawn)
+            stream = source.first_stream("audio")
+            if stream is None or stream.duration_seconds is None or (music.source_in_us + music.duration_us) / 1e6 > stream.duration_seconds + ACCEPTANCE_TOLERANCE_SECONDS:
+                raise FinalCutError("final_cut_acceptance_failed", "BGM 裁剪超出源音频，重新选择片段")
+            if music.volume == 0:
+                continue  # Explicit mute is intentional.
+            filters = [f"atrim=duration={_seconds(music.duration_us)}", "asetpts=PTS-STARTPTS", f"volume={music.volume}"]
+            if music.fade_in_us:
+                filters.append(f"afade=t=in:d={_seconds(music.fade_in_us)}")
+            if music.fade_out_us:
+                filters.append(f"afade=t=out:st={_seconds(music.duration_us - music.fade_out_us)}:d={_seconds(music.fade_out_us)}")
+            measured = await run_with_deadline([
+                ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-ss", _seconds(music.source_in_us),
+                *local_file_input(music.path), "-t", _seconds(music.duration_us), "-vn", "-af",
+                ",".join([*filters, "volumedetect"]), "-f", "null", "-",
+            ], deadline_seconds=60 + music.duration_us / 1e6, capture_stderr=True, spawn=spawn)
+            peaks = re.findall(r"max_volume:\s*(-?[\d.]+|-inf) dB", measured.stderr.decode(errors="replace"))
+            if measured.returncode or not peaks or float(peaks[-1]) <= -80:
+                raise FinalCutError("final_cut_acceptance_failed", "BGM 所选片段全程静音或无法解码，调整裁剪或更换音乐")
+        decoded = await run_with_deadline([
+            ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-xerror", *local_file_input(path),
+            "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-",
+        ], deadline_seconds=DEFAULT_RENDER_DEADLINES.for_seconds(plan.duration_seconds), capture_stderr=True, spawn=spawn)
+    except (SubprocessDeadlineExceeded, MediaProbeError) as exc:
+        raise FinalCutError("final_cut_acceptance_failed", "媒体验收未完成，检查音频文件并重新导出") from exc
+    if decoded.returncode or decoded.stderr.strip():
+        raise FinalCutError("final_cut_acceptance_failed", "成片完整解码失败，检查源视频并重新导出")
     return acceptance
 
 

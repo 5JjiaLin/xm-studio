@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 
 # 开栏：``` 后可跟空白、可选的语言标注 json（大小写不敏感）、可选空白与换行。
@@ -9,6 +10,24 @@ import re
 _OPENING_FENCE = re.compile(r"^```[ \t]*(?:json)?[ \t]*\n?", re.IGNORECASE)
 # 闭栏：结尾的 ``` 及其前导换行。
 _CLOSING_FENCE = re.compile(r"\n?```$")
+
+
+class DuplicateJSONKeyError(ValueError):
+    """结构化模型响应含重复对象键，无法唯一解释字段值。"""
+
+
+def strict_json_loads(text: str):
+    """解析 JSON 并拒绝任意嵌套层级的重复对象键。"""
+
+    def object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise DuplicateJSONKeyError(f"JSON 对象含重复字段: {key}")
+            result[key] = value
+        return result
+
+    return json.loads(text, object_pairs_hook=object_without_duplicates)
 
 
 def normalize_newlines(text: str) -> str:

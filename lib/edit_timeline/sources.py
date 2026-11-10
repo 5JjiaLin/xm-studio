@@ -52,6 +52,7 @@ class UnitMedia:
     video_version: int | None
     video_duration_us: int | None
     narration_duration_us: int | None
+    narration_version: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,11 +95,16 @@ def load_episode_script_units(projects: ProjectManager, project_name: str, episo
     script_file = _episode_script_file(project, episode)
     try:
         script = projects.load_script_readonly(project_name, script_file)
-        items, id_field, kind = resolve_items(script)
+        return script_units_from_snapshot(script, episode)
     except FileNotFoundError as exc:
         raise EditTimelineError("episode_not_found", f"集（id={episode}）的脚本不存在", episode=episode) from exc
     except ScriptEditError as exc:
         raise EditTimelineError("script_invalid", f"集（id={episode}）的脚本无法解析：{exc}", episode=episode) from exc
+
+
+def script_units_from_snapshot(script: dict, episode: int) -> EpisodeScriptUnits:
+    """Build source facts without reacquiring a caller's canonical script lock."""
+    items, id_field, kind = resolve_items(script)
     units: list[ScriptUnit] = []
     for item in items:
         if not isinstance(item, dict):
@@ -148,6 +154,7 @@ async def _unit_media(project_path: Path, versions: VersionManager, resource_typ
         video_version=video[0] if video else None,
         video_duration_us=video_duration,
         narration_duration_us=narration_duration,
+        narration_version=narration[0] if narration else None,
     )
 
 

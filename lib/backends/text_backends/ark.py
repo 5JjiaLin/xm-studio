@@ -6,6 +6,7 @@ import asyncio
 import logging
 
 from openai import OpenAI
+from volcenginesdkarkruntime._exceptions import ArkAPIConnectionError, ArkAPIStatusError
 
 from lib.backends.ark_shared import ark_base_url, create_ark_client, resolve_ark_api_key
 from lib.backends.providers import PROVIDER_ARK
@@ -15,10 +16,31 @@ from lib.backends.text_backends.base import (
     TextGenerationResult,
     merge_billed_usage,
 )
+from lib.infra.content_digest import canonical_json_digest
 from lib.infra.logging_utils import format_kwargs_for_log
 from lib.infra.retry import with_retry_async
 
+from .openai_policy import retry_text_request
+from .request_policy import explicit_parameter_rejection, retry_before_acceptance
+
 logger = logging.getLogger(__name__)
+
+
+def _retry_ark_text(exc: BaseException) -> bool:
+    if isinstance(exc, ArkAPIStatusError):
+        return not _ark_schema_rejection(exc) and retry_before_acceptance(exc, status_code=exc.status_code)
+    if isinstance(exc, ArkAPIConnectionError):
+        return retry_before_acceptance(exc)
+    return retry_text_request(exc)
+
+
+def _ark_schema_rejection(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, ArkAPIStatusError)
+        and exc.status_code in (400, 422, 429)
+        and explicit_parameter_rejection(str(exc), "schema", "response_format", "json_schema")
+    )
+
 
 DEFAULT_MODEL = "doubao-seed-2-1-lite-260915"
 
@@ -37,8 +59,8 @@ class ArkTextBackend:
         # 但 Ark API 是 OpenAI 兼容的，因此额外创建原生 OpenAI 客户端供降级使用。
         resolved_key = resolve_ark_api_key(api_key)
         effective_base_url = ark_base_url(base_url)
-        self._client = create_ark_client(api_key=resolved_key, base_url=effective_base_url)
-        self._openai_client = OpenAI(base_url=effective_base_url, api_key=resolved_key)
+        self._client = create_ark_client(api_key=resolved_key, base_url=effective_base_url, max_retries=0)
+        self._openai_client = OpenAI(base_url=effective_base_url, api_key=resolved_key, max_retries=0)
         self._model = model or DEFAULT_MODEL
         self._capabilities: set[TextCapability] = self._resolve_capabilities()
 
@@ -69,6 +91,12 @@ class ArkTextBackend:
     def capabilities(self) -> set[TextCapability]:
         return self._capabilities
 
+    @property
+    def configuration_fingerprint(self) -> str:
+        return canonical_json_digest(
+            {"endpoint": str(self._client.base_url), "capabilities": sorted(self.capabilities)}
+        )
+
     async def generate(self, request: TextGenerationRequest) -> TextGenerationResult:
         """生成文本回复。
 
@@ -80,7 +108,7 @@ class ArkTextBackend:
             return await self._generate_structured(request)
         return await self._generate_plain(request)
 
-    @with_retry_async()
+    @with_retry_async(retry_if=_retry_ark_text)
     async def _call_chat_completions(self, kwargs: dict, *, structured: bool) -> TextGenerationResult:
         """单次 chat.completions 调用：日志、发请求、解析与截断处理，瞬态错误重试。"""
         logger.info("调用 %s 文本 SDK kwargs=%s", self.name, format_kwargs_for_log(kwargs))
@@ -125,6 +153,8 @@ class ArkTextBackend:
                 # 必然再截断的请求毫无意义，直接冒泡让调用方感知并换模型/调小规模。
                 raise
             except Exception as exc:
+                if not _ark_schema_rejection(exc):
+                    raise
                 logger.warning("原生 response_format 调用或解析失败 (%s)，降级到 Instructor/json_object 路径", exc)
                 return await self._structured_fallback(request, messages)
 
@@ -148,7 +178,7 @@ class ArkTextBackend:
 
         return await self._structured_fallback(request, messages)
 
-    @with_retry_async()
+    @with_retry_async(retry_if=_retry_ark_text)
     async def _structured_fallback(self, request: TextGenerationRequest, messages: list[dict]) -> TextGenerationResult:
         """Instructor / json_object 降级路径。
 
@@ -192,6 +222,8 @@ class ArkTextBackend:
     def _parse_chat_response(self, response, *, structured: bool) -> TextGenerationResult:
         from lib.backends.text_backends.base import chat_completion_result, check_truncation
 
+        if not response.choices:
+            raise RuntimeError("文本响应缺少 choices，不能保存不完整结果")
         choice = response.choices[0]
         text = choice.message.content
         usage = getattr(response, "usage", None)

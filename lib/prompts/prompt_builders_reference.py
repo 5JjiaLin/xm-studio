@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import re
+
 from lib.infra.text_metrics import reading_unit_noun
 from lib.prompts.prompt_builders_script import outline_slot, overview_slot, project_asset_appearances
 from lib.prompts.prompt_rules.asset_appearance import asset_reference_names
@@ -29,6 +31,23 @@ def _candidate_names(characters: dict | None, scenes: dict | None, props: dict |
 
 def _join_durations(durations: list[int]) -> str:
     return ", ".join(str(d) for d in durations)
+
+
+_SOURCE_SPAN_BOUNDARY = re.compile(r"[。！？!?；;\n]+")
+
+
+def reference_source_spans(source_text: str) -> list[tuple[str, int, int, str]]:
+    """按句末标点和换行切分源文，保留原始字符偏移以供服务端精确回填。"""
+    spans: list[tuple[str, int, int, str]] = []
+    start = 0
+    for match in _SOURCE_SPAN_BOUNDARY.finditer(source_text):
+        end = match.end()
+        if source_text[start:end].strip():
+            spans.append((f"S{len(spans) + 1:04d}", start, end, source_text[start:end]))
+        start = end
+    if source_text[start:].strip():
+        spans.append((f"S{len(spans) + 1:04d}", start, len(source_text), source_text[start:]))
+    return spans
 
 
 def build_reference_units_split_prompt(
@@ -124,6 +143,8 @@ def build_reference_units_split_prompt(
     source_language = source_language if isinstance(source_language, str) else None
     speech_rate = speech_rate_units_per_second(source_language, speech_rate_override)
 
+    source_spans = reference_source_spans(novel_text)
+    rendered_source_spans = "\n".join(f"[{span_id}] {text}" for span_id, _start, _end, text in source_spans)
     return builtin_templates.render(
         "text/reference_video_script_plan",
         source_kind="screenplay" if source_kind == "screenplay" else "novel",
@@ -131,7 +152,7 @@ def build_reference_units_split_prompt(
         project_overview=overview_slot(project_overview),
         assets=project_asset_appearances(characters, scenes, props, include_creation_text=True),
         **_candidate_names(characters, scenes, props),
-        novel_text=novel_text,
+        source_spans=rendered_source_spans,
         episode_outline=outline_slot(episode_outline),
         next_episode_outline=outline_slot(next_episode_outline),
         episode=episode,

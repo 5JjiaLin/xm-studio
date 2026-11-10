@@ -87,7 +87,7 @@ class BgmLibraryService:
         self._project_dir(project_name)
         return self._projects.load_project(project_name)
 
-    async def upload(self, project_name: str, *, filename: str, content: bytes) -> BgmTrack:
+    async def upload(self, project_name: str, *, filename: str, content: bytes, generation_id: str | None = None) -> BgmTrack:
         """登记一首 BGM：校验格式与大小，探测时长，实测积分响度并折算增益，原子落盘并按字节登记。"""
         project_dir = await asyncio.to_thread(self._project_dir, project_name)
         extension = Path(filename).suffix.lower()
@@ -121,8 +121,9 @@ class BgmLibraryService:
                 gain_db=loudness_gain_db(integrated),
                 content_digest=await asyncio.to_thread(sha256_file, staged),
                 uploaded_at=_utc_now(),
+                generation_id=generation_id,
             )
-            await run_sync_transaction(self._commit, project_name, project_dir, staged, track)
+            track = await run_sync_transaction(self._commit, project_name, project_dir, staged, track)
         finally:
             await asyncio.to_thread(staged.unlink, missing_ok=True)  # hard-delete: temp -- 上传暂存文件
         return track
@@ -149,10 +150,18 @@ class BgmLibraryService:
             raise BgmError("bgm_silent", "BGM 几乎没有声音，测不出可用的响度")
         return integrated
 
-    def _commit(self, project_name: str, project_dir: Path, staged: Path, track: BgmTrack) -> None:
+    def _commit(self, project_name: str, project_dir: Path, staged: Path, track: BgmTrack) -> BgmTrack:
         target = project_dir / track.file
+        selected = track
 
         def mutate(project: dict) -> None:
+            nonlocal selected
+            if track.generation_id:
+                existing = next((item for item in read_bgm_library(project).values()
+                                 if item.generation_id == track.generation_id), None)
+                if existing is not None:
+                    selected = existing
+                    return
             bucket = project.get(PROJECT_BGM_FIELD)
             if not isinstance(bucket, dict):
                 bucket = project[PROJECT_BGM_FIELD] = {}
@@ -161,6 +170,8 @@ class BgmLibraryService:
             bucket[track.id] = bgm_entry(track)
 
         def install(_project_file: Path) -> None:
+            if selected is not track:
+                return
             staged.replace(target)
             register_current_artifact(
                 project_dir, bgm_key(track.id), artifact_path=track.file, basis=bgm_basis(track.content_digest)
@@ -168,6 +179,7 @@ class BgmLibraryService:
 
         with project_change_source("webui"):
             self._projects.update_project(project_name, mutate, on_commit=install, formal_paths=(target,))
+        return selected
 
 
 __all__ = ["BgmError", "BgmErrorCode", "BgmLibraryService", "bgm_display_name"]

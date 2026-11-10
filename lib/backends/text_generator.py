@@ -68,6 +68,15 @@ class TextGenerator:
         return self.backend.model
 
     @property
+    def provider_id(self) -> str:
+        """Non-secret configured provider identity for resumable generation inputs."""
+        return self._provider_id
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        return self.backend.configuration_fingerprint
+
+    @property
     def max_output_tokens(self) -> int:
         """本生成器每次请求实际生效的输出上限（单位 token）。"""
         return self._max_output_tokens

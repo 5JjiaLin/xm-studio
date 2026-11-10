@@ -85,6 +85,24 @@ async def production_render(project_name: str, episode: int, request: Request, u
         raise ConflictError("script_plan_refused", reason=str(exc)) from exc
 
 
+@router.post("/projects/{project_name}/episodes/{episode}/production/finish")
+async def production_finish(project_name: str, episode: int, request: Request, user: CurrentUser):
+    try:
+        return await service(request).post_production.start(
+            project_name, episode, user.id, local=_is_local_jianying(request)
+        )
+    except ProductionError as exc:
+        raise ConflictError("script_plan_refused", reason=str(exc)) from exc
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/production/finish/resume")
+async def production_finish_resume(project_name: str, episode: int, request: Request, user: CurrentUser):
+    try:
+        return await service(request).post_production.resume(project_name, episode, local=_is_local_jianying(request))
+    except ProductionError as exc:
+        raise ConflictError("script_plan_refused", reason=str(exc)) from exc
+
+
 @router.post("/projects/{project_name}/episodes/{episode}/production/videos/preview")
 async def production_video_preview(
     project_name: str, episode: int, body: VideosRequest, request: Request, user: CurrentUser
@@ -306,6 +324,7 @@ async def _production_timeline(project: str, episode: int, request: Request):
 
 @router.get("/projects/{project_name}/episodes/{episode}/production/edit")
 async def production_edit_read(project_name: str, episode: int, request: Request):
+    from lib.bgm.library import read_bgm_library
     from lib.edit_timeline.manual_subtitles import edit_issues
     from lib.edit_timeline.sources import load_episode_script_units, load_episode_sources
     from lib.edit_timeline.store import EditTimelineStore
@@ -320,10 +339,15 @@ async def production_edit_read(project_name: str, episode: int, request: Request
         pm, project_name, script, {clip.unit_id for clip in document.latest.content.clips}
     )
     readout = await timelines.read(project_name, timeline_id)
+    project_data = await asyncio.to_thread(pm.load_project, project_name)
     return {
         "timeline_id": timeline_id,
+        "aspect_ratio": project_data.get("aspect_ratio"),
+        "content_mode": project_data.get("content_mode", "narration"),
         "revision": document.latest.number,
         "clips": [clip.model_dump(mode="json") for clip in document.latest.content.clips],
+        "bgm": [clip.model_dump(mode="json") for clip in document.latest.content.bgm],
+        "bgm_library": [track.model_dump(mode="json") for track in read_bgm_library(project_data).values()],
         "media": {
             key: {"version": value.video_version, "duration_us": value.video_duration_us}
             for key, value in sources.media.items()
@@ -566,10 +590,11 @@ async def submit_jianying_delivery(
         _require_local_jianying(request)
     pm = service(request).projects
     store = delivery_store(pm)
+    record = None
     try:
         timelines, timeline_id = await _production_timeline(project_name, episode, request)
         drafts = TimelineJianyingDraftService(pm)
-        checked = await drafts.check(project_name, timeline_id)
+        checked = await drafts.check(project_name, timeline_id, narration="without_narration")
         job = await drafts.prepare(project_name, timeline_id, revision=checked.revision, narration=checked.narration)
         readout = await timelines.read(project_name, timeline_id)
         project = await asyncio.to_thread(pm.load_project, project_name)
@@ -616,7 +641,7 @@ async def submit_jianying_delivery(
         record = await asyncio.to_thread(store.patch, record["delivery_id"], task_id=enqueued["task_id"])
         return {"delivery": record}
     except ActiveTaskRequestConflict as exc:
-        if "record" in locals():
+        if record is not None:
             await asyncio.to_thread(
                 store.patch, record["delivery_id"], state="failed", error="另一个草稿任务正在运行，请稍后重试"
             )
@@ -662,7 +687,241 @@ async def download_jianying_delivery(project_name: str, episode: int, request: R
         store.package_path(record["delivery_id"]), filename=f"{record['folder']}.zip", media_type="application/zip"
     )
 
+
 # Keep the five-step production router as the single application entry point.
 from server.routers.whole_script import router as whole_script_router
 
 router.include_router(whole_script_router)
+
+
+class MusicDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    summary: str = Field(max_length=4000)
+    mood: str = Field(min_length=1, max_length=1000)
+    target_seconds: int = Field(ge=5, le=1200)
+    prompt: str = Field(min_length=1, max_length=2000)
+
+
+class MusicSubmit(MusicDraft):
+    candidate_id: str
+    basis: str
+    confirmed: Literal[True]
+
+
+class BeatApply(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    basis: str
+    ids: list[str] = Field(min_length=1, max_length=500)
+
+
+class MusicUndo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    base_revision: int = Field(ge=2)
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/production/music/preview")
+async def production_music_preview(
+    project_name: str, episode: int, body: MusicDraft, request: Request, user: CurrentUser
+):
+    from lib.backends.music import DEFAULT_MUSIC_MODEL
+    from lib.bgm.beat_sync import digest
+    from lib.config.resolver import ConfigResolver
+    from lib.edit_timeline.store import EditTimelineStore
+
+    _, timeline = await _production_timeline(project_name, episode, request)
+    document = await asyncio.to_thread(
+        lambda: EditTimelineStore(service(request).projects, project_name).find(timeline)
+    )
+    config = await ConfigResolver(async_session_factory).provider_config("minimax")
+    submitted_prompt = (
+        f"Instrumental score. Target duration: {body.target_seconds} seconds (creative target).\n"
+        f"Story: {body.summary.strip()}\nEmotional arc: {body.mood.strip()}\n"
+        f"Music direction: {body.prompt.strip()}"
+    )
+    if len(submitted_prompt) > 2000 or not body.mood.strip() or not body.prompt.strip():
+        raise HTTPException(422, "完整音乐提示词须在 2000 字符以内，请缩短剧情摘要、情绪曲线或音乐描述")
+    basis = digest({"draft": body.model_dump(), "timeline": timeline, "revision": document.latest.number})
+    return {
+        "basis": basis,
+        "model": DEFAULT_MUSIC_MODEL,
+        "configured": bool(config.get("api_key")),
+        "draft": body.model_dump(),
+        "submitted_prompt": submitted_prompt,
+    }
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/production/music")
+async def production_music_submit(
+    project_name: str, episode: int, body: MusicSubmit, request: Request, user: CurrentUser
+):
+    from uuid import UUID
+
+    from lib.generation.generation_queue_client import TaskSpec
+
+    try:
+        candidate = str(UUID(body.candidate_id))
+    except ValueError as exc:
+        raise HTTPException(422, "Invalid candidate ID") from exc
+    draft = MusicDraft(**body.model_dump(include={"summary", "mood", "target_seconds", "prompt"}))
+    async with generation_admission_lock(project_name=project_name, script_file="", resource_id=f"music:{candidate}"):
+        preview = await production_music_preview(project_name, episode, draft, request, user)
+        if preview["basis"] != body.basis:
+            raise HTTPException(409, "Music review expired; preview the current draft again")
+        if not preview["configured"]:
+            raise HTTPException(409, "Configure MiniMax API Key first")
+        spec = TaskSpec.from_request(
+            task_type="music",
+            media_type="audio",
+            resource_id=candidate,
+            prompt=preview["submitted_prompt"],
+            source="webui",
+            extra_payload={
+                "summary": body.summary,
+                "mood": body.mood,
+                "target_seconds": body.target_seconds,
+                "episode": episode,
+                "billing_episode_id": episode,
+            },
+        )
+        return await get_generation_queue().enqueue_task(
+            project_name=project_name,
+            task_type="music",
+            media_type="audio",
+            resource_id=candidate,
+            payload=spec.payload,
+            source="webui",
+            user_id=user.id,
+            provider_id="minimax",
+        )
+
+
+@router.get("/projects/{project_name}/episodes/{episode}/production/music")
+async def production_music_status(project_name: str, episode: int, request: Request, user: CurrentUser):
+    from pathlib import Path
+    from uuid import UUID
+
+    from lib.infra.json_io import load_json_or_none
+
+    await _production_timeline(project_name, episode, request)
+    queue = get_generation_queue()
+    tasks = await queue.list_tasks(project_name=project_name, task_type="music", page_size=500)
+    root = await asyncio.to_thread(service(request).projects.get_project_path, project_name)
+
+    def project_tasks():
+        rows = []
+        for task in tasks["items"]:
+            payload = task.get("payload") or {}
+            if payload.get("episode") != episode:
+                continue
+            candidate = str(UUID(task["resource_id"]))
+            spool = root / "bgm" / ".music-candidates"
+            audio = Path(spool / f"{candidate}.mp3").is_file()
+            marker = Path(spool / f"{candidate}.json")
+            submitted = marker.exists()
+            rejected = (load_json_or_none(marker) or {}).get("outcome") == "rejected"
+            terminal = task["status"] in {"failed", "cancelled"}
+            status = "unknown" if terminal and submitted and not audio and not rejected else task["status"]
+            rows.append(
+                {
+                    "task_id": task["task_id"],
+                    "candidate_id": candidate,
+                    "status": status,
+                    "recoverable": terminal and audio,
+                    "error": task.get("error_message") or task.get("error"),
+                }
+            )
+        return {"items": rows}
+
+    return await asyncio.to_thread(project_tasks)
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/production/music/{task_id}/recover")
+async def production_music_recover(project_name: str, episode: int, task_id: str, request: Request, user: CurrentUser):
+    await _production_timeline(project_name, episode, request)
+    queue = get_generation_queue()
+    task = await queue.get_task(task_id)
+    if (
+        not task
+        or task["project_name"] != project_name
+        or task["task_type"] != "music"
+        or (task.get("payload") or {}).get("episode") != episode
+    ):
+        raise HTTPException(404, "Music task not found")
+    from uuid import UUID
+
+    candidate = str(UUID(task["resource_id"]))
+    root = await asyncio.to_thread(service(request).projects.get_project_path, project_name)
+    if task["status"] not in {"failed", "cancelled"} or not await asyncio.to_thread(
+        (root / "bgm" / ".music-candidates" / f"{candidate}.mp3").is_file
+    ):
+        raise HTTPException(409, "仅可恢复已结束任务的本地音频，未知响应不能重新提交")
+    return await queue.enqueue_task(
+        project_name=project_name,
+        task_type="music",
+        media_type="audio",
+        resource_id=task["resource_id"],
+        payload={**task["payload"], "recover_only": True},
+        source="webui",
+        user_id=user.id,
+        provider_id="minimax",
+    )
+
+
+@router.get("/projects/{project_name}/episodes/{episode}/production/beats")
+async def production_beats(project_name: str, episode: int, request: Request, user: CurrentUser):
+    from lib.bgm.beat_sync import BeatSyncService
+
+    _, timeline = await _production_timeline(project_name, episode, request)
+    try:
+        return await BeatSyncService(service(request).projects).analyze(project_name, timeline)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/production/beats/apply")
+async def production_beats_apply(project_name: str, episode: int, body: BeatApply, request: Request, user: CurrentUser):
+    from lib.bgm.beat_sync import BeatSyncService
+    from lib.edit_timeline.errors import EditTimelineError
+    from lib.edit_timeline.model import RevisionAuthor
+
+    _, timeline = await _production_timeline(project_name, episode, request)
+    try:
+        await BeatSyncService(service(request).projects).apply(
+            project_name,
+            timeline,
+            basis=body.basis,
+            ids=body.ids,
+            author=RevisionAuthor(kind="creator", user_id=user.id),
+        )
+    except (ValueError, EditTimelineError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return await production_edit_read(project_name, episode, request)
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/production/music-undo")
+async def production_music_undo(project_name: str, episode: int, body: MusicUndo, request: Request, user: CurrentUser):
+    from lib.edit_timeline.errors import EditTimelineError
+    from lib.edit_timeline.model import RevisionAuthor
+    from lib.edit_timeline.store import EditTimelineStore
+
+    timelines, timeline = await _production_timeline(project_name, episode, request)
+    document = await asyncio.to_thread(
+        lambda: EditTimelineStore(service(request).projects, project_name).find(timeline)
+    )
+    if (
+        document.latest.number != body.base_revision
+        or not document.latest.summary.startswith("Music beat alignment:")
+        or document.latest.author.user_id != user.id
+    ):
+        raise HTTPException(409, "Only your latest beat alignment can be undone")
+    try:
+        await timelines.restore(
+            project_name,
+            timeline,
+            revision=body.base_revision - 1,
+            expected_latest=body.base_revision,
+            author=RevisionAuthor(kind="creator", user_id=user.id),
+        )
+    except EditTimelineError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return await production_edit_read(project_name, episode, request)

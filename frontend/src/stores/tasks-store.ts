@@ -23,6 +23,7 @@ export type ResourceKind =
   | "storyboard"
   | "video"
   | "tts"
+  | "music"
   | "reference_video"
   | "grid"
   | "text_episode_script"

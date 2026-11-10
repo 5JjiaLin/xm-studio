@@ -5,11 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from openai import AsyncOpenAI, BadRequestError
+from openai import AsyncOpenAI
 
 from lib.backends.openai_shared import (
     LONG_THINKING_TEXT_MODELS,
-    OPENAI_RETRYABLE_ERRORS,
     OPENAI_TEXT_TIMEOUT,
     create_openai_client,
 )
@@ -28,8 +27,15 @@ from lib.backends.text_backends.base import (
     structured_fallback_reason,
     truncate_for_log,
 )
+from lib.backends.text_backends.openai_policy import (
+    is_schema_rejection,
+    rejects_parameter,
+    retry_text_request,
+    supports_strict_schema,
+)
 from lib.backends.transport_layer import TransportLayer
 from lib.config.url_utils import is_official_openai_base_url
+from lib.infra.content_digest import canonical_json_digest
 from lib.infra.logging_utils import format_kwargs_for_log
 from lib.infra.retry import with_retry_async
 
@@ -95,6 +101,12 @@ class OpenAITextBackend:
     def capabilities(self) -> set[TextCapability]:
         return self._capabilities
 
+    @property
+    def configuration_fingerprint(self) -> str:
+        return canonical_json_digest(
+            {"endpoint": str(self._client.base_url), "capabilities": sorted(self.capabilities)}
+        )
+
     async def generate(self, request: TextGenerationRequest) -> TextGenerationResult:
         """生成文本回复。
 
@@ -112,6 +124,8 @@ class OpenAITextBackend:
         # 带图请求要读本地图片编码 data URI，放线程里构建，避免阻塞事件循环
         messages = await asyncio.to_thread(_build_messages, request)
         if request.response_schema and TextCapability.STRUCTURED_OUTPUT not in self._capabilities:
+            if request.prefer_stream:
+                return await self._prompt_json_fallback(request)
             logger.info("%s/%s 未声明原生结构化输出，直接走 Instructor", self._provider_name, self._model)
             return await _instructor_fallback(
                 self._client,
@@ -124,6 +138,8 @@ class OpenAITextBackend:
 
         native = await self._generate_native(request, messages)
         if native is None:
+            if request.prefer_stream:
+                return await self._prompt_json_fallback(request)
             # 原生 response_format 通道不兼容（schema 错误），结构化输出整体降级
             return await _instructor_fallback(
                 self._client,
@@ -142,6 +158,10 @@ class OpenAITextBackend:
                     fallback_reason,
                     truncate_for_log(native.text),
                 )
+                if request.prefer_stream:
+                    result = await self._prompt_json_fallback(request)
+                    merge_billed_usage(result, native)
+                    return result
                 result = await _instructor_fallback(
                     self._client,
                     self._model,
@@ -156,13 +176,18 @@ class OpenAITextBackend:
 
         return native
 
+    async def _prompt_json_fallback(self, request: TextGenerationRequest) -> TextGenerationResult:
+        return await prompt_json_fallback(
+            request, self._generate_prompt_json_once, provider=self._provider_name, model=self._model
+        )
+
     async def _generate_prompt_json_once(self, request: TextGenerationRequest) -> TextGenerationResult:
         messages = await asyncio.to_thread(_build_messages, request)
         result = await self._generate_native(request, messages, structured=True)
         assert result is not None  # prompt 路径没有 response_schema，不存在 wire schema 降级
         return result
 
-    @with_retry_async(max_attempts=4, backoff_seconds=(2, 4, 8), retryable_errors=OPENAI_RETRYABLE_ERRORS)
+    @with_retry_async(max_attempts=4, backoff_seconds=(2, 4, 8), retry_if=retry_text_request)
     async def _generate_native(
         self, request: TextGenerationRequest, messages: list[dict], *, structured: bool = False
     ) -> TextGenerationResult | None:
@@ -182,23 +207,18 @@ class OpenAITextBackend:
                 "type": "json_schema",
                 "json_schema": {
                     "name": "response",
-                    "strict": True,
                     "schema": schema,
                 },
             }
+            if supports_strict_schema(schema):
+                kwargs["response_format"]["json_schema"]["strict"] = True
 
         logger.info("调用 %s 文本 SDK kwargs=%s", self.name, format_kwargs_for_log(kwargs))
         try:
-            if self._model in LONG_THINKING_TEXT_MODELS:
+            if request.prefer_stream or self._model in LONG_THINKING_TEXT_MODELS:
                 # 流式接收让支持心跳的代理在思考期间保持连接；正文仍完整聚合后才返回。
                 # 使用快照保留原有截断判断，避免 SDK 的 parse 抢先抛 length 异常。
-                async with self._client.chat.completions.stream(
-                    **kwargs, stream_options={"include_usage": True}
-                ) as stream:
-                    await stream.until_done()
-                    response = stream.current_completion_snapshot
-                if not response.choices or not response.choices[0].finish_reason:
-                    raise RuntimeError("文本流未收到结束标记，不能保存不完整结果")
+                response = await self._receive_stream(kwargs)
             else:
                 response = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:
@@ -236,6 +256,27 @@ class OpenAITextBackend:
             text=text, provider=self._provider_name, model=self._model, usage=usage, truncated=truncated
         )
 
+    async def _receive_stream(self, kwargs: dict):
+        # Only explicit parameter rejection permits another request. A broken accepted
+        # stream must propagate, since its generation may already have been billed.
+        options: dict = {"include_usage": True}
+        while True:
+            try:
+                stream_kwargs = {**kwargs, **({"stream_options": options} if options else {})}
+                async with self._client.chat.completions.stream(**stream_kwargs) as stream:
+                    await stream.until_done()
+                    response = stream.current_completion_snapshot
+                if not response.choices or not response.choices[0].finish_reason:
+                    raise RuntimeError("文本流未收到结束标记，不能保存不完整结果")
+                return response
+            except Exception as exc:
+                if options and rejects_parameter(exc, "stream_options"):
+                    options = {}
+                    continue
+                if rejects_parameter(exc, "stream"):
+                    return await self._client.chat.completions.create(**kwargs)
+                raise
+
 
 def _build_messages(request: TextGenerationRequest) -> list[dict]:
     """将 TextGenerationRequest 转为 OpenAI messages 格式。"""
@@ -263,30 +304,12 @@ def _build_messages(request: TextGenerationRequest) -> list[dict]:
     return messages
 
 
-_SCHEMA_ERROR_KEYWORDS = (
-    "response_schema",
-    "json_schema",
-    "Unknown name",
-    "Cannot find field",
-    "Invalid JSON payload",
-)
-
-
 def _is_schema_error(exc: BaseException) -> bool:
-    """判断异常是否为 JSON Schema 不兼容导致的错误。
-
-    除了标准的 400 BadRequestError，一些 OpenAI 兼容代理（如 Gemini
-    兼容端点）会将上游 schema 错误包装成其他状态码（如 429），
-    因此也检查错误信息中是否包含 schema 相关关键字。
-    """
-    if isinstance(exc, BadRequestError):
-        return True
-    # 代理可能把上游 schema 错误包装成非 400 状态码
-    error_str = str(exc)
-    return any(kw in error_str for kw in _SCHEMA_ERROR_KEYWORDS)
+    """Only explicit schema rejection permits structured-output fallback."""
+    return is_schema_rejection(exc)
 
 
-@with_retry_async(max_attempts=4, backoff_seconds=(2, 4, 8), retryable_errors=OPENAI_RETRYABLE_ERRORS)
+@with_retry_async(max_attempts=4, backoff_seconds=(2, 4, 8), retry_if=retry_text_request)
 async def _instructor_fallback(
     client: AsyncOpenAI,
     model: str,

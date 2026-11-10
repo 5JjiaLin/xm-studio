@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import { API } from "@/api";
+import { ProductionMusic } from "./ProductionMusic";
+import { ProductionTimelinePreview } from "./ProductionTimelinePreview";
 import type { ProductionEdit, ProductionEditClip, ProductionSubtitle } from "@/types/production";
 import type { ReferenceVideoUnit } from "@/types/reference-video";
 import { useEditUnit } from "@/components/shared/edit-unit/useEditUnit";
@@ -39,6 +41,8 @@ function Editor({ project, episode, data, units, busy, onChanged, onRender }: { 
   const [selectedId, setSelectedId] = useState(data.clips.find(included)?.id || data.clips[0]?.id || "");
   const [timeUs, setTimeUs] = useState(0);
   const [playerHeight, setPlayerHeight] = useState(400);
+  const [musicPending, setMusicPending] = useState(false);
+  const [musicOpened, setMusicOpened] = useState(false);
   const [rendering, setRendering] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const player = useRef<HTMLVideoElement>(null);
@@ -63,8 +67,9 @@ function Editor({ project, episode, data, units, busy, onChanged, onRender }: { 
     const result = await API.saveProductionEdit(project, episode, metadata.timeline_id, metadata.revision, operations);
     setMetadata(result); onChanged(); return result.clips;
   }, [busy, episode, metadata.revision, metadata.timeline_id, onChanged, project, t]);
-  const editor = useEditUnit({ source: data.clips, save });
-  const locked = busy || rendering || editor.status === "saving";
+  const editor = useEditUnit({ source: metadata.clips, save });
+  const baseLocked = busy || rendering || editor.status === "saving";
+  const locked = baseLocked || musicPending;
   const clip = editor.value.find((item) => item.id === selectedId);
   const media = clip ? metadata.media[clip.unit_id] : null;
   const source = clip ? units.find((unit) => unit.unit_id === clip.unit_id)?.generated_assets?.video_clip : null;
@@ -106,6 +111,18 @@ function Editor({ project, episode, data, units, busy, onChanged, onRender }: { 
       {visibleCues.map((cue) => <div key={cue.id} className="pointer-events-none absolute inset-x-[5%] whitespace-pre-wrap text-center font-bold text-shadow-sm text-shadow-black text-(length:--caption-size) text-(--caption-color) translate-y-(--caption-shift) top-(--caption-top) bottom-(--caption-bottom)" style={{ "--caption-shift": cue.position === "center" ? "-50%" : "0%", "--caption-color": cue.color, "--caption-size": `${Math.max(12, cue.font_size * playerHeight / 1080)}px`, "--caption-top": cue.position === "top" ? "8%" : cue.position === "center" ? "45%" : "auto", "--caption-bottom": cue.position === "bottom" ? "12%" : "auto" } as CSSProperties}>{cue.text}</div>)}
     </div>}
     <Button type="button" variant="outline" className="self-start" disabled={!source} onClick={() => { setContinuous(true); if (player.current) void player.current.play().catch((e) => setError(errMsg(e))); }}>{t("production_edit_play")}</Button>
+    <details onToggle={(event) => { if (event.currentTarget.open) setMusicOpened(true); }}>
+    <summary className="cursor-pointer text-sm text-muted-foreground">{t("production_optional_music")}</summary>
+    {musicOpened && <ProductionMusic project={project} episode={episode} data={metadata} locked={baseLocked || editor.dirty} onPendingChange={setMusicPending} onChanged={(value) => { setMetadata(value); onChanged(); }} onReviewCut={(cut) => {
+      let start = 0;
+      for (const item of editor.value.filter(included)) {
+        const length = (item.trim?.out_us ?? metadata.media[item.unit_id]?.duration_us ?? 0) - (item.trim?.in_us ?? 0) + item.hold_us;
+        if (start + length >= cut) { setSelectedId(item.id); setContinuous(false); break; }
+        start += length;
+      }
+    }} />}
+    </details>
+    <ProductionTimelinePreview key={`${metadata.timeline_id}/${metadata.revision}`} project={project} data={metadata} units={units} dirty={editor.dirty || musicPending} />
     <h3 className="font-medium">{t("production_edit_clips")}</h3>
     <ol className="flex flex-col gap-2">{editor.value.map((item, index) => <li key={item.id} className="flex flex-wrap items-center gap-2 rounded-md border border-border p-2">
       <Button type="button" variant={item.id === selectedId ? "default" : "ghost"} onClick={() => { setSelectedId(item.id); setContinuous(false); }}>{item.unit_id}</Button><span className="text-xs text-muted-foreground">{seconds(Math.max(0, (item.trim?.out_us ?? metadata.media[item.unit_id]?.duration_us ?? 0) - (item.trim?.in_us ?? 0)))}s</span>

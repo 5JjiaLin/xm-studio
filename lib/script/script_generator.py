@@ -57,8 +57,8 @@ from lib.generation.video_request_facts import (
 )
 from lib.i18n import _ as translate
 from lib.infra.async_thread import run_sync_transaction
-from lib.infra.content_digest import sha256_file
-from lib.infra.text_utils import strip_json_code_fences
+from lib.infra.content_digest import canonical_json_digest, sha256_file
+from lib.infra.text_utils import DuplicateJSONKeyError, strict_json_loads, strip_json_code_fences
 from lib.project.asset_types import asset_name_comparison_key
 from lib.project.item_id_history import issue_landing_item_ids
 from lib.project.project_manager import ProjectManager, ScriptWriteConflict
@@ -97,6 +97,7 @@ from lib.script.plan_new_assets import (
     resolve_new_assets,
     unregistered_references,
 )
+from lib.script.prompt_authoring_progress import PROMPT_AUTHORING_BATCH_SIZE, PromptAuthoringProgress
 from lib.script.prompt_authoring_scope import (
     PromptAuthoringSelection,
     PromptOverwrite,
@@ -115,6 +116,7 @@ from lib.script.reference_video.draft_validation import (
 )
 from lib.script.reference_video.duration_slots import resolve_duration_slot
 from lib.script.reference_video.request_projection import ReferenceUnitHydration
+from lib.script.reference_video.temporal_validation import normalize_model_timeline_newlines
 from lib.script.reference_video.unit_capabilities import hydrate_reference_units
 from lib.script.script_document import (
     build_materialized_script,
@@ -658,8 +660,8 @@ class ScriptGenerator:
         """按骨架种类严格校验视觉层响应，返回逐条目视觉层 dict（id + image_prompt + video_prompt）。"""
         text = strip_json_code_fences(response_text)
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError as e:
+            data = strict_json_loads(text)
+        except (json.JSONDecodeError, DuplicateJSONKeyError) as e:
             raise ValueError(f"提示词编写视觉层 JSON 解析失败: {e}") from e
         try:
             validated = _VISUAL_RESPONSE_SCHEMA[targets.kind].model_validate(data)
@@ -1130,6 +1132,7 @@ class ScriptGenerator:
         if self.content_mode == "ad":
             return self._build_ad_reference_prompt_authoring_prompt(episode, targets, instructions)
         facts = await self._fetch_video_request_facts()
+        targets = replace(targets, entries=targets.entries[:PROMPT_AUTHORING_BATCH_SIZE])
         return self._build_reference_prompt_authoring_prompt(episode, targets, facts, instructions)
 
     @property
@@ -1745,14 +1748,89 @@ class ScriptGenerator:
             )
         max_refs = self._resolve_max_refs(facts)
         logger.info("正在为第 %d 集编写提示词（video_units，%d/%d 个单元）...", episode, len(units), len(targets.items))
-        result = await self._generate_text(
-            TextGenerationRequest(
-                prompt=self._build_reference_prompt_authoring_prompt(episode, targets, facts, instructions),
-                response_schema=ReferencePromptAuthoringFlatScript,
-                max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+        initial_prompt = self._build_reference_prompt_authoring_prompt(episode, targets, facts, instructions)
+        assert self.generator is not None
+        progress = PromptAuthoringProgress(
+            self.project_path,
+            episode,
+            canonical_json_digest(
+                {
+                    "version": 1,
+                    "baseline": formal_baseline,
+                    "prompt": initial_prompt,
+                    "model": self.generator.model,
+                    "provider": self.generator.provider_id,
+                    "backend": self.generator.backend.name,
+                    "configuration": self.generator.configuration_fingerprint,
+                    "max_output_tokens": self.generator.max_output_tokens,
+                    "selection": [(uid, targets.fields_of(uid)) for uid in targets.ids],
+                }
+            ),
+            await asyncio.to_thread(ProjectManager.for_project_dir, self.project_path),
+        )
+        context = copy.deepcopy(targets.script)
+        output_units: list[dict[str, str]] = []
+        responses: list[str] = []
+
+        def validate_and_save(batch: list[dict], text: str, cached: bool, key: str) -> list[dict]:
+            authored = self._merge_reference_visual(batch, text, episode, max_refs=max_refs)
+            if not cached:
+                progress.save(key, text)
+            return authored
+
+        for offset in range(0, len(units), PROMPT_AUTHORING_BATCH_SIZE):
+            batch = units[offset : offset + PROMPT_AUTHORING_BATCH_SIZE]
+            batch_targets = replace(targets, entries=tuple(batch), script=context)
+            prompt = self._build_reference_prompt_authoring_prompt(episode, batch_targets, facts, instructions)
+            key = canonical_json_digest({"ids": batch_targets.ids, "prompt": prompt})
+            response_text = await asyncio.to_thread(progress.read, key)
+            cached = response_text is not None
+            if response_text is None:
+                # Recheck before every paid batch; completed batches do not permit silently
+                # continuing against a changed formal script or a newly edited repair draft.
+                await asyncio.to_thread(self._assert_prompt_authoring_snapshot, episode, filename, formal_baseline)
+                result = await self._generate_text(
+                    TextGenerationRequest(
+                        prompt=prompt,
+                        response_schema=ReferencePromptAuthoringFlatScript,
+                        max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                        prefer_stream=True,
+                    )
+                )
+                response_text = result.text
+
+            try:
+                # Finish validation and persistence together even if the awaiting task is cancelled.
+                authored_batch = await run_sync_transaction(validate_and_save, batch, response_text, cached, key)
+            except DraftViolation as exc:
+                raise await run_sync_transaction(
+                    self._quarantine_reference_prompt_authoring,
+                    episode,
+                    response_text,
+                    exc,
+                    unit_ids=batch_targets.ids,
+                    base_fingerprint=formal_baseline,
+                    expected_draft_revision=None,
+                    before_commit=before_quarantine_commit,
+                ) from exc
+            responses.append(response_text)
+            output_units.extend({"text": unit["text"]} for unit in authored_batch)
+            completed = {str(unit["unit_id"]): unit for unit in authored_batch}
+            context[targets.kind] = [
+                {**entry, **completed[str(entry[targets.id_field])], "pending_authoring": False}
+                if str(entry[targets.id_field]) in completed
+                else entry
+                for entry in context[targets.kind]
+            ]
+            logger.info("第 %d 集提示词已校验 %d/%d 单元（复用=%s）", episode, len(output_units), len(units), cached)
+        response_text = (
+            responses[0]
+            if len(responses) == 1
+            else json.dumps(
+                {"title": self._parse_unit_texts(responses[0], episode).title, "units": output_units},
+                ensure_ascii=False,
             )
         )
-        response_text = result.text
 
         async def quarantine(exc: DraftViolation) -> DraftViolation:
             return await run_sync_transaction(
@@ -1798,11 +1876,21 @@ class ScriptGenerator:
         logger.info("剧本已保存至 %s", output_path)
         return output_path
 
+    def _assert_prompt_authoring_snapshot(self, episode: int, filename: str, baseline: str | None) -> None:
+        _, current = self._formal_script_baseline(episode, filename)
+        if current != baseline:
+            raise ScriptWriteConflict(expected=baseline, actual=current, current_content=None)
+        if self._reference_prompt_authoring_draft_revision(episode) is not None:
+            raise DraftViolation(
+                "reference prompt_authoring 草稿待处置；请先晋升或丢弃现有草稿",
+                code="draft_revision_conflict",
+            )
+
     def _parse_unit_texts(self, response_text: str, episode: int) -> ReferencePromptAuthoringFlatScript:
         text = strip_json_code_fences(response_text)
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError as e:
+            data = strict_json_loads(text)
+        except (json.JSONDecodeError, DuplicateJSONKeyError) as e:
             raise ValueError(f"JSON 解析失败: {e}") from e
         # title 缺失/空白兜底须在校验之前：title 不参与写回，非约束解码通道下模型整字段漏写
         # 不该让一次已付费的展开失败（与 _parse_response 的兜底同口径）。
@@ -1844,22 +1932,25 @@ class ScriptGenerator:
         violations: list[DraftViolation] = []
         for index, (unit, flat_unit) in enumerate(zip(units, flat.units, strict=True)):
             label = f"unit {unit['unit_id']}"
+            authored_text = (
+                normalize_model_timeline_newlines(flat_unit.text) if self.content_mode == "drama" else flat_unit.text
+            )
             # 逐 unit 收集而非首个违约即抛：报告要覆盖所有坏 unit，Agent 一轮就能看全要改什么。
             # 一个 unit 内部仍是首个违约即停——正文解析不出时，后续判定都建立在同一个问题上。
             try:
                 validate_unit_text(
                     label,
-                    flat_unit.text,
+                    authored_text,
                     self.project_json,
                     max_refs=max_refs,
                     tolerated_speakers=dialogue_speakers(str(unit.get("text") or "")),
                 )
-                assert_dialogue_preserved(label, str(unit.get("text") or ""), flat_unit.text)
+                assert_dialogue_preserved(label, str(unit.get("text") or ""), authored_text)
                 if self.content_mode == "drama":
                     from lib.script.reference_video.temporal_validation import validate_timeline
 
                     _, temporal_issues = validate_timeline(
-                        flat_unit.text,
+                        authored_text,
                         int(unit["duration_seconds"]),
                         required=True,
                         language=self.project_json.get("source_language"),
@@ -1886,7 +1977,7 @@ class ScriptGenerator:
             authored.append(
                 {
                     **unit,
-                    "text": flat_unit.text,
+                    "text": authored_text,
                     **({"prompt_format_version": "timeline_v1"} if self.content_mode == "drama" else {}),
                 }
             )
@@ -2265,8 +2356,8 @@ class ScriptGenerator:
 
         # 解析 JSON
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError as e:
+            data = strict_json_loads(text)
+        except (json.JSONDecodeError, DuplicateJSONKeyError) as e:
             raise ValueError(f"JSON 解析失败: {e}") from e
         if not isinstance(data, dict):
             raise ValueError(f"JSON 顶层须是对象，实际是 {type(data).__name__}")
@@ -2320,8 +2411,8 @@ class ScriptGenerator:
         """
         text = strip_json_code_fences(response_text)
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
+            data = strict_json_loads(text)
+        except (json.JSONDecodeError, DuplicateJSONKeyError) as exc:
             raise AdScriptRejected([f"广告参考剧本 JSON 解析失败: {exc}"]) from exc
         try:
             flat = AdReferenceFlatScript.model_validate(data)
