@@ -12,8 +12,10 @@ from lib.artifacts.artifact_activation import activate_artifact_target_state
 from lib.config.resolver import ConfigResolver
 from lib.infra.json_io import atomic_write_json
 from lib.project.project_manager import ProjectManager
+from server.draft_workflow import DraftContext, DraftWorkflow
 from server.services.project.script_review import ScriptReviewError, ScriptReviewService
-from tests.fakes import FakeConfigResolver
+from server.text_generation import TextGenerationError, TextGenerationRequest, generate_reference_script_plan
+from tests.fakes import FakeConfigResolver, FakeTextGenerator, use_text_generator
 
 _PLAN_FILES = {
     "drama": "script_plan_normalized_script.json",
@@ -335,7 +337,56 @@ async def test_reference_video_mentions_follow_merges_and_derivatives(tmp_path: 
     await _confirm(pm)
 
     [unit] = _formal(pm)["video_units"]
-    assert unit["text"] == "@[裴与] 看着 @[阿离/幼年]。\n@[阿离/幼年]{你回来了。}"
+    assert unit["text"] == "@[裴与] 看着 @[阿离/幼年]。\n@[阿离]{你回来了。}"
+
+
+async def test_reference_plan_recovers_and_confirms_with_the_same_asset_identities_without_regeneration(
+    tmp_path: Path, monkeypatch, video_request_facts
+) -> None:
+    pm = _project(tmp_path, "drama", generation_mode="reference_video")
+    project_path = pm.get_project_path("demo")
+    source = project_path / "source" / "episode_1.txt"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("小桃穿着雨衣等人。", encoding="utf-8")
+    original_text = "@[桃桃] 穿着@[小桃/雨衣]等人。\n@[桃桃]{你回来了。}"
+    fake = FakeTextGenerator(
+        json.dumps(
+            {
+                "units": [{"text": original_text, "duration_seconds": 8, "source_text": "小桃穿着雨衣等人。"}],
+                "new_assets": [
+                    _new("小桃", "register", description="女童"),
+                    _new("雨衣", "derivative", target="小桃", description="披着雨衣"),
+                    _new("桃桃", "merge", target="不存在的人"),
+                ],
+            },
+            ensure_ascii=False,
+        )
+    )
+    use_text_generator(monkeypatch, fake.create)
+    resolver = cast(ConfigResolver, FakeConfigResolver())
+
+    with pytest.raises(TextGenerationError, match="new_asset_target_unresolved"):
+        await generate_reference_script_plan(
+            TextGenerationRequest(episode=1), project_name="demo", projects=pm, config_resolver=resolver
+        )
+    workflow = DraftWorkflow(DraftContext("demo", pm.data_root, pm, resolver))
+    draft = await workflow.open(1, "reference_script_plan")
+    assert [v["code"] for v in draft["violations"]] == ["new_asset_target_unresolved"]
+    assert draft["content"]["units"][0]["text"] == original_text
+    draft["content"]["new_assets"][2]["target"] = "小桃"
+
+    repaired = await workflow.patch(1, "reference_script_plan", draft["content"], draft["revision"])
+    await workflow.promote(1, "reference_script_plan", repaired["revision"])
+
+    plan = json.loads((project_path / "drafts" / "episode_1" / _PLAN_FILES["reference_video"]).read_text())
+    assert plan["units"][0]["text"] == original_text
+    assert set(pm.load_project("demo")["characters"]) == {"阿离", "裴与"}
+    await _confirm(pm)
+    assert _formal(pm)["video_units"][0]["text"] == "@[小桃] 穿着@[小桃/雨衣]等人。\n@[小桃]{你回来了。}"
+    characters = pm.load_project("demo")["characters"]
+    assert set(characters) == {"阿离", "裴与", "小桃"}
+    assert characters["小桃"]["derivatives"]["雨衣"]["description"] == "披着雨衣"
+    assert len(fake.requests) == 1
 
 
 @pytest.mark.parametrize(

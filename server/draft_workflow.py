@@ -47,7 +47,7 @@ from lib.script.draft_quarantine import (
     write_quarantine,
 )
 from lib.script.draft_violation import DraftViolation, schema_violations
-from lib.script.plan_new_assets import NEW_ASSETS_FIELD, dedupe_new_assets, planning_project, with_new_assets
+from lib.script.plan_new_assets import NEW_ASSETS_FIELD, dedupe_new_assets, with_new_assets
 from lib.script.planning_draft_trash import discard_quarantine
 from lib.script.script_generator import ScriptGenerator
 from lib.script.script_models import (
@@ -316,9 +316,10 @@ async def revalidate_reference_script_plan_draft(
     # 否则 Agent 修草稿的每一轮都看不见降级提示，直到最后一轮晋升成功才第一次读到。
     soft_violations = reference_soft_violations(
         [str(flat["text"]) for flat in flat_units],
-        planning_project(project, new_assets),
+        project,
         episode=episode,
         voice=split_caps.voice,
+        new_assets=new_assets,
     )
     return ReferenceDraftRevalidation(
         violations,
@@ -495,10 +496,11 @@ async def _promote_reference_script_plan(
         )
     units = build_reference_units_from_flat(
         flat_units,
-        planning_project(project, revalidation.new_assets),
+        project,
         episode=episode,
         max_refs=split_caps.max_refs,
         unit_ids=unit_ids,
+        new_assets=revalidation.new_assets,
     )
     # 写盘经单一出口（lib.script.script_review.write_script_plan_locked）：锁、基线比对、prompt_authoring 草稿清理
     # 只存在那一处。基线指纹取自取回 / 草稿产出时记进 meta 的 base_fingerprint——正式文件在草稿

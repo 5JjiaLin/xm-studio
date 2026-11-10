@@ -145,6 +145,30 @@ async def test_reference_plan_accepts_a_skipped_speaker_and_new_mentions(
     assert [item["name"] for item in saved["new_assets"]] == ["货郎", "路人"]
 
 
+async def test_reference_plan_accepts_a_new_base_and_its_derivative_in_an_empty_project(
+    fake_ctx: ToolHarness, monkeypatch, video_request_facts
+) -> None:
+    for bucket in ("characters", "scenes", "props"):
+        fake_ctx.pm.project_payload[bucket] = {}
+    rv_source(fake_ctx)
+    unit = rv_unit("@[张三/换装形态] 在 @[村口] 等人。\n@[张三]{你回来了。}")
+    new_assets = [
+        _new("张三", "register", description="粗布短打的青年"),
+        _new("换装形态", "derivative", target="张三", description="披着雨衣"),
+        {"type": "scene", "name": "村口", "decision": "register", "reason": "原文场景", "description": "村口空地"},
+    ]
+
+    out = await run_rv_split(fake_ctx, monkeypatch, [unit], new_assets=new_assets)
+
+    assert out.problem is None, out
+    assert not rv_quarantine_path(fake_ctx).exists()
+    saved = json.loads(rv_script_plan_path(fake_ctx).read_text(encoding="utf-8"))
+    assert saved["units"][0]["text"] == unit["text"]
+    assert [item["name"] for item in saved["new_assets"]] == ["张三", "换装形态", "村口"]
+    project = json.loads((fake_ctx.project_path / "project.json").read_text(encoding="utf-8"))
+    assert all(project[bucket] == {} for bucket in ("characters", "scenes", "props"))
+
+
 async def test_reference_plan_still_refuses_an_unlisted_speaker(
     fake_ctx: ToolHarness, monkeypatch, video_request_facts
 ) -> None:
@@ -154,6 +178,33 @@ async def test_reference_plan_still_refuses_an_unlisted_speaker(
 
     assert out.problem is not None
     assert rv_quarantine_path(fake_ctx).exists()
+
+
+@pytest.mark.parametrize("source_text", ["张三在村口等人", "原文没有这一句"])
+async def test_invalid_asset_decision_reports_the_cause_without_cascading_reference_errors(
+    fake_ctx: ToolHarness, monkeypatch, video_request_facts, source_text: str
+) -> None:
+    rv_source(fake_ctx)
+    new_assets = [
+        _new("小桃", "register", description="女童"),
+        _new("雨衣", "derivative", target="小桃", description="披着雨衣"),
+        _new("路人", "merge", target="不存在的角色"),
+    ]
+
+    out = await run_rv_split(
+        fake_ctx,
+        monkeypatch,
+        [rv_unit("@[小桃/雨衣] 在 @[村口] 等候。", source_text=source_text)],
+        new_assets=new_assets,
+    )
+
+    assert out.problem is not None
+    draft = json.loads(rv_quarantine_path(fake_ctx).read_text(encoding="utf-8"))
+    expected = [] if source_text == "张三在村口等人" else ["source_text_not_verbatim"]
+    assert [v["code"] for v in draft["violations"]] == [*expected, "new_asset_target_unresolved"]
+    assert draft["content"]["units"][0]["text"] == "@[小桃/雨衣] 在 @[村口] 等候。"
+    for saved, original in zip(draft["content"]["new_assets"], new_assets, strict=True):
+        assert all(saved[key] == value for key, value in original.items())
 
 
 @pytest.mark.parametrize(

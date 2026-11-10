@@ -382,6 +382,50 @@ async def test_split_reference_video_units_rejects_over_max_refs(
     assert not rv_script_plan_path(fake_ctx).exists()
 
 
+@pytest.mark.parametrize(
+    ("decision", "extra", "text"),
+    [
+        ("merge", {"target": "张三"}, "@[张三] 看着镜中的@[三哥]。"),
+        ("register", {"asset_name": "张三", "description": "青年"}, "@[张三] 看着镜中的@[三哥]。"),
+        ("skip", {}, "@[张三] 走过@[三哥]身旁。\n@[三哥]{借过。}"),
+    ],
+)
+async def test_split_reference_limit_counts_final_assets_instead_of_temporary_names(
+    fake_ctx: ToolHarness, monkeypatch, set_video_request_facts, decision: str, extra: dict, text: str
+) -> None:
+    rv_source(fake_ctx)
+    set_video_request_facts(_reference_facts("r2v", max_reference_images=1))
+    new_assets = [{"type": "character", "name": "三哥", "decision": decision, "reason": "本集称呼", **extra}]
+
+    out = await run_rv_split(fake_ctx, monkeypatch, [rv_unit(text)], new_assets=new_assets)
+
+    assert out.problem is None, out
+    saved = json.loads(rv_script_plan_path(fake_ctx).read_text(encoding="utf-8"))
+    assert saved["units"][0]["text"] == text
+    assert "三哥" not in fake_ctx.pm.project_payload["characters"]
+
+
+@pytest.mark.parametrize(("duration", "accepted"), [(4, False), (8, True)])
+async def test_split_reference_alias_uses_the_final_owners_available_image_for_duration(
+    fake_ctx: ToolHarness, monkeypatch, set_video_request_facts, duration: int, accepted: bool
+) -> None:
+    rv_source(fake_ctx)
+    _veo_720p_facts(set_video_request_facts)
+    rv_character_sheet(fake_ctx, "张三", claimed=True)
+    text = "@[三哥] 起身。\n@[三哥]{我来了。}"
+    new_assets = [{"type": "character", "name": "三哥", "decision": "merge", "target": "张三", "reason": "同一人"}]
+
+    out = await run_rv_split(fake_ctx, monkeypatch, [rv_unit(text, duration=duration)], new_assets=new_assets)
+
+    assert (out.problem is None) is accepted, out
+    if accepted:
+        saved = json.loads(rv_script_plan_path(fake_ctx).read_text(encoding="utf-8"))
+        assert saved["units"][0]["text"] == text
+    else:
+        assert "生效档位" in said(out)
+        assert not rv_script_plan_path(fake_ctx).exists()
+
+
 async def test_split_reference_video_units_rejects_duration_off_reference_tier(
     fake_ctx: ToolHarness, monkeypatch, set_video_request_facts
 ) -> None:

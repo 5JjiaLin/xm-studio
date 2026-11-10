@@ -93,7 +93,7 @@ from lib.script.plan_new_assets import (
     NewAssetResolution,
     NewAssetsError,
     UnregisteredReferencesError,
-    planning_project,
+    plan_reference_validation,
     resolve_new_assets,
     unregistered_references,
 )
@@ -2328,14 +2328,22 @@ class ScriptGenerator:
         except ValidationError as exc:
             raise AdScriptRejected([f"广告参考剧本结构校验失败: {exc}"]) from exc
         raw_new_assets = [item.model_dump() for item in flat.new_assets]
-        planning = planning_project(self.project_json, raw_new_assets)
+        new_assets = self._resolve_ad_new_assets(raw_new_assets)
+        validation = plan_reference_validation(
+            self.project_json, raw_new_assets, [unit.model_dump() for unit in flat.units]
+        )
         problems: list[str] = []
-        for ordinal, source in enumerate(flat.units, start=1):
+        for ordinal, source in enumerate(validation.entries, start=1):
             try:
-                validate_unit_text(f"unit E{episode}U{ordinal}", source.text, planning, max_refs=None)
+                validate_unit_text(
+                    f"unit E{episode}U{ordinal}",
+                    source["text"],
+                    validation.project,
+                    max_refs=None,
+                    tolerated_speakers=validation.tolerated_speakers,
+                )
             except DraftViolation as exc:
                 problems.extend(str(item) for item in violation_items(exc) if item.code not in _AD_UNIT_REPLAN_CODES)
-        new_assets = self._resolve_ad_new_assets(raw_new_assets)
         if problems:
             raise AdScriptRejected(problems)
 

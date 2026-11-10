@@ -69,8 +69,11 @@ from lib.script.draft_quarantine import (
 from lib.script.draft_violation import DraftViolation, collect_violations
 from lib.script.plan_new_assets import (
     NEW_ASSETS_FIELD,
+    NewAssetsError,
+    asset_problem_violations,
     dedupe_new_assets,
     new_asset_violations,
+    plan_reference_validation,
     planning_project,
     with_new_assets,
 )
@@ -1296,25 +1299,33 @@ def collect_reference_flat_violations(
     （文件存在且产物清单认领，与内容确认面板、执行同判据）——正文解析不出时无从判档位，此时报出的
     也只会是同一个问题的另一种说法。
 
-    正文里的 ``@[名称]`` 须已登记或在本次新增项中：校验对着叠加了新增项的项目视图判，新增项
-    自身的处理决定另行收进整集违约。
+    正文引用按确认时的最终身份校验。新增资产决定非法时先报告根因，修正后再校验依赖身份的
+    引用与档位；不依赖身份的原文锚与台词量仍逐条校验。
     """
     # 台词口播量的语速与 prompt 侧同源：项目级覆盖优先，否则按语言默认。
     speech_rate_override = project_speech_rate_override(project)
-    planning = planning_project(project, new_assets)
-    hydrations = hydrate_reference_units(planning, project_path, flat_units)
+    validation = plan_reference_validation(project, new_assets, flat_units)
+    hydrations = (
+        hydrate_reference_units(validation.project, project_path, validation.entries)
+        if not validation.asset_problems
+        else [None] * len(validation.entries)
+    )
     violations: list[DraftViolation] = []
-    for index, (flat, hydration) in enumerate(zip(flat_units, hydrations, strict=True), start=1):
+    for index, (flat, hydration) in enumerate(zip(validation.entries, hydrations, strict=True), start=1):
         label = _reference_unit_label(episode, index)
         duration = flat["duration_seconds"]
         source_text = flat["source_text"]
         text = flat["text"]
-        with_reference_images = hydration.hydrated_generation_type == "r2v"
+        with_reference_images = hydration is not None and hydration.hydrated_generation_type == "r2v"
 
         def _check_text_and_tier(
             la: str = label, tx: str = text, d: int = duration, with_images: bool = with_reference_images
         ) -> None:
-            validate_unit_text(la, tx, planning, max_refs=caps.max_refs)
+            if validation.asset_problems:
+                return
+            validate_unit_text(
+                la, tx, validation.project, max_refs=caps.max_refs, tolerated_speakers=validation.tolerated_speakers
+            )
             _validate_unit_duration_tier(la, d, has_references=with_images, caps=caps)
 
         violations.extend(
@@ -1330,7 +1341,7 @@ def collect_reference_flat_violations(
                 item_id=_reference_unit_id(episode, index),
             )
         )
-    violations.extend(new_asset_violations(project, new_assets))
+    violations.extend(asset_problem_violations(validation.asset_problems))
     return violations
 
 
@@ -1341,6 +1352,7 @@ def build_reference_units_from_flat(
     episode: int,
     max_refs: int | None,
     unit_ids: Sequence[str],
+    new_assets: object = None,
 ) -> list[dict]:
     """把已校验通过的扁平产出派生为落盘的结构化 unit 表。
 
@@ -1350,10 +1362,19 @@ def build_reference_units_from_flat(
     ``collect_reference_flat_violations`` 确认无违约；此处仍复判一次正文，让「校验看到的
     文本」与「落盘的正文」出自同一次解析。
     """
+    validation = plan_reference_validation(project, new_assets, flat_units)
+    if validation.asset_problems:
+        raise NewAssetsError(validation.asset_problems)
     units: list[dict] = []
-    for index, flat in enumerate(flat_units, start=1):
+    for index, (flat, resolved) in enumerate(zip(flat_units, validation.entries, strict=True), start=1):
         unit_id = _reference_unit_id(episode, index, unit_ids)
-        validate_unit_text(f"unit {unit_id}", flat["text"], project, max_refs=max_refs)
+        validate_unit_text(
+            f"unit {unit_id}",
+            resolved["text"],
+            validation.project,
+            max_refs=max_refs,
+            tolerated_speakers=validation.tolerated_speakers,
+        )
         units.append(
             {
                 "unit_id": unit_id,
@@ -1444,6 +1465,7 @@ def reference_soft_violations(
     episode: int,
     voice: VoiceRenderSettings,
     unit_ids: Sequence[str] | None = None,
+    new_assets: object = None,
 ) -> list[SoftViolation]:
     """一份扁平产出的全部软违约（声音降级 + 未引用场景），拆分与草稿流共用的单一出口。
 
@@ -1454,6 +1476,11 @@ def reference_soft_violations(
     顺序固定为「声音在前、场景在后」：报告与回执并排比对时，同一份产物在不同路径上给出的
     行序不该抖动。
     """
+    validation = plan_reference_validation(project, new_assets, [{"text": text} for text in unit_texts])
+    if validation.asset_problems:
+        return []
+    unit_texts = [entry["text"] for entry in validation.entries]
+    project = validation.project
     return _reference_voice_warnings(
         unit_texts, project, voice, episode=episode, unit_ids=unit_ids
     ) + _reference_scene_warnings(unit_texts, project, episode=episode, unit_ids=unit_ids)
@@ -1495,10 +1522,13 @@ def _reference_soft_violation_lines(
     episode: int,
     voice: VoiceRenderSettings,
     unit_ids: Sequence[str] | None = None,
+    new_assets: object = None,
 ) -> list[str]:
     """一份扁平产出的软违约文本行（拆分回执用）。"""
     return render_soft_violation_lines(
-        reference_soft_violations(unit_texts, project, episode=episode, voice=voice, unit_ids=unit_ids)
+        reference_soft_violations(
+            unit_texts, project, episode=episode, voice=voice, unit_ids=unit_ids, new_assets=new_assets
+        )
     )
 
 
@@ -1839,9 +1869,10 @@ async def generate_reference_script_plan(
             source_language=project.get("source_language"),
             new_assets=new_assets,
         )
-        planning = planning_project(project, new_assets)
         unit_texts = [flat_unit["text"] for flat_unit in flat_units]
-        soft_violations = _reference_soft_violation_lines(unit_texts, planning, episode=episode, voice=split_caps.voice)
+        soft_violations = _reference_soft_violation_lines(
+            unit_texts, project, episode=episode, voice=split_caps.voice, new_assets=new_assets
+        )
         if violations:
             async with draft_locks.async_file_lock(draft_path):
                 report = await run_sync_transaction(
@@ -1869,13 +1900,14 @@ async def generate_reference_script_plan(
         )
         raw_units = build_reference_units_from_flat(
             flat_units,
-            planning,
+            project,
             episode=episode,
             max_refs=split_caps.max_refs,
             unit_ids=unit_ids,
+            new_assets=new_assets,
         )
         soft_violations = _reference_soft_violation_lines(
-            unit_texts, planning, episode=episode, voice=split_caps.voice, unit_ids=unit_ids
+            unit_texts, project, episode=episode, voice=split_caps.voice, unit_ids=unit_ids, new_assets=new_assets
         )
         async with draft_locks.async_file_lock(draft_path):
             try:

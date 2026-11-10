@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import pytest
 
 from lib.references.reference_catalog import build_reference_catalog
-from lib.script.plan_new_assets import NewAssetsError, planning_project, resolve_new_assets
+from lib.script.plan_new_assets import NewAssetsError, plan_reference_validation, planning_project, resolve_new_assets
 
 
 def _new(name: str, asset_type: str = "character", **fields: Any) -> dict[str, Any]:
@@ -99,6 +100,56 @@ def test_planning_accepts_resolved_derivative_without_mutating_project() -> None
     assert "Alice/赤裸上身" in catalog.reference_names("character")
     assert "赤裸上身" in catalog.reference_names("character")
     assert project["characters"]["Alice"]["derivatives"] == {}
+
+
+@pytest.mark.parametrize("derivative_first", [False, True])
+@pytest.mark.parametrize("base_name", ["José", "Jose\u0301"])
+def test_plan_validation_preserves_the_draft_and_resolves_chained_names_and_derivatives(
+    derivative_first: bool, base_name: str
+) -> None:
+    project: dict[str, Any] = {"characters": {}, "scenes": {}, "props": {}}
+    items = [
+        _new(base_name),
+        _derivative("雨衣", target=base_name),
+        _new("少年", decision="merge", target=base_name),
+        _new("小哥", decision="merge", target="少年"),
+        _new("路人", decision="skip"),
+    ]
+    if derivative_first:
+        items.reverse()
+    entries = [{"text": "@[小哥] 穿着@[雨衣]走过@[路人]。\n@[雨衣]{等我回来。}\n@[路人]{好。}"}]
+    original = copy.deepcopy((project, items, entries))
+
+    validation = plan_reference_validation(project, items, entries)
+
+    assert not validation.asset_problems
+    assert validation.entries[0]["text"] == ("@[José] 穿着@[José/雨衣]走过路人。\n@[José]{等我回来。}\n@[路人]{好。}")
+    assert validation.tolerated_speakers == ("路人",)
+    assert set(validation.project["characters"]) == {"José"}
+    assert "雨衣" in validation.project["characters"]["José"]["derivatives"]
+    assert (project, items, entries) == original
+
+
+@pytest.mark.parametrize("derivative_first", [False, True])
+@pytest.mark.parametrize("registered_name", ["Alice", "Álice"])
+def test_planning_keeps_derivative_of_a_base_registered_in_the_same_plan(
+    derivative_first: bool, registered_name: str
+) -> None:
+    project: dict[str, Any] = {"characters": {}, "scenes": {}, "props": {}}
+    items = [
+        _new(registered_name),
+        _derivative("换装形态", target=registered_name),
+    ]
+    if derivative_first:
+        items.reverse()
+
+    planning = planning_project(project, items)
+    catalog = build_reference_catalog(planning)
+
+    assert f"{registered_name}/换装形态" in catalog.reference_names("character")
+    assert {registered_name, "换装形态"} <= catalog.reference_names("character")
+    assert planning["characters"][registered_name]["derivatives"]["换装形态"]["description"] == "换装"
+    assert project == {"characters": {}, "scenes": {}, "props": {}}
 
 
 def test_a_derivative_differing_only_in_case_from_an_existing_derivative_is_taken() -> None:

@@ -469,15 +469,20 @@ def new_asset_violations(project: Mapping[str, Any], raw_items: object) -> list[
     try:
         resolve_new_assets(project, raw_items)
     except NewAssetsError as exc:
-        return [
-            DraftViolation(
-                f"{problem.message}；请改正该项的 decision / target，或改用 register / skip",
-                code=problem.code,
-                label=f"new_assets[{problem.index}]" if problem.index >= 0 else "new_assets",
-            )
-            for problem in exc.problems
-        ]
+        return asset_problem_violations(exc.problems)
     return []
+
+
+def asset_problem_violations(problems: Sequence[NewAssetProblem]) -> list[DraftViolation]:
+    """把解析错误转换为同一组可定位的草稿违约。"""
+    return [
+        DraftViolation(
+            f"{problem.message}；请改正该项的 decision / target，或改用 register / skip",
+            code=problem.code,
+            label=f"new_assets[{problem.index}]" if problem.index >= 0 else "new_assets",
+        )
+        for problem in problems
+    ]
 
 
 def unregistered_references(
@@ -553,7 +558,7 @@ def planning_project(project: Mapping[str, Any], raw_items: object) -> dict[str,
         # Invalid decisions are reported separately by new_asset_violations.
         overlay = copy.deepcopy(project)
     items, _problems = _parse_items(raw_items)
-    _registered, owners = _registered_names(project)
+    _registered, owners = _registered_names(overlay)
     for item in items:
         if item is None:
             continue
@@ -568,3 +573,36 @@ def planning_project(project: Mapping[str, Any], raw_items: object) -> dict[str,
         overlay[spec.bucket_key] = bucket
         owners[key] = item.type
     return overlay
+
+
+@dataclass(frozen=True)
+class PlanReferenceValidation:
+    """参考正文按确认时相同的资产决定投影；只供校验，不替换待审查原稿。"""
+
+    project: dict[str, Any]
+    entries: list[dict[str, Any]]
+    tolerated_speakers: tuple[str, ...]
+    asset_problems: tuple[NewAssetProblem, ...] = ()
+
+
+def plan_reference_validation(
+    project: Mapping[str, Any], raw_items: object, entries: Sequence[Mapping[str, Any]]
+) -> PlanReferenceValidation:
+    """用最终引用身份校验图数、说话人与时长，避免临时称呼改变能力判断。
+
+    处理决定非法时返回原始输入与错误；依赖资产身份的校验须等待决定修正，不能确认或登记。
+    """
+    try:
+        resolution = resolve_new_assets(project, raw_items)
+    except NewAssetsError as exc:
+        return PlanReferenceValidation(
+            copy.deepcopy(dict(project)), copy.deepcopy(list(entries)), (), tuple(exc.problems)
+        )
+    overlay = copy.deepcopy(dict(project))
+    resolution.apply_to_project(overlay)
+    speakers = tuple(
+        outcome.name
+        for (asset_type, _name), outcome in resolution.outcomes.items()
+        if asset_type == "character" and outcome.kind == "skip"
+    )
+    return PlanReferenceValidation(overlay, resolution.rewrite_entries(entries), speakers)
