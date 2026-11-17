@@ -130,7 +130,7 @@ class ProductionService:
                 if current["status"] != "confirmed":
                     if current.get("script_overwrite"):
                         raise ProductionError("script_overwrite_requires_review")
-                    await review.confirm(project, episode)
+                    await review.confirm(project, episode, plan_fingerprint=fingerprint)
                 # Image generation is an explicit action after prompt review. Video
                 # prompt authoring is a separate user action on the video step.
                 state["basis"] = await asyncio.to_thread(self._script_hash, project, episode)

@@ -375,8 +375,10 @@ class PlanNewAsset(BaseModel):
 
     @model_validator(mode="after")
     def _registered_asset_needs_visual_input(self) -> "PlanNewAsset":
-        if self.decision == "register" and not self.description.strip():
+        if self.decision == "register" and not self.description.strip() and not self.generation_prompt.strip():
             raise ValueError("register 必须提供非空外观描述，才能生成完整生图提示词")
+        if self.decision == "derivative" and not self.description.strip():
+            raise ValueError("derivative 必须提供非空变化描述（图片编辑指令）")
         return self
 
 
@@ -870,6 +872,9 @@ class ReferenceVideoUnit(BaseModel):
     prompt_format_version: SkipJsonSchema[Literal["timeline_v1"] | None] = Field(
         default=None, exclude_if=lambda value: value is None, description="服务端编写格式版本；不包含镜头内容"
     )
+    prompt_policy_version: SkipJsonSchema[str | None] = Field(
+        default=None, exclude_if=lambda value: value is None, description="服务端提示词策略版本；不包含镜头内容"
+    )
     unit_id: str = Field(description="格式 E{集}U{序号}")
     text: str = Field(description="单元正文，可包含 @[商品]/@[角色]/@[场景]/@[道具] 引用；迁移问题壳可为空")
     duration_seconds: int = Field(
@@ -972,6 +977,9 @@ class ReferenceScriptPlanDraft(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     units: list[ReferenceScriptPlanUnit] = Field(description="video_unit 列表")
+    # Server-owned provenance. Old plans stay unversioned; editor saves cannot
+    # opt them in or downgrade a plan that was generated under this policy.
+    prompt_policy_version: SkipJsonSchema[str | None] = Field(default=None, exclude_if=lambda value: value is None)
     new_assets: list[PlanNewAsset] = Field(
         default_factory=list, description="本集规划引用的、尚未登记的角色 / 场景 / 道具及其处理决定"
     )

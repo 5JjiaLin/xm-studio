@@ -26,6 +26,7 @@ from server.services.project.production import ProductionError, ProductionServic
 
 router = APIRouter()
 source_router = APIRouter()
+settings_router = APIRouter()
 
 
 def service(request: Request) -> ProductionService:
@@ -406,12 +407,12 @@ def _feedback_store(request: Request):
     return register_root(service(request).projects.data_root)
 
 
-@router.get("/production/feedback/settings")
+@settings_router.get("/production/feedback/settings")
 async def feedback_settings(request: Request, user: CurrentUser):
     return await asyncio.to_thread(lambda: _feedback_store(request).settings())
 
 
-@router.put("/production/feedback/settings")
+@settings_router.put("/production/feedback/settings")
 async def save_feedback_settings(body: FeedbackSettingsRequest, request: Request, user: CurrentUser):
     return await run_sync_transaction(lambda: _feedback_store(request).save_settings(body.model_dump()))
 

@@ -51,6 +51,43 @@ class TestCustomTextBackend:
 
         assert backend.capabilities is delegate.capabilities
 
+    def test_configuration_fingerprint_includes_endpoint_and_path_overrides(self):
+        delegate = MagicMock()
+        delegate.capabilities = {TextCapability.TEXT_GENERATION}
+        delegate.configuration_fingerprint = "https://relay.example/v1|capabilities"
+        first = CustomTextBackend(
+            provider_id="custom-3",
+            delegate=delegate,
+            model="m",
+            endpoint="openai-chat",
+            path_overrides={"generate": "/a"},
+        )
+        same = CustomTextBackend(
+            provider_id="custom-3",
+            delegate=delegate,
+            model="m",
+            endpoint="openai-chat",
+            path_overrides={"generate": "/a"},
+        )
+        changed_path = CustomTextBackend(
+            provider_id="custom-3",
+            delegate=delegate,
+            model="m",
+            endpoint="openai-chat",
+            path_overrides={"generate": "/b"},
+        )
+        changed_endpoint = CustomTextBackend(
+            provider_id="custom-3",
+            delegate=delegate,
+            model="m",
+            endpoint="openai-responses",
+            path_overrides={"generate": "/a"},
+        )
+
+        assert first.configuration_fingerprint == same.configuration_fingerprint
+        assert first.configuration_fingerprint != changed_path.configuration_fingerprint
+        assert first.configuration_fingerprint != changed_endpoint.configuration_fingerprint
+
     async def test_generate_delegates(self):
         expected_result = TextGenerationResult(
             text="hello world",

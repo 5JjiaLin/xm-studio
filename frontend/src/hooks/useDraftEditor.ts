@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { API, ApiRequestError } from "@/api";
+import { useLeaveGuard } from "@/components/shared/edit-unit/LeaveGuard";
 import { draftRepairResourceId, enqueueDraftRepair } from "@/actions/generation";
 import type { DraftRepairTaskResult, SaveEpisodeDraftResult, ScriptReviewQuarantine } from "@/types";
 import { useAppStore } from "@/stores/app-store";
@@ -27,6 +28,7 @@ interface DraftEditorOptions<T> {
 }
 
 interface Synced<T> {
+  scope: string;
   revision: string | null;
   base: T | null;
   edited: T | null;
@@ -44,7 +46,7 @@ export interface DraftEditorHandle<T> {
   /** 本份草稿的 AI 修复在提交、排队或执行中。 */
   repairing: boolean;
   /** 保存并校验；违约清零即采用。 */
-  save: () => Promise<void>;
+  save: () => Promise<boolean>;
   /** 提交 AI 修复（修复已保存的草稿）；返回 `true` 表示已提交或已落定，供调用方收起弹窗。 */
   repair: (instructions: string) => Promise<boolean>;
   /** 丢弃草稿；返回是否成功，供调用方决定是否收起确认框。 */
@@ -73,7 +75,7 @@ export function diagnosticCode(err: unknown): string | null {
  * 待修复草稿的就地手修：本地编辑、保存并校验（违约清零即采用）、AI 修复、丢弃。
  *
  * 服务端草稿变了（Agent 写入、另一处保存）而本地没有未保存编辑时，直接采用新的草稿；有未保存编辑时
- * 保留编辑并标记 `outdated`，保存会以并发冲突被拒，届时载入最新草稿。
+ * 保留编辑并标记 `outdated`，保存会以并发冲突被拒，本地编辑保留至用户明确载入最新草稿。
  *
  * AI 修复以排队文本任务执行：占用本份草稿的任务槽期间 `repairing` 为真。本界面提交的、或看到在跑的
  * 那次修复到达终态时，提示结果并通知调用方刷新；采用后草稿视图会消失，因此按任务 ID 跟踪。
@@ -81,10 +83,21 @@ export function diagnosticCode(err: unknown): string | null {
 export function useDraftEditor<T>({ projectName, episode, view, narrow, onSettled }: DraftEditorOptions<T>): DraftEditorHandle<T> {
   const { t } = useTranslation("dashboard");
   const pushToast = useAppStore((s) => s.pushToast);
+  const scope = JSON.stringify([projectName, episode, view?.doc_type ?? null]);
+  const scopeController = useRef<AbortController | null>(null);
+  const pendingMutation = useRef<AbortSignal | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    scopeController.current = controller;
+    return () => controller.abort();
+  }, [scope]);
   const [synced, setSynced] = useState<Synced<T> | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [discarding, setDiscarding] = useState(false);
-  const [watchedRepairId, setWatchedRepairId] = useState<string | null>(null);
+  const [savingScope, setSavingScope] = useState<string | null>(null);
+  const [discardingScope, setDiscardingScope] = useState<string | null>(null);
+  const saving = savingScope === scope;
+  const discarding = discardingScope === scope;
+  const [watched, setWatched] = useState<{ scope: string; id: string } | null>(null);
+  const watchedRepairId = watched?.scope === scope ? watched.id : null;
 
   const repairResourceId = view != null ? draftRepairResourceId(episode, view.doc_type) : null;
   const activeRepairs = useActiveResourceIds("text_draft_repair", projectName);
@@ -92,7 +105,7 @@ export function useDraftEditor<T>({ projectName, episode, view, narrow, onSettle
   const latestRepair = useLatestTasksByResource(projectName, "text_draft_repair").get(repairResourceId ?? "");
   // 看到本份草稿有在跑的修复（别处提交、或页面重新打开）时同样跟踪它。
   if (latestRepair != null && isOccupyingStatus(latestRepair.status) && watchedRepairId !== latestRepair.task_id) {
-    setWatchedRepairId(latestRepair.task_id);
+    setWatched({ scope, id: latestRepair.task_id });
   }
   const watchedRepair = useTaskRowsByIds(watchedRepairId != null ? [watchedRepairId] : []).get(watchedRepairId ?? "");
 
@@ -100,20 +113,20 @@ export function useDraftEditor<T>({ projectName, episode, view, narrow, onSettle
   const adoptView = useCallback(
     (next: ScriptReviewQuarantine) => {
       const base = narrow(next.content);
-      setSynced({ revision: next.revision, base, edited: clone(base) });
+      setSynced({ scope, revision: next.revision, base, edited: clone(base) });
     },
-    [narrow],
+    [narrow, scope],
   );
 
   // 服务端草稿变化时的派生状态（render 期同步）：无未保存编辑才采用。
-  if (view != null && (synced == null || (synced.revision !== incomingRevision && !isDirty(synced)))) {
+  if (view != null && (synced == null || synced.scope !== scope || (synced.revision !== incomingRevision && !isDirty(synced)))) {
     adoptView(view);
   }
   if (view == null && synced != null) {
     setSynced(null);
   }
 
-  const current = view != null ? synced : null;
+  const current = view != null && synced?.scope === scope ? synced : null;
   const dirty = current != null && isDirty(current);
   const outdated = current != null && current.revision !== incomingRevision;
 
@@ -126,8 +139,11 @@ export function useDraftEditor<T>({ projectName, episode, view, narrow, onSettle
   }, [view, adoptView]);
 
   const save = useCallback(async () => {
-    if (view == null || current?.edited == null) return;
-    setSaving(true);
+    if (view == null || current?.edited == null || outdated || saving || discarding || repairing) return false;
+    const signal = scopeController.current?.signal;
+    if (signal == null || signal.aborted || pendingMutation.current === signal) return false;
+    pendingMutation.current = signal;
+    setSavingScope(scope);
     try {
       const result: SaveEpisodeDraftResult = await API.saveEpisodeDraft(
         projectName,
@@ -136,29 +152,37 @@ export function useDraftEditor<T>({ projectName, episode, view, narrow, onSettle
         current.edited,
         current.revision ?? "",
       );
+      if (signal?.aborted) return false;
       if (result.adopted) {
+        setSynced({ ...current, base: clone(current.edited) });
         pushToast(t("draft_adopted_toast"), "success");
       } else if (result.draft != null) {
         adoptView(result.draft);
         pushToast(t("draft_saved_with_violations_toast", { count: result.draft.violations.length }), "warning");
       }
       onSettled();
+      return true;
     } catch (err) {
+      if (signal?.aborted) return false;
       if (diagnosticCode(err) === "revision_conflict") {
-        adoptView(view);
         pushToast(t("draft_conflict_toast"), "warning");
         onSettled();
       } else {
         pushToast(err instanceof Error && err.message ? err.message : t("draft_save_failed_toast"), "error");
       }
+      return false;
     } finally {
-      setSaving(false);
+      if (pendingMutation.current === signal) pendingMutation.current = null;
+      if (!signal?.aborted) setSavingScope(null);
     }
-  }, [view, current, projectName, episode, adoptView, onSettled, pushToast, t]);
+  }, [view, current, projectName, episode, adoptView, onSettled, pushToast, t, scope, outdated, saving, discarding, repairing]);
+
+  useLeaveGuard({ dirty, saving, save, discard: reloadLatest });
 
   const repair = useCallback(
     async (instructions: string): Promise<boolean> => {
-      if (view == null) return false;
+      if (view == null || dirty || outdated || saving || discarding) return false;
+      const signal = scopeController.current?.signal;
       if (isResourceBusy("text_draft_repair", projectName, draftRepairResourceId(episode, view.doc_type))) {
         pushToast(t("draft_repair_busy"), "error");
         return false;
@@ -171,11 +195,12 @@ export function useDraftEditor<T>({ projectName, episode, view, narrow, onSettle
           current?.revision ?? view.revision ?? "",
           instructions.trim() || null,
         );
-        if (taskIds[0] != null) setWatchedRepairId(taskIds[0]);
+        if (signal?.aborted) return true;
+        if (taskIds[0] != null) setWatched({ scope, id: taskIds[0] });
         return true;
       } catch (err) {
+        if (signal?.aborted) return false;
         if (diagnosticCode(err) === "revision_conflict") {
-          adoptView(view);
           pushToast(t("draft_conflict_toast"), "warning");
           onSettled();
           return true;
@@ -184,7 +209,7 @@ export function useDraftEditor<T>({ projectName, episode, view, narrow, onSettle
         return false;
       }
     },
-    [view, current, projectName, episode, adoptView, onSettled, pushToast, t],
+    [view, current, projectName, episode, scope, dirty, outdated, saving, discarding, onSettled, pushToast, t],
   );
 
   // 跟踪的修复到达终态：提示结果，并让调用方重拉（采用后正式内容已变，否则草稿已写回）。每次任务只回报一次。
@@ -206,18 +231,22 @@ export function useDraftEditor<T>({ projectName, episode, view, narrow, onSettle
     onSettled();
   }, [watchedRepair, onSettled, pushToast, t]);
 
-  /** 丢弃界面上呈现的那一版草稿；返回 `true` 表示确认框可关闭。草稿已在别处更新时不丢弃，载入最新版本供用户重新判断。 */
+  /** 丢弃界面上呈现的那一版草稿；返回 `true` 表示确认框可关闭。草稿已在别处更新时不丢弃，保留本地编辑并刷新服务端视图供用户重新判断。 */
   const discard = useCallback(async (): Promise<boolean> => {
-    if (view == null) return false;
-    setDiscarding(true);
+    if (view == null || saving || discarding || repairing) return false;
+    const signal = scopeController.current?.signal;
+    if (signal == null || signal.aborted || pendingMutation.current === signal) return false;
+    pendingMutation.current = signal;
+    setDiscardingScope(scope);
     try {
       await API.discardEpisodeDraft(projectName, episode, view.doc_type, current?.revision ?? view.revision);
+      if (signal?.aborted) return true;
       pushToast(t("draft_discarded_toast"), "success");
       onSettled();
       return true;
     } catch (err) {
+      if (signal?.aborted) return false;
       if (diagnosticCode(err) === "revision_conflict") {
-        adoptView(view);
         pushToast(t("draft_conflict_toast"), "warning");
         onSettled();
         return true;
@@ -226,9 +255,10 @@ export function useDraftEditor<T>({ projectName, episode, view, narrow, onSettle
       onSettled();
       return false;
     } finally {
-      setDiscarding(false);
+      if (pendingMutation.current === signal) pendingMutation.current = null;
+      if (!signal?.aborted) setDiscardingScope(null);
     }
-  }, [view, current, projectName, episode, adoptView, onSettled, pushToast, t]);
+  }, [view, current, projectName, episode, scope, saving, discarding, repairing, onSettled, pushToast, t]);
 
   return {
     content: current?.edited ?? null,

@@ -984,6 +984,7 @@ class CostEstimationService:
                     try:
                         projection = await projector.project_hydrated(
                             project=project,
+                            script={"video_units": units},
                             unit=unit,
                             hydration=hydration,
                             options=ReferenceRequestOptions(),

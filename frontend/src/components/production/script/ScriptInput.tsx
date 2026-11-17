@@ -23,7 +23,7 @@ function initialInput() {
   }
   catch { return DEFAULT_INPUT; }
 }
-export function ScriptInput({ projectName, episode: targetEpisode, createOnly = false, source = "", disabled = false, readOnly = false }: { projectName?: string; episode?: number; createOnly?: boolean; source?: string; disabled?: boolean; readOnly?: boolean }) {
+export function ScriptInput({ projectName, episode: targetEpisode, createOnly = false, source = "", disabled = false, readOnly = false, repairEnabled = false }: { projectName?: string; episode?: number; createOnly?: boolean; source?: string; disabled?: boolean; readOnly?: boolean; repairEnabled?: boolean }) {
   const draftKey = projectName ? `xm:script-draft:${projectName}:${targetEpisode}` : "xm:script-draft";
   const [initial] = useState(() => {
     if (!projectName) return initialInput();
@@ -34,6 +34,7 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
   const [, navigate] = useLocation();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [repairOnce, setRepairOnce] = useState(false);
   const [value, setValue] = useState(initial);
   const [createdName, setCreatedName] = useState<string | null>(projectName ?? null);
   const [createdEpisode, setCreatedEpisode] = useState<number | null>(targetEpisode ?? null);
@@ -78,7 +79,8 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
     if (target.episode == null) return;
     setBusy(true);
     try {
-      await enqueueScriptPlan(target.name, target.episode, {});
+      await enqueueScriptPlan(target.name, target.episode, repairEnabled && repairOnce ? { repair_once: true } : {});
+      setRepairOnce(false);
       sessionStorage.removeItem(draftKey);
       navigate(productionPath(target.name, "breakdown", target.episode));
     } catch (e) { setError(errMsg(e)); }
@@ -129,6 +131,7 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
     </div>
     }
     {readOnly && <p className="text-sm text-muted-foreground">{t("whole_script_source_readonly")}</p>}
+    {!createOnly && repairEnabled && <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={repairOnce} onChange={(event) => setRepairOnce(event.target.checked)} disabled={busy || disabled} />{t("production_repair_once")}</label>}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
     <p className="text-sm text-muted-foreground">{busy ? t("common:loading") : createOnly ? t("management_create_hint") : t("production_text_cost_unknown")}</p>
   </form>;

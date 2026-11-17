@@ -16,6 +16,7 @@ from server.routers import production
 from server.services.presentation.jianying_delivery import delivery_store, execute_delivery
 from server.services.project.production import ProductionService
 from tests.auth_deps import override_auth
+from tests.fakes import use_jianying_compatibility_ready, use_jianying_process_state, use_production_generation_queue
 from tests.integration.server.services.presentation.timeline_render_support import edited_timeline, setup_project
 
 
@@ -29,12 +30,12 @@ async def delivery_client(tmp_path, monkeypatch, file_db_factory):
     root = tmp_path / "剪映 草稿"
     root.mkdir()
     atomic_write_json(root / "root_meta_info.json", {"all_draft_store": [], "future": "keep"})
-    monkeypatch.setattr(local, "compatibility", lambda _: {"ready": True})
-    monkeypatch.setattr(local, "process_state", lambda: "running")
+    use_jianying_compatibility_ready(monkeypatch)
+    use_jianying_process_state(monkeypatch, "running")
     store = delivery_store(pm)
     store.save_settings(local.LocalSettings(enabled=True, app_path=str(tmp_path), draft_root=str(root)))
     queue = GenerationQueue(session_factory=file_db_factory, project_manager=pm)
-    monkeypatch.setattr(production, "get_generation_queue", lambda: queue)
+    use_production_generation_queue(monkeypatch, queue)
     app = FastAPI()
     app.state.production_service = svc
     override_auth(app)
@@ -64,7 +65,7 @@ async def test_explicit_queue_wait_resume_idempotency_and_download(delivery_clie
     assert again.json()["delivery"]["delivery_id"] == record["delivery_id"]
     await execute_delivery(pm, record["delivery_id"])
     assert (await client.get(URL)).json()["delivery"]["state"] == "waiting_for_exit"
-    monkeypatch.setattr(local, "process_state", lambda: "stopped")
+    use_jianying_process_state(monkeypatch, "stopped")
     resumed = await client.post(URL, json={})
     assert resumed.json()["delivery"]["state"] == "delivered"
     target = Path(record["draft_root"]) / record["folder"] / "draft_info.json"

@@ -50,7 +50,7 @@ interface InvalidDraftBarProps {
   repairing: boolean;
   onSave: () => void;
   onReloadLatest: () => void;
-  onHandToAgent: () => void;
+  onHandToAgent?: () => void;
   /** AI 修复已保存的草稿；返回 `true` 时收起弹窗。 */
   onRepair: (instructions: string) => Promise<boolean>;
   onDiscard: () => void;
@@ -61,7 +61,7 @@ interface InvalidDraftBarProps {
 /**
  * 待修复草稿的状态条：违约计数与逐条目跳转、整集层面的违约计数。有违约时修复入口以「交给 Agent」为主、
  * 「AI 修复」为次，另有「保存并校验」与「丢弃草稿」，脚本规划草稿另有「重新规划」。违约清零时保存即可采用，
- * 「保存并校验」成为主按钮、即便没有改动也允许保存，不再提供「AI 修复」。有未保存的修改时，「交给 Agent」与
+ * 「保存并校验」成为主按钮，不再提供「AI 修复」。所有可编辑且未过期的草稿，即便没有改动也能重新校验。有未保存的修改时，「交给 Agent」与
  * 「AI 修复」都不可用：它们读取的是已保存的草稿，原因写在状态条第二行。
  */
 export function InvalidDraftBar({
@@ -87,7 +87,7 @@ export function InvalidDraftBar({
   const { t } = useTranslation("dashboard");
   const [repairOpen, setRepairOpen] = useState(false);
   const clean = violationCount === 0;
-  const canSave = editable && !busy && (dirty || clean);
+  const canSave = editable && !busy && !outdated;
   const saveIcon = saving ? (
     <Loader2 aria-hidden data-icon="inline-start" className="animate-spin" />
   ) : (
@@ -145,7 +145,7 @@ export function InvalidDraftBar({
             </span>
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {editable && !clean && (
             <Button variant="outline" size="sm" onClick={onSave} disabled={!canSave}>
               {saveIcon}
@@ -153,7 +153,7 @@ export function InvalidDraftBar({
             </Button>
           )}
           {!clean && (
-            <Button variant="outline" size="sm" onClick={() => setRepairOpen(true)} disabled={busy || dirty}>
+            <Button variant="outline" size="sm" onClick={() => setRepairOpen(true)} disabled={busy || dirty || outdated}>
               {repairing ? (
                 <Loader2 aria-hidden data-icon="inline-start" className="animate-spin" />
               ) : (
@@ -162,10 +162,10 @@ export function InvalidDraftBar({
               {repairing ? t("draft_repairing") : t("draft_ai_repair")}
             </Button>
           )}
-          <Button variant={clean ? "outline" : "default"} size="sm" onClick={onHandToAgent} disabled={busy || dirty}>
+          {onHandToAgent && <Button variant={clean ? "outline" : "default"} size="sm" onClick={onHandToAgent} disabled={busy || dirty || outdated}>
             <Bot aria-hidden data-icon="inline-start" />
             {t("draft_hand_to_agent")}
-          </Button>
+          </Button>}
           {editable && clean && (
             <Button size="sm" onClick={onSave} disabled={!canSave}>
               {saveIcon}
@@ -264,7 +264,7 @@ function DraftRepairDialog({ repairing, onSubmit, onClose }: DraftRepairDialogPr
 
 interface AgentDraftBarProps {
   busy: boolean;
-  onFinish: () => void;
+  onFinish?: () => void;
   onDiscard: () => void;
 }
 
@@ -284,10 +284,10 @@ export function AgentDraftBar({ busy, onFinish, onDiscard }: AgentDraftBarProps)
         <Button variant="destructive" size="xs" onClick={onDiscard} disabled={busy}>
           {t("draft_agent_discard")}
         </Button>
-        <Button size="sm" onClick={onFinish} disabled={busy}>
+        {onFinish && <Button size="sm" onClick={onFinish} disabled={busy}>
           <Bot aria-hidden data-icon="inline-start" />
           {t("draft_agent_finish")}
-        </Button>
+        </Button>}
       </div>
     </header>
   );

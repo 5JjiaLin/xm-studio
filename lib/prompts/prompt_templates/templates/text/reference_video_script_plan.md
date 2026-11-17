@@ -33,6 +33,7 @@ slots:
   max_reference_images: 单个视频单元的参考图上限；不限时传 null
   episode_target_duration: 单集目标秒数；未设置时传 null
   instructions: 附加指令正文；缺值传 null
+  drama_detail_enabled: 仅剧情参考生视频启用真人短剧资产描述补充规范
 protected: false
 ---
 # 角色与任务
@@ -123,6 +124,9 @@ protected: false
 - 资产外观信息来自登记文本，不代表已经看过参考图片。附加指令若提供人工核对的图像事实，按其来源与对应图片理解；图片更换后旧事实需重新核对。“图中未出现”不等于剧情世界中不存在。图文初态冲突应在内容确认时解决，不能静默改台词或补剧情。
 
 {{ partial("shared/reference_video_new_assets_rule") }}
+{% if drama_detail_enabled %}
+{{ partial("shared/reference_video_new_assets_drama_detail") }}
+{% endif %}
 {% if instructions %}
 
 {{ partial("shared/additional_instructions") }}

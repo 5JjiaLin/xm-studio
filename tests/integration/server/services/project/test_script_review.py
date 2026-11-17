@@ -17,6 +17,7 @@ from lib.artifacts.artifact_activation import activate_artifact_target_state
 from lib.artifacts.artifact_manifest import ArtifactKey, ArtifactManifestEntry, ProjectArtifactManifestAdapter
 from lib.artifacts.version_manager import VersionManager
 from lib.config.resolver import ConfigResolver
+from lib.episode.episode_source_commands import set_episode_source_text
 from lib.generation.video_request_facts import VideoRequestFactsFailure
 from lib.i18n import _ as i18n_message
 from lib.infra.json_io import atomic_write_json
@@ -174,6 +175,85 @@ def _write_rv_script_plan(pm: ProjectManager, content: dict) -> Path:
     return path
 
 
+@pytest.mark.parametrize("policy", [None, "drama_detail_v1"])
+async def test_content_save_cannot_upgrade_or_downgrade_persisted_policy(tmp_path, video_request_facts, policy):
+    pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
+    original = _rv_script_plan()
+    if policy:
+        original["prompt_policy_version"] = policy
+    path = _write_rv_script_plan(pm, original)
+    edited = {**original, "prompt_policy_version": None if policy else "drama_detail_v1"}
+    edited["units"][0]["text"] += "\n@[阿离] 抬头。"
+    await _service(pm).save_content("demo", 1, edited)
+    assert json.loads(path.read_text()).get("prompt_policy_version") == policy
+
+
+@pytest.mark.parametrize(("asset_type", "description"), [
+    ("character", "男性，身穿黑色军大衣。发型、肤色与年龄未交代，待确认。"),
+    ("prop", "银色金属针，一掌长，刻有卷枝纹样。"),
+])
+async def test_policy_confirm_rejects_incomplete_design_after_manual_save(
+    tmp_path, video_request_facts, asset_type, description,
+):
+    pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
+    plan = {**_rv_script_plan(), "prompt_policy_version": "drama_detail_v1", "new_assets": [{
+        "type": asset_type, "name": "新资产", "decision": "register", "description": description,
+        "reason": "未明确的外观由美术设计补全。",
+    }]}
+    path = _write_rv_script_plan(pm, plan)
+    await _service(pm).save_content("demo", 1, {**plan, "prompt_policy_version": None})
+    before = path.read_bytes()
+    with pytest.raises(ScriptReviewError):
+        await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
+    assert path.read_bytes() == before
+    assert "新资产" not in pm.load_project("demo")["characters" if asset_type == "character" else "props"]
+    assert not (pm.get_project_path("demo") / "scripts/episode_1.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["fabricated", "reverse", "unknown_speaker"])
+async def test_screenplay_confirm_rejects_unprovable_source_without_writing(tmp_path, video_request_facts, failure):
+    pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
+    source = "阿离：别动。\n\n裴与：放下剑。" if failure != "unknown_speaker" else "UNKNOWN: Stay."
+    set_episode_source_text(pm, "demo", 1, source, source_kind="screenplay")
+    if failure == "unknown_speaker":
+        units = [{"unit_id": "E1U01", "duration_seconds": 8, "source_text": source, "text": "@[阿离]{Stay.}"}]
+    else:
+        units = [{"unit_id": f"E1U0{i + 1}", "duration_seconds": 8, "source_text": line,
+                  "text": f"@[{name}]{{{speech}}}"}
+                 for i, (line, name, speech) in enumerate([
+                     ("阿离：别动。", "阿离", "别动。"), ("裴与：放下剑。", "裴与", "放下剑。"),
+                 ])]
+        if failure == "reverse":
+            units.reverse()
+        else:
+            units[0]["source_text"] = "阿离跳上屋顶。"
+    path = _write_rv_script_plan(pm, {"units": units})
+    before = path.read_bytes()
+    with pytest.raises(ScriptReviewError):
+        await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
+    assert path.read_bytes() == before
+    assert not (pm.get_project_path("demo") / "scripts/episode_1.json").exists()
+
+
+async def test_screenplay_confirm_registers_new_character_alias_and_keeps_dialogue(tmp_path, video_request_facts):
+    pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
+    source = "△吉迪恩转身。\nGIDEON: Come here."
+    set_episode_source_text(pm, "demo", 1, source, source_kind="screenplay")
+    text = "@[吉迪恩] 转身。@[吉迪恩]{Come here.}"
+    _write_rv_script_plan(pm, {"units": [{
+        "unit_id": "E1U01", "duration_seconds": 8, "source_text": source, "text": text,
+    }], "new_assets": [{
+        "type": "character", "name": "吉迪恩", "decision": "register", "description": "宽肩男性",
+        "reason": "首次出场", "aliases": ["GIDEON"],
+    }]})
+    await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
+    project = pm.load_project("demo")
+    assert project["characters"]["吉迪恩"]["aliases"] == ["GIDEON"]
+    script = json.loads((pm.get_project_path("demo") / "scripts/episode_1.json").read_text())
+    assert script["video_units"][0]["text"] == text
+    assert script["video_units"][0]["pending_authoring"] is True
+
+
 def test_content_fingerprint_of_data_matches_path_based_fingerprint(tmp_path: Path):
     """对同一份内容，从已解析对象取的指纹须与对文件路径取的指纹相同——两者共用同一套
     规范化逻辑，调用方才能安全地用前者替代"读入内存后再对路径复核一次"的二次读盘。
@@ -299,7 +379,7 @@ class TestDramaGateFlow:
         assert script_review.review_status(project_path, project, 1) == "pending_review"
 
         # 确认 → 放行
-        confirmed = await svc.confirm("demo", 1)
+        confirmed = await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert confirmed["status"] == "confirmed"
         assert confirmed["confirmed_at"]
         project = pm.load_project("demo")
@@ -312,7 +392,7 @@ class TestDramaGateFlow:
         svc = _service(pm)
         project_path = pm.get_project_path("demo")
         _write_script_plan(pm, "drama", _admitted_drama_script_plan())
-        await svc.confirm("demo", 1)
+        await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert (await svc.get_state("demo", 1))["status"] == "confirmed"
 
         write_quarantine(
@@ -326,7 +406,7 @@ class TestDramaGateFlow:
         assert (await svc.get_state("demo", 1))["status"] == "pending_review"
         assert script_review.review_status(project_path, pm.load_project("demo"), 1) == "pending_review"
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert exc.value.code == "quarantined"
 
         clear_quarantine(project_path, 1, QUARANTINE_KIND_DRAMA_SCRIPT_PLAN)
@@ -336,7 +416,7 @@ class TestDramaGateFlow:
         pm = _make_project(tmp_path, "drama")
         svc = _service(pm)
         path = _write_script_plan(pm, "drama", _admitted_drama_script_plan())
-        await svc.confirm("demo", 1)
+        await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         before = path.read_bytes()
 
         edited = _admitted_drama_script_plan()
@@ -355,7 +435,7 @@ class TestDramaGateFlow:
         pm = _make_project(tmp_path, "drama")
         svc = _service(pm)
         path = _write_script_plan(pm, "drama", _admitted_drama_script_plan())
-        await svc.confirm("demo", 1)
+        await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         write_quarantine(
             pm.get_project_path("demo"),
             1,
@@ -375,7 +455,7 @@ class TestDramaGateFlow:
         pm = _make_project(tmp_path, "drama")
         svc = _service(pm)
         _write_script_plan(pm, "drama", _admitted_drama_script_plan())
-        await svc.confirm("demo", 1)
+        await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         rerun = _admitted_drama_script_plan()
         rerun["scenes"][0]["scene_description"] = "雨势渐急，阿离仍站在屋檐下"
@@ -436,7 +516,7 @@ class TestDramaGateFlow:
         saved = json.loads(path.read_text(encoding="utf-8"))
         assert saved["scenes"][0]["needs_replan"] is True
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert exc.value.code == "speech_admission"
         assert exc.value.admission is not None
         assert exc.value.admission.problems[0].code == "needs_replan"
@@ -446,7 +526,7 @@ class TestDramaGateFlow:
         pm = _make_project(tmp_path, "drama")
         svc = _service(pm)
         path = _write_script_plan(pm, "drama", _admitted_drama_script_plan())
-        await svc.confirm("demo", 1)
+        await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         # 同内容、不同缩进 / 键序重写
         path.write_text(json.dumps(_admitted_drama_script_plan(), ensure_ascii=False, indent=4), encoding="utf-8")
@@ -462,7 +542,7 @@ async def _confirm_over_existing_script(pm: ProjectManager) -> dict:
     """该集已有正式脚本时按覆盖清单的版本认可覆盖并确认。"""
     svc = _service(pm)
     revision = (await svc.get_state("demo", 1))["script_overwrite"]["revision"]
-    return await svc.confirm("demo", 1, overwrite_revision=revision)
+    return await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm), overwrite_revision=revision)
 
 
 def _formal_script(pm: ProjectManager) -> dict:
@@ -492,7 +572,7 @@ class TestConfirmMaterializesScript:
         svc = _service(pm)
 
         assert (await svc.get_state("demo", 1))["script_overwrite"] is None
-        state = await svc.confirm("demo", 1)
+        state = await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         assert state["status"] == "confirmed"
         script = _formal_script(pm)
@@ -510,7 +590,7 @@ class TestConfirmMaterializesScript:
         pm = _make_project(tmp_path, "narration")
         _write_script_plan(pm, "narration", _narration_script_plan())
 
-        await _service(pm).confirm("demo", 1)
+        await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         [segment] = _formal_script(pm)["segments"]
         assert segment["segment_id"] == "E1S01"
@@ -523,7 +603,7 @@ class TestConfirmMaterializesScript:
         pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
         _write_rv_script_plan(pm, _rv_script_plan())
 
-        await _service(pm).confirm("demo", 1)
+        await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         [unit] = _formal_script(pm)["video_units"]
         planned = _rv_script_plan()["units"][0]
@@ -532,6 +612,69 @@ class TestConfirmMaterializesScript:
         assert unit["duration_seconds"] == planned["duration_seconds"]
         assert unit["source_text"] == planned["source_text"]
         assert unit["pending_authoring"] is True
+
+    async def test_screenplay_confirm_rejects_incomplete_video_unit_coverage(self, tmp_path, video_request_facts):
+        pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
+        source = "Episode 1\n\n1-1 NIGHT — INT. HALL\n\n△阿离推开石门。\n\n阿离：你是谁？\n\n△阿离退到柱边。"
+        set_episode_source_text(pm, "demo", 1, source, source_kind="screenplay")
+        _write_rv_script_plan(
+            pm,
+            {
+                "units": [
+                    {
+                        "unit_id": "E1U01",
+                        "text": "@[阿离] 推开石门。",
+                        "duration_seconds": 8,
+                        "source_text": "△阿离推开石门。",
+                    }
+                ]
+            },
+        )
+
+        with pytest.raises(ScriptReviewError, match="拆解原文锚遗漏"):
+            await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
+
+    @pytest.mark.parametrize("decision", ["register", "merge", "derivative", "skip"])
+    async def test_screenplay_confirm_checks_speakers_using_final_new_asset_identity(
+        self, tmp_path, video_request_facts, decision
+    ):
+        pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
+        source = "GIDEON: Come here."
+        set_episode_source_text(pm, "demo", 1, source, source_kind="screenplay")
+        asset = {
+            "type": "character",
+            "name": "GIDEON",
+            "decision": decision,
+            "description": "黑色军大衣男性",
+            "reason": "本场说话人",
+        }
+        if decision == "register":
+            asset["asset_name"] = "吉迪恩"
+        elif decision in {"merge", "derivative"}:
+            asset["target"] = "阿离"
+            if decision == "derivative":
+                asset["asset_name"] = "军大衣形态"
+        plan = {
+            "units": [
+                {
+                    "unit_id": "E1U01",
+                    "duration_seconds": 8,
+                    "source_text": source,
+                    "text": "@[裴与]{Come} @[裴与]{here.}",
+                }
+            ],
+            "new_assets": [asset],
+        }
+        _write_rv_script_plan(pm, plan)
+        with pytest.raises(ScriptReviewError, match="说话人归属不匹配"):
+            await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
+        assert "GIDEON" not in pm.load_project("demo")["characters"]
+        assert "吉迪恩" not in pm.load_project("demo")["characters"]
+        plan["units"][0]["text"] = "门口。@[GIDEON]{Come} @[GIDEON]{here.}"
+        _write_rv_script_plan(pm, plan)
+        await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
+        speaker = {"register": "吉迪恩", "merge": "阿离", "derivative": "阿离", "skip": "GIDEON"}[decision]
+        assert _formal_script(pm)["video_units"][0]["text"] == f"门口。@[{speaker}]{{Come}} @[{speaker}]{{here.}}"
 
     async def test_reference_confirm_registers_complete_restrained_appearance_and_keeps_speaker_identity(
         self, tmp_path, video_request_facts
@@ -566,7 +709,7 @@ class TestConfirmMaterializesScript:
             },
         )
 
-        await _service(pm).confirm("demo", 1)
+        await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         [unit] = _formal_script(pm)["video_units"]
         assert unit["text"] == "@[阿离/束缚形态] 手腕戴着手链、脚踝戴着脚链。\n@[阿离]{别碰我。}"
@@ -617,7 +760,7 @@ class TestConfirmMaterializesScript:
 
         assert (await svc.get_state("demo", 1))["script_overwrite"] == expected_overwrite
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         assert exc.value.code == "overwrite_required"
         assert exc.value.overwrite == expected_overwrite
@@ -643,7 +786,7 @@ class TestConfirmMaterializesScript:
         if spelling == "bare":
             revision = revision.removeprefix("sha256-v1:")
 
-        state = await svc.confirm("demo", 1, overwrite_revision=revision)
+        state = await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm), overwrite_revision=revision)
 
         assert state["status"] == "confirmed"
         [segment] = _formal_script(pm)["segments"]
@@ -732,7 +875,7 @@ class TestConfirmMaterializesScript:
         before = (pm.get_project_path("demo") / "scripts" / "episode_1.json").read_bytes()
 
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1, overwrite_revision=listed_revision)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm), overwrite_revision=listed_revision)
 
         assert exc.value.code == "overwrite_required"
         assert exc.value.overwrite is not None
@@ -762,7 +905,7 @@ class TestConfirmMaterializesScript:
 
         assert (await svc.get_state("demo", 1))["script_overwrite"] is None
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         assert exc.value.code == "foreign_formal_script"
         assert exc.value.script_filename == "episode_1.json"
@@ -777,7 +920,7 @@ class TestConfirmMaterializesScript:
         svc = _service(pm)
 
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         assert exc.value.code == "video_request_facts"
         assert exc.value.problem is not None
@@ -791,7 +934,7 @@ class TestConfirmMaterializesScript:
         _write_script_plan(pm, "drama", _drama_script_plan())
 
         with pytest.raises(ScriptReviewError) as exc:
-            await _service(pm).confirm("demo", 1)
+            await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         assert exc.value.code == "speech_admission"
         assert not (pm.get_project_path("demo") / "scripts" / "episode_1.json").exists()
@@ -817,7 +960,7 @@ class TestConfirmMaterializesScript:
         monkeypatch.setattr(script_generator_module, "formal_script_overwrite", rewrite_plan_then_read_overwrite)
 
         with pytest.raises(ScriptReviewError) as exc:
-            await _service(pm).confirm("demo", 1)
+            await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         assert exc.value.code == "conversion_conflict"
         assert not (pm.get_project_path("demo") / "scripts" / "episode_1.json").exists()
@@ -839,13 +982,13 @@ class TestNarrationGateFlow:
         assert state["status"] == "pending_review"
         assert state["content"]["segments"][0]["novel_text"].startswith("裴与")
 
-        assert (await svc.confirm("demo", 1))["status"] == "confirmed"
+        assert (await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm)))["status"] == "confirmed"
 
     async def test_saving_confirmed_novel_text_is_rejected_until_rerun(self, tmp_path, video_request_facts):
         pm = _make_project(tmp_path, "narration")
         svc = _service(pm)
         path = _write_script_plan(pm, "narration", _narration_script_plan())
-        await svc.confirm("demo", 1)
+        await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         before = path.read_bytes()
 
         edited = _narration_script_plan()
@@ -869,7 +1012,7 @@ class TestNarrationGateFlow:
         svc = _service(pm)
         project_path = pm.get_project_path("demo")
         _write_script_plan(pm, "narration", _narration_script_plan())
-        await svc.confirm("demo", 1)
+        await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert (await svc.get_state("demo", 1))["status"] == "confirmed"
 
         write_quarantine(
@@ -883,7 +1026,7 @@ class TestNarrationGateFlow:
         assert (await svc.get_state("demo", 1))["status"] == "pending_review"
         assert script_review.review_status(project_path, pm.load_project("demo"), 1) == "pending_review"
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert exc.value.code == "quarantined"
 
         clear_quarantine(project_path, 1, QUARANTINE_KIND_NARRATION_SCRIPT_PLAN)
@@ -913,7 +1056,7 @@ class TestReferenceVideoGateFlow:
         assert script_review.review_status(project_path, pm.load_project("demo"), 1) == "pending_review"
 
         # 确认 → 放行
-        confirmed = await svc.confirm("demo", 1)
+        confirmed = await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert confirmed["status"] == "confirmed"
         assert confirmed["confirmed_at"]
         assert script_review.review_status(project_path, pm.load_project("demo"), 1) == "confirmed"
@@ -922,7 +1065,7 @@ class TestReferenceVideoGateFlow:
         pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
         svc = _service(pm)
         path = _write_rv_script_plan(pm, _rv_script_plan())
-        await svc.confirm("demo", 1)
+        await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         before = path.read_bytes()
 
         edited = _rv_script_plan()
@@ -940,7 +1083,7 @@ class TestReferenceVideoGateFlow:
         pm.add_scenes_batch("demo", {"屋檐": {"description": "雨夜屋檐"}})
         svc = _service(pm)
         _write_rv_script_plan(pm, _rv_script_plan())
-        await svc.confirm("demo", 1)
+        await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         rerun = _rv_script_plan()
         rerun["units"][0]["text"] = "@[阿离] 立于屋檐下。"
         _write_rv_script_plan(pm, rerun)
@@ -966,7 +1109,7 @@ class TestReferenceVideoGateFlow:
         svc = _service(pm)
         project_path = pm.get_project_path("demo")
         _write_rv_script_plan(pm, _rv_script_plan())
-        await svc.confirm("demo", 1)
+        await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert (await svc.get_state("demo", 1))["status"] == "confirmed"
 
         write_quarantine(
@@ -980,7 +1123,7 @@ class TestReferenceVideoGateFlow:
         assert (await svc.get_state("demo", 1))["status"] == "pending_review"
         assert script_review.review_status(project_path, pm.load_project("demo"), 1) == "pending_review"
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert exc.value.code == "quarantined"
 
         # 草稿清除后回到既有的指纹判定（内容未变，确认仍然有效）
@@ -1036,7 +1179,7 @@ class TestReferenceVideoGateFlow:
         bad["units"][0]["duration_seconds"] = 9999  # 超出 unit 时长的结构合理性区间
         _write_rv_script_plan(pm, bad)
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert exc.value.code == "invalid_content"
 
     async def test_confirm_rejects_text_with_unregistered_mention(self, tmp_path, video_request_facts):
@@ -1048,7 +1191,7 @@ class TestReferenceVideoGateFlow:
         _write_rv_script_plan(pm, candidate)
 
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         assert exc.value.code == "unregistered_references"
         assert exc.value.message == "E1U01: 酒馆"
@@ -1063,7 +1206,7 @@ class TestReferenceVideoGateFlow:
         _write_rv_script_plan(pm, candidate)
 
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         assert exc.value.code == "speech_admission"
 
@@ -1128,7 +1271,7 @@ class TestReferenceVideoGateFlow:
             {"type": "character", "name": "阿离"},
             {"type": "character", "name": "裴与"},
         ]
-        assert units["E1U01"]["allowed_durations"] == [5, 10]
+        assert units["E1U01"]["allowed_durations"] == [8]
         assert [problem["code"] for problem in units["E1U01"]["problems"]] == [
             "reference_asset_missing",
             "reference_capability_changed",
@@ -1193,7 +1336,7 @@ class TestReferenceVideoGateFlow:
 
         if operation == "confirm":
             with pytest.raises(ScriptReviewError) as exc:
-                await service.confirm("demo", 1)
+                await service.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
             assert exc.value.code == "video_request_facts"
             assert exc.value.problem is not None
             assert exc.value.problem.code == "reference_capability_unavailable"
@@ -1330,7 +1473,7 @@ class TestReferenceVideoScriptPlanMigration:
         legacy["units"][0]["duration_seconds"] = 7
         _write_rv_script_plan(pm, legacy)
 
-        state = await svc.confirm("demo", 1)
+        state = await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert state["status"] == "confirmed"
         assert state["content"]["units"][0]["duration_seconds"] == 10
 
@@ -1376,7 +1519,7 @@ class TestReferenceVideoScriptPlanMigration:
         edited["units"][0]["text"] = "@[阿离] 收伞。"
         assert (await svc.save_content("demo", 1, edited))["status"] == "pending_review"
 
-        confirmed = await svc.confirm("demo", 1)
+        confirmed = await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert confirmed["status"] == "confirmed"
 
     async def test_confirm_survives_migration_without_reopening_review(self, tmp_path, video_request_facts):
@@ -1509,7 +1652,7 @@ class TestReferenceVideoScriptPlanMigration:
         legacy["units"][0]["duration_seconds"] = 90
         _write_rv_script_plan(pm, legacy)
 
-        state = await svc.confirm("demo", 1)
+        state = await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert state["status"] == "confirmed"
         assert state["content"]["units"][0]["duration_seconds"] == 12
 
@@ -1614,7 +1757,7 @@ class TestReferenceVideoPromptAuthoringEnforcement:
         assert "尚无正式脚本" in refused.problem.detail
         assert "内容确认" in refused.problem.detail
 
-        result = await run_declared_tool(CONFIRM_SCRIPT_REVIEW, ctx, {"episode_id": 1})
+        result = await run_declared_tool(CONFIRM_SCRIPT_REVIEW, ctx, {"episode_id": 1, "plan_fingerprint": _review_fingerprint(pm)})
         assert result.problem is None, result
         assert (project_path / "scripts" / "episode_1.json").exists()
 
@@ -1726,7 +1869,7 @@ class TestErrors:
         pm = _make_project(tmp_path, "drama")
         svc = _service(pm)
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert exc.value.code == "no_script_plan"
 
     async def test_confirm_marked_drama_candidate_returns_structured_admission(self, tmp_path):
@@ -1737,7 +1880,7 @@ class TestErrors:
         _write_script_plan(pm, "drama", candidate)
 
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
 
         assert exc.value.code == "speech_admission"
         assert exc.value.admission is not None
@@ -1855,7 +1998,7 @@ class TestErrors:
         path = _write_script_plan(pm, "drama", _drama_script_plan())
         path.write_bytes(b"\x00\x01 not json at all {")
         with pytest.raises(ScriptReviewError) as exc:
-            await svc.confirm("demo", 1)
+            await svc.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert exc.value.code == "invalid_content"
 
 
@@ -2085,7 +2228,7 @@ class TestPromptAuthoringEnforcement:
             pm=pm,
             config_resolver=cast(ConfigResolver, FakeConfigResolver()),
         )
-        result = await run_declared_tool(CONFIRM_SCRIPT_REVIEW, ctx, {"episode_id": 1})
+        result = await run_declared_tool(CONFIRM_SCRIPT_REVIEW, ctx, {"episode_id": 1, "plan_fingerprint": _review_fingerprint(pm)})
 
         assert result.problem is None, result
         assert script_review.review_status(project_path, pm.load_project("demo"), 1) == "confirmed"
@@ -2117,7 +2260,7 @@ class TestPromptAuthoringEnforcement:
             config_resolver=cast(ConfigResolver, FakeConfigResolver()),
         )
 
-        refused = await run_declared_tool(CONFIRM_SCRIPT_REVIEW, ctx, {"episode_id": 1})
+        refused = await run_declared_tool(CONFIRM_SCRIPT_REVIEW, ctx, {"episode_id": 1, "plan_fingerprint": _review_fingerprint(pm)})
 
         assert refused.problem is not None
         assert refused.problem.code == "script_overwrite_required"
@@ -2144,7 +2287,7 @@ class TestPromptAuthoringEnforcement:
             config_resolver=cast(ConfigResolver, FakeConfigResolver()),
         )
 
-        result = await run_declared_tool(CONFIRM_SCRIPT_REVIEW, ctx, {"episode_id": 1})
+        result = await run_declared_tool(CONFIRM_SCRIPT_REVIEW, ctx, {"episode_id": 1, "plan_fingerprint": _review_fingerprint(pm)})
 
         assert result.problem is not None
         text = result.problem.detail
@@ -2222,7 +2365,7 @@ class TestOwnSourceEpisodes:
         assert register_project_sources(pm, "demo", own_episodes=("任意原文内容",)) == [1]
         _write_script_plan(pm, "drama", _admitted_drama_script_plan())
 
-        confirmed = await _service(pm).confirm("demo", 1)
+        confirmed = await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
         assert confirmed["status"] == "confirmed"
 
         project_path = pm.get_project_path("demo")
@@ -2231,3 +2374,27 @@ class TestOwnSourceEpisodes:
         assert ep is not None
         assert ep["source_origin"] == "own"
         assert "source_range" not in ep
+
+
+def _review_fingerprint(pm):
+    from lib.script import script_review
+    path = script_review.script_plan_path(pm.get_project_path("demo"), pm.load_project("demo"), 1)
+    return script_review.content_fingerprint(path) if path is not None else None
+
+
+async def test_confirmation_requires_reviewed_fingerprint_and_is_idempotent(tmp_path, video_request_facts):
+    pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
+    path = _write_rv_script_plan(pm, {"units": [{"unit_id": "E1U01", "duration_seconds": 8, "source_text": "原文", "text": "@[阿离]进门。"}]})
+    service = _service(pm)
+    reviewed = (await service.get_state("demo", 1))["fingerprint"]
+    for fingerprint in (None, "stale-fingerprint"):
+        with pytest.raises(ScriptReviewError) as error:
+            await service.confirm("demo", 1, plan_fingerprint=fingerprint)
+        assert error.value.code == "conflict"
+        assert not (pm.get_project_path("demo") / "scripts/episode_1.json").exists()
+        assert _review_fingerprint(pm) == reviewed
+    await service.confirm("demo", 1, plan_fingerprint=reviewed)
+    formal = (pm.get_project_path("demo") / "scripts/episode_1.json").read_bytes()
+    await service.confirm("demo", 1, plan_fingerprint=reviewed)
+    assert (pm.get_project_path("demo") / "scripts/episode_1.json").read_bytes() == formal
+    assert path.exists()

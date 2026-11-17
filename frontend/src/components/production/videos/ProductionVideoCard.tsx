@@ -66,7 +66,7 @@ export function ProductionVideoCard({
     void Promise.resolve().then(() => { if (!controller.signal.aborted) { setPreviewBusy(true); setError(null); } });
     void API.previewReferenceUnitPrompt(project, episode, unit.unit_id, editor.value.text, { signal: controller.signal, generationPrompt: editor.value.generation_prompt }).then((value) => { if (!controller.signal.aborted) setPreview(value); }).catch((cause) => { if (!controller.signal.aborted) setError(errMsg(cause)); }).finally(() => { if (!controller.signal.aborted) setPreviewBusy(false); });
     return () => controller.abort();
-  }, [project, episode, unit.unit_id, editor.value.text, editor.value.generation_prompt, unit.pending_authoring, unit.prompt_format_version, promptOpen, projectData, fingerprints]);
+  }, [project, episode, unit.unit_id, editor.value.text, editor.value.generation_prompt, unit.pending_authoring, unit.prompt_format_version, unit.prompt_policy_version, promptOpen, projectData, fingerprints]);
   const timelineBlocked = preview?.problems?.some((problem) => problem.blocking) ?? false;
   useEffect(() => {
     const key = `${project}/${episode}/${unit.unit_id}`;

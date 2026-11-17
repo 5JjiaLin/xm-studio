@@ -132,6 +132,20 @@ async def test_schema_violating_output_falls_back_to_prompt_injection():
     assert (result.input_tokens, result.output_tokens) == (250, 22)
 
 
+async def test_authoring_keeps_raw_native_response_without_paid_format_retry():
+    from lib.script.reference_video.authoring_response import authoring_response_model
+
+    raw = '{"title":"t","units":[{"text":"first","text":"second"}]}'
+    with capture_http() as router:
+        route = router.post(_RESPONSES_URL).mock(return_value=_response(raw))
+        result = await _backend('any-model').generate(TextGenerationRequest(
+            prompt='write', response_schema=authoring_response_model(2), preserve_raw_response=True,
+        ))
+    assert route.call_count == 1
+    assert result.text == raw
+    assert result.output_tokens == 20
+
+
 async def test_rejected_text_format_falls_back_to_prompt_injection():
     with capture_http() as router:
         route = router.post(_RESPONSES_URL).mock(

@@ -79,6 +79,10 @@ def _fake_generator(responses: list[str]) -> MagicMock:
     """按调用次序吐出预置响应；多调一次即耗尽，用例据此断言「本轮没有调用模型」。"""
     generator = MagicMock()
     generator.model = "mock"
+    generator.provider_id = "mock-provider"
+    generator.backend.name = "mock-backend"
+    generator.configuration_fingerprint = "mock-configuration"
+    generator.max_output_tokens = 65536
     generator.generate = AsyncMock(side_effect=[MagicMock(text=text) for text in responses])
     return generator
 
@@ -748,6 +752,10 @@ class TestDryRunPrompt:
         prompt = await variant.generator(project_dir, []).build_prompt(1)
 
         first_needle, second_needle = variant.prompt_needles
+        if variant.name == "reference_video":
+            # 整集只读上下文保留衔接信息，只有目标区限定本次输出。
+            assert first_needle in prompt.split("</episode_context>")[0]
+            prompt = prompt.split("<script_plan_units>")[1].split("</script_plan_units>")[0]
         assert second_needle in prompt
         assert first_needle not in prompt
 

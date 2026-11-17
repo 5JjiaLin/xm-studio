@@ -233,6 +233,15 @@ export interface WorkflowDraft {
   needs_repair: boolean;
 }
 
+export interface WorkflowReferencedAsset {
+  asset_type: "character" | "scene" | "prop" | "product";
+  /** Registered asset name; a derivative is written as owner/name. */
+  name: string;
+  owner?: string | null;
+  has_description: boolean;
+  sheet_state: ArtifactStatus;
+}
+
 /** 内容现状。集级字段只在有目标集时有值；项目整体不可用时整份为空。 */
 export interface WorkflowContent {
   episode_count: number;
@@ -254,6 +263,15 @@ export interface WorkflowContent {
   referenced_asset_sheets_stale: string[];
   /** 本集引用、缺描述因而不能生成资产图的资产；只陈述，不进建议的下一步。 */
   referenced_assets_without_description: string[];
+  referenced_assets?: WorkflowReferencedAsset[];
+  asset_summary?: {
+    suggested: number;
+    registered: number;
+    adopted: number;
+    missing: number;
+    stale: number;
+    unused_suggestions: string[];
+  } | null;
   /** 目标集已完成：视频齐全且至少有一条剪辑时间线。 */
   episode_complete?: boolean;
   /** 只在不指定集的查询里为 true：每集都完成，且整本源文没有剩余。 */

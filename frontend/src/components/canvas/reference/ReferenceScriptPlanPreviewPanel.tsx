@@ -1,3 +1,4 @@
+import { ScriptPlanCandidateEditor } from "./ScriptPlanCandidateEditor";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AlertTriangle, ArrowRight, CheckCircle2, ChevronDown, Clock, Lock, OctagonAlert, Pencil, RotateCcw, Save } from "lucide-react";
@@ -52,6 +53,7 @@ interface ReferenceScriptPlanPreviewPanelProps {
   projectName: string;
   episode: number;
   videoModelUnresolved?: boolean;
+  allowAgentActions?: boolean;
   /** 剧本规划档位；端点固定的单元按它选时长、判越档，与提示词编写的拒绝判据同源。未给时自查。 */
   planningDurations?: number[];
   /** Asset name → kind, for mention coloring — same lookup the editor/parse preview share. */
@@ -456,6 +458,7 @@ export function ReferenceScriptPlanPreviewPanel({
   planningDurations,
   lookup,
   onOpenTimeline,
+  allowAgentActions = true,
 }: ReferenceScriptPlanPreviewPanelProps) {
   const { t } = useTranslation("dashboard");
   const episodeLedger = useEpisodeLedger();
@@ -648,9 +651,9 @@ export function ReferenceScriptPlanPreviewPanel({
           outdated={draftEditor.outdated}
           onSave={voidPromise(draftEditor.save)}
           onReloadLatest={draftEditor.reloadLatest}
-          onHandToAgent={() =>
+          onHandToAgent={allowAgentActions ? () =>
             prefillAssistant(draftFixRequestText(t, episodeRef, "reference_script_plan", quarantine.violations))
-          }
+          : undefined}
           onDiscard={() => setDiscardOpen(true)}
           regenerateAction={
             <>
@@ -660,6 +663,7 @@ export function ReferenceScriptPlanPreviewPanel({
           }
         />
         {discardDialog}
+        {content == null && <ScriptPlanCandidateEditor project={projectName} episode={episode} draft={quarantine} onChanged={handleRetry} />}
         <DraftEpisodeViolations
           violations={groups.episodeLevel}
           anchorRef={(el) => {
@@ -759,9 +763,9 @@ export function ReferenceScriptPlanPreviewPanel({
       {agentEditing ? (
         <AgentDraftBar
           busy={draftBusy}
-          onFinish={() =>
+          onFinish={allowAgentActions ? () =>
             prefillAssistant(t("dashboard:draft_agent_finish_prefill", { episodeRef, docType: "reference_script_plan" }))
-          }
+          : undefined}
           onDiscard={() => setDiscardOpen(true)}
         />
       ) : (

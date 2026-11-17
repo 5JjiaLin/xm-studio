@@ -1,0 +1,11 @@
+{
+  "method": "PUT",
+  "path": "/api/v1/projects/demo/episodes/1/drafts/reference_prompt_authoring",
+  "status": 200,
+  "body": {
+    "episode": 1,
+    "doc_type": "reference_prompt_authoring",
+    "adopted": true,
+    "draft": null
+  }
+}

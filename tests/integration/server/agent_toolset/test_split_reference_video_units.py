@@ -8,8 +8,6 @@ from typing import Any
 import pytest
 
 from lib.generation.video_request_facts import VideoRequestFactsError, VideoRequestFactsFailure
-from lib.script.reference_video.unit_capabilities import evaluate_reference_unit_capabilities
-from server.services.tasks.video_caps import reference_request_facts_lookup
 from tests.factories import make_video_request_facts, seed_endpoint_fixed_video_model
 from tests.fakes import use_text_generator
 from tests.integration.server.agent_tool_support import (
@@ -287,6 +285,7 @@ async def test_split_reference_video_units_dry_run(fake_ctx: ToolHarness, video_
     # 集号、资产候选与能力约束进 prompt；引用语法规范随之注入
     assert "第 1 集" in prompt_text
     assert "张三" in prompt_text
+    assert "[S0001] 张三在村口等人" in prompt_text
     # 上限是两套逐 unit 档位并集的最大值，随能力解析派生
     assert "8 秒" in prompt_text
     assert "紧跟它所对应的那句动作" in prompt_text
@@ -465,25 +464,18 @@ async def test_split_reference_video_units_locates_the_unit_when_its_i2v_tiers_a
 
 
 @pytest.mark.parametrize("sheet", ["absent", "unclaimed"])
-async def test_split_reference_video_units_buckets_a_reference_without_usable_image_as_i2v(
+async def test_split_reference_video_units_keeps_planned_reference_tier_without_images(
     fake_ctx: ToolHarness, monkeypatch, set_video_request_facts, sheet: str
 ) -> None:
-    """`@` 引用的角色没有可用参考图（未生成资产图，或图在盘上但产物清单未认领）时，单元与内容确认
-    面板、执行一样落 i2v：4 秒在 i2v 档位内合法，不按带图档位 [8] 判越档。
-    """
+    """预期使用参考图时，缺图不允许拆成仅无图档合法的 4 秒。"""
     rv_source(fake_ctx)
     _veo_720p_facts(set_video_request_facts)
     if sheet == "unclaimed":
         rv_character_sheet(fake_ctx, "张三", claimed=False)
     out = await run_rv_split(fake_ctx, monkeypatch, [rv_unit("@[张三] 起身", duration=4)])
-    assert out.problem is None, out
-    saved = json.loads(rv_script_plan_path(fake_ctx).read_text(encoding="utf-8"))
-    assert saved["units"][0]["duration_seconds"] == 4
-    project = json.loads((fake_ctx.project_path / "project.json").read_text(encoding="utf-8"))
-    (capability,) = await evaluate_reference_unit_capabilities(
-        project, fake_ctx.project_path, saved["units"], request_facts=reference_request_facts_lookup(project)
-    )
-    assert capability.generation_type == "i2v"
+    assert out.problem is not None
+    assert not rv_script_plan_path(fake_ctx).exists()
+    assert [v["code"] for v in read_rv_quarantine(fake_ctx)["violations"]] == ["duration_off_tier"]
 
 
 async def test_split_reference_video_units_accepts_wide_tier_without_references(
@@ -506,7 +498,7 @@ async def test_split_reference_video_units_rejects_out_of_enum_duration(
     rv_source(fake_ctx)
     out = await run_rv_split(fake_ctx, monkeypatch, [rv_unit("@[张三] 起身", duration=5)])
     assert out.problem is not None
-    assert "script_plan 拆分内容结构校验失败" in said(out)
+    assert "schema_invalid" in said(out)
     assert not rv_script_plan_path(fake_ctx).exists()
 
 
@@ -537,6 +529,111 @@ async def test_split_reference_video_units_accepts_source_text_substring(
     units = [rv_unit("@[张三] 起身", source_text="张三在村口")]
     out = await run_rv_split(fake_ctx, monkeypatch, units)
     assert out.problem is None, out
+
+
+@pytest.mark.parametrize("extra", [{}, {"source_text": "模型改写的错误原文"}])
+async def test_split_reference_video_units_derives_exact_anchor_from_source_span(
+    fake_ctx: ToolHarness, monkeypatch, video_request_facts, extra
+) -> None:
+    """跨度 ID 是原文锚的真相源，模型附带的改写文本不得覆盖服务端回填。"""
+    rv_source(fake_ctx)
+    units = [
+        {
+            "duration_seconds": 8,
+            "source_span_start": "S0001",
+            "source_span_end": "S0001",
+            "text": "@[张三] 等候",
+            **extra,
+        }
+    ]
+
+    out = await run_rv_split(fake_ctx, monkeypatch, units)
+
+    assert out.problem is None, out
+    draft = json.loads(rv_script_plan_path(fake_ctx).read_text(encoding="utf-8"))
+    assert draft["units"][0]["source_text"] == _RV_NOVEL
+
+
+@pytest.mark.parametrize(
+    "span_fields",
+    [
+        {"source_span_start": "S0001"},
+        {"source_span_end": "S0001"},
+        {"source_span_start": "S0001", "source_span_end": "S0001", "legacy_source_text": True},
+    ],
+)
+async def test_split_reference_video_units_rejects_incomplete_or_bypass_span_fields(
+    fake_ctx: ToolHarness, monkeypatch, video_request_facts, span_fields
+) -> None:
+    rv_source(fake_ctx)
+    out = await run_rv_split(fake_ctx, monkeypatch, [{**rv_unit("@[张三] 等候"), **span_fields}])
+    assert out.problem is not None
+    assert "schema_invalid" in said(out)
+    assert not rv_script_plan_path(fake_ctx).exists()
+
+
+@pytest.mark.parametrize(("start", "end"), [("S0001", "S0002"), ("S0002", "S0001")])
+async def test_split_reference_video_units_resolves_multispan_range_in_source_order(
+    fake_ctx: ToolHarness, monkeypatch, video_request_facts, start, end
+) -> None:
+    rv_source(fake_ctx)
+    source = _RV_NOVEL + "。\r\n他转身离开。"
+    (fake_ctx.project_path / "source" / "episode_1.txt").write_text(source, encoding="utf-8")
+    units = [{"duration_seconds": 8, "source_span_start": start, "source_span_end": end, "text": "@[张三] 等候后离开"}]
+
+    out = await run_rv_split(fake_ctx, monkeypatch, units)
+
+    if start == "S0001":
+        assert out.problem is None, out
+        saved = json.loads(rv_script_plan_path(fake_ctx).read_text(encoding="utf-8"))
+        # 源文件读取沿用现有 universal newline 规则；跨度坐标基于实际加载的源文。
+        assert saved["units"][0]["source_text"] == source.replace("\r\n", "\n")
+    else:
+        assert out.problem is not None
+        draft = read_rv_quarantine(fake_ctx)
+        assert draft["violations"][0]["code"] == "source_span_invalid"
+        assert draft["content"]["units"][0]["source_span_start"] == start
+        assert draft["content"]["units"][0]["source_span_end"] == end
+
+
+async def test_split_reference_video_units_quarantines_unknown_source_span_even_with_text(
+    fake_ctx: ToolHarness, monkeypatch, video_request_facts
+) -> None:
+    """无效跨度不能靠模型额外输出 source_text 绕过服务端原文回填。"""
+    rv_source(fake_ctx)
+    units = [
+        {
+            "duration_seconds": 8,
+            "source_span_start": "S9999",
+            "source_span_end": "S9999",
+            "source_text": _RV_NOVEL,
+            "text": "@[张三] 等候",
+        }
+    ]
+
+    out = await run_rv_split(fake_ctx, monkeypatch, units)
+
+    assert out.problem is not None
+    draft = read_rv_quarantine(fake_ctx)
+    assert [(item["code"], item["item_index"]) for item in draft["violations"]] == [("source_span_invalid", 0)]
+
+
+async def test_split_reference_video_units_rejects_source_anchors_in_reverse_story_order(
+    fake_ctx: ToolHarness, monkeypatch, video_request_facts
+) -> None:
+    """逐条合法的原文锚仍须与 unit 顺序一致；只限制参考生视频拆解，不要求覆盖无画面化原文。"""
+    rv_source(fake_ctx)
+    units = [
+        rv_unit("@[张三] 等候", source_text="等人"),
+        rv_unit("@[张三] 走来", source_text="张三在村口"),
+    ]
+
+    out = await run_rv_split(fake_ctx, monkeypatch, units)
+
+    assert out.problem is not None
+    draft = read_rv_quarantine(fake_ctx)
+    assert [(item["code"], item["item_index"]) for item in draft["violations"]] == [("source_text_out_of_order", 1)]
+    assert not rv_script_plan_path(fake_ctx).exists()
 
 
 async def test_split_reference_video_units_rejects_dialogue_overload(

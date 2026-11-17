@@ -9,7 +9,7 @@ import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from lib.infra.api_errors import ConflictError, NotFoundError, UnprocessableError
 from lib.infra.async_thread import run_sync_transaction
@@ -44,6 +44,19 @@ class ScriptPlanRequest(ScriptPlanInstructions):
     replan_reason: _Instructions | None = Field(
         default=None, description="仅本次重新拆解的原因，不作为长期附加指令保存"
     )
+    repair_draft_revision: str | None = Field(default=None, min_length=1, max_length=100)
+    repair_once: bool = Field(default=False, strict=True)
+    repair_recheck_task_id: str | None = Field(default=None, min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def mutually_exclusive_modes(self) -> "ScriptPlanRequest":
+        if self.repair_draft_revision and self.repair_once:
+            raise ValueError("显式修复不能再次自动修复")
+        if self.repair_recheck_task_id and (
+            self.repair_draft_revision or self.repair_once or self.replan_reason or "instructions" in self.model_fields_set
+        ):
+            raise ValueError("重新检查不能附带生成或改写要求")
+        return self
 
 
 def _raise_problem(problem: ToolProblem, episode: int, _t: Translator) -> None:
@@ -90,7 +103,10 @@ async def plan_script(
     """
     pm = get_project_manager()
     instructions = req.instructions
-    if req.replan_reason and "instructions" not in req.model_fields_set:
+    if req.repair_recheck_task_id:
+        if req.repair_draft_revision or req.repair_once or req.replan_reason or "instructions" in req.model_fields_set:
+            raise UnprocessableError("script_plan_refused", reason="重新检查不能附带生成或改写要求")
+    elif (req.replan_reason or req.repair_draft_revision) and "instructions" not in req.model_fields_set:
         try:
             project = await asyncio.to_thread(pm.load_project, project_name)
         except FileNotFoundError as exc:
@@ -103,7 +119,14 @@ async def plan_script(
         await _save(project_name, episode, instructions)
     outcome = await generate_script_plan(
         ToolRequest(
-            GenerateScriptPlanRequest(episode_id=episode, instructions=instructions, replan_reason=req.replan_reason)
+            GenerateScriptPlanRequest(
+                episode_id=episode,
+                instructions=instructions,
+                replan_reason=req.replan_reason,
+                repair_draft_revision=req.repair_draft_revision,
+                repair_once=req.repair_once,
+                repair_recheck_task_id=req.repair_recheck_task_id,
+            )
         ),
         ProjectScope(project_name=project_name, data_root=pm.data_root),
         CallerContext(user_id=user.id, source="webui"),

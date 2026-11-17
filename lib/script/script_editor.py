@@ -83,6 +83,8 @@ def _set_nested(obj: dict[str, Any], field_path: str, value: Any) -> None:
         raise ScriptEditError("patch_episode_script 不可直接改重规划标记；修改 unit 规划内容后由系统重算")
     if parts[0] == "prompt_format_version":
         raise ScriptEditError("prompt_format_version 由提示词编写确定，不能通过字段编辑降级")
+    if parts[0] == "prompt_policy_version":
+        raise ScriptEditError("prompt_policy_version 由提示词编写确定，不能通过字段编辑降级")
     if parts[0] == PENDING_AUTHORING_FIELD:
         # 待编写标记随视觉层是否写齐变化；放行 patch 会让缺视觉层的条目被伪装成已编写。
         raise ScriptEditError(

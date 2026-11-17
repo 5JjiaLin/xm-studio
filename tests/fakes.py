@@ -1132,6 +1132,7 @@ def use_project_manager(monkeypatch, pm: Any) -> None:
     monkeypatch.setattr("server.services.currency.upload_finalize.get_project_manager", for_pm)
     monkeypatch.setattr("server.services.tasks.generation_context.get_project_manager", for_pm)
     monkeypatch.setattr("server.services.tasks.generation_tasks.get_project_manager", for_pm)
+    monkeypatch.setattr("server.services.tasks.derivative_sheet_tasks.get_project_manager", for_pm)
     monkeypatch.setattr("server.services.tasks.image_edit_tasks.get_project_manager", for_pm)
     monkeypatch.setattr("server.services.tasks.reference_video_tasks.get_project_manager", for_pm)
 
@@ -1143,6 +1144,7 @@ def use_generation_context(monkeypatch, resolve: Callable[..., Any]) -> None:
     """
     monkeypatch.setattr("server.services.tasks.formal_image_commit.resolve_generation_context", resolve)
     monkeypatch.setattr("server.services.tasks.generation_tasks.resolve_generation_context", resolve)
+    monkeypatch.setattr("server.services.tasks.derivative_sheet_tasks.resolve_generation_context", resolve)
     monkeypatch.setattr("server.services.tasks.reference_video_tasks.resolve_generation_context", resolve)
 
 
@@ -1155,6 +1157,22 @@ def use_video_thumbnail_extractor(monkeypatch, extract: Callable[..., Any]) -> N
 def use_text_generator(monkeypatch, create: Callable[..., Any]) -> None:
     """``TextGenerator.create`` 换成 *create*：所有经它取文本模型的调用方都拿到替身生成器。"""
     monkeypatch.setattr("lib.backends.text_generator.TextGenerator.create", create)
+
+
+def observe_json_replace(monkeypatch, after_replace: Callable[[str | Path, str | Path], None]) -> None:
+    """After a real atomic JSON replace, notify a test about the committed paths."""
+    import os
+
+    from lib.infra import json_io
+
+    original_replace = os.replace
+
+    def observed_replace(src, dst, *args, **kwargs):
+        result = original_replace(src, dst, *args, **kwargs)
+        after_replace(src, dst)
+        return result
+
+    monkeypatch.setattr(json_io.os, "replace", observed_replace)
 
 
 def bind_session_factory(monkeypatch, factory) -> None:
@@ -1221,6 +1239,22 @@ def use_generation_queue(monkeypatch, queue: Any) -> None:
     """生成与参考视频路由的 ``get_generation_queue()`` 都返回 *queue*（入队替身）。"""
     monkeypatch.setattr("server.routers.generate.get_generation_queue", lambda: queue)
     monkeypatch.setattr("server.routers.reference_videos.get_generation_queue", lambda: queue)
+
+
+def use_production_generation_queue(monkeypatch, queue: Any) -> None:
+    """制作路由查询任务时使用指定队列。"""
+    monkeypatch.setattr("server.routers.production.get_generation_queue", lambda: queue)
+
+
+def use_jianying_compatibility_ready(monkeypatch) -> None:
+    """隔离本机剪映安装检测，草稿写入仍使用真实实现。"""
+    monkeypatch.setattr("lib.jianying_draft.local_delivery.compatibility", lambda _: {"ready": True})
+
+
+def use_jianying_process_state(monkeypatch, state: str | Callable[[], str]) -> None:
+    """替换操作系统进程检测，支持固定状态和检测时序回调。"""
+    process = state if callable(state) else lambda: state
+    monkeypatch.setattr("lib.jianying_draft.local_delivery.process_state", process)
 
 
 def use_backend_assembler(monkeypatch, assemble: Callable[..., Any]) -> None:

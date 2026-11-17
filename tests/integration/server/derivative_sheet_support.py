@@ -176,10 +176,8 @@ def run_derivative_generation(
     from tests.integration.server.services.tasks.generation_tasks_support import fake_resolve_ctx
 
     generator = build_generator(project_path, DashScopeImageBackend(api_key="sk", model="qwen-image-2.0"))
-    monkeypatch.setattr(derivative_sheet_tasks, "get_project_manager", lambda: pm)
     use_project_manager(monkeypatch, pm)
     use_generation_context(monkeypatch, fake_resolve_ctx(generator))
-    monkeypatch.setattr(derivative_sheet_tasks, "resolve_generation_context", fake_resolve_ctx(generator))
 
     result_bytes = solid_png_bytes(result_rgb)
     with capture_http() as router:

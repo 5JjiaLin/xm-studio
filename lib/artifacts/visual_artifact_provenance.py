@@ -129,14 +129,14 @@ def build_asset_sheet_visual_basis(
     """Describe one character, scene, prop, or product design sheet.
 
     ``absent`` records the generation-input gaps (``docs/adr/0098``). An empty
-    description is accepted only together with recorded gaps.
+    description is accepted with a complete manual generation prompt or recorded gaps.
     """
 
     if asset_type not in ASSET_TYPES:
         raise ValueError(f"unsupported asset type: {asset_type!r}")
     canonical_id = normalize_asset_name(_require_non_empty("asset_id", asset_id))
     normalized_description = _require_string("description", description).strip()
-    if not absent:
+    if not absent and not _require_string("generation_prompt", generation_prompt).strip():
         _require_non_empty("description", normalized_description)
     _require_string("style", style)
     _require_string("style_description", style_description)

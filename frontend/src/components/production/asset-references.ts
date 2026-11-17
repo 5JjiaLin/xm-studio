@@ -7,15 +7,17 @@ export function belongsToAsset(reference: string, name: string): boolean {
 }
 
 /** Remove visual references without turning character dialogue into narration. */
-export function replaceAssetReferences(text: string, name: string, replacement: string): string {
+export function replaceAssetReferences(text: string, name: string, replacement: string, preserveSuffix = false): string {
   const key = normalizeAssetName(name);
   const rewrite = (part: string) => part.replace(MENTION_RE, (...args: unknown[]) => {
     const match = args.slice(0, 3) as unknown as RegExpMatchArray;
-    return belongsToAsset(mentionNameFromMatch(match), key) ? replacement ? `@[${replacement}]` : name : String(args[0]);
+    const reference = normalizeAssetName(mentionNameFromMatch(match));
+    const suffix = preserveSuffix ? reference.slice(key.length) : "";
+    return belongsToAsset(reference, key) ? replacement ? `@[${replacement}${suffix}]` : name : String(args[0]);
   });
   return text.split(LINE_BREAK_RE).map((line, index) => index % 2 ? line : splitSpeechLine(line).map((part) => {
     if (typeof part === "string") return rewrite(part);
     // Ordinary-description removal preserves the speaker and all spoken words.
-    return replacement && belongsToAsset(part.speaker, key) ? rewrite(part.raw.slice(0, part.raw.indexOf("{"))) + part.raw.slice(part.raw.indexOf("{")) : part.raw;
+    return replacement && belongsToAsset(part.derivative ? `${part.speaker}/${part.derivative}` : part.speaker, key) ? rewrite(part.raw.slice(0, part.raw.indexOf("{"))) + part.raw.slice(part.raw.indexOf("{")) : part.raw;
   }).join("")).join("");
 }

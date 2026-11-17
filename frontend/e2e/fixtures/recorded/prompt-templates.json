@@ -49,6 +49,7 @@
           "body": "第二段：单元正文，mention 已换成主体记号，台词记号已重组，旁白记号已丢弃",
           "style": "项目画风",
           "style_description": "项目风格描述",
+          "policy_style": "新策略固定的 Style/Avoid 文本；空值时使用项目画风",
           "co_present_characters": "同框的不同角色，本体与衍生合并计一个；不足两个时为空",
           "products": "随请求发出参考图的商品名，按首现顺序去重；无商品参考图时为空"
         },
@@ -1076,10 +1077,13 @@
           "scene_names": "场景候选引用名列表",
           "prop_names": "道具候选引用名列表",
           "units_content": "本次输出目标，带原始序号、输入定位 ID、输出序号、确认时长与正文",
+          "output_count": "本批必须返回的 units 数组元素数量",
+          "output_shape": "按本批目标数构造的 JSON 外层结构示例",
           "context_content": "当前集正式脚本全部单元的有序只读上下文，包含编写状态和人工创作段",
           "episode": "当前集号",
           "max_refs": "单个视频单元的参考图上限；不限时传 null",
           "timeline_enabled": "剧情参考生视频启用统一分段时间轴；其他路线保留旧规则",
+          "drama_detail_enabled": "仅新启用的剧情参考生视频采用细节与纯状态交接规则",
           "speech_rate": "项目口播语速，阅读单位/秒",
           "speech_unit": "语言对应的字或词",
           "voice_conditions": "本次已求值的各视频桶声音能力摘要",
@@ -1119,7 +1123,7 @@
           "character_names": "角色候选引用名列表（含 本体/衍生）",
           "scene_names": "场景候选引用名列表",
           "prop_names": "道具候选引用名列表",
-          "novel_text": "逐字源文",
+          "source_spans": "逐字源文切分出的带 ID 连续跨度列表；ID 用于服务端精确回填原文锚",
           "episode_outline": "本集大纲，键齐全的对象 {title, story_beats, hook, next_episode_teaser}；无有效内容时传 null",
           "next_episode_outline": "下集大纲，形状同上；无有效内容时传 null",
           "episode": "当前集号",
@@ -1131,10 +1135,11 @@
           "max_duration": "单次生成的时长上限（秒）",
           "max_reference_images": "单个视频单元的参考图上限；不限时传 null",
           "episode_target_duration": "单集目标秒数；未设置时传 null",
-          "instructions": "附加指令正文；缺值传 null"
+          "instructions": "附加指令正文；缺值传 null",
+          "drama_detail_enabled": "仅剧情参考生视频启用真人短剧资产描述补充规范"
         },
         "protected": false,
-        "output_schema": "lib.script.script_models:ReferenceScriptPlanFlatDraft"
+        "output_schema": "lib.script.script_models:ReferenceScriptPlanSpanDraft"
       },
       {
         "id": "text/source_overview",

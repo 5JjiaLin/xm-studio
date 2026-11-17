@@ -1720,15 +1720,21 @@ class API {
   static async confirmScriptReview(
     projectName: string,
     episode: number,
-    options: { overwriteRevision?: string } = {}
+    options: { overwriteRevision?: string; planFingerprint?: string } = {}
   ): Promise<ScriptReviewState> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/script-review/confirm`,
       {
         method: "POST",
-        body: JSON.stringify({ overwrite_revision: options.overwriteRevision ?? null }),
+        body: JSON.stringify({ overwrite_revision: options.overwriteRevision ?? null, plan_fingerprint: options.planFingerprint ?? null }),
       }
     );
+  }
+
+  static async startScriptReviewRevision(projectName: string, episode: number, planFingerprint: string): Promise<ScriptReviewState> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episodes/${episode}/script-review/revise`, {
+      method: "POST", body: JSON.stringify({ plan_fingerprint: planFingerprint }),
+    });
   }
 
   // ==================== 草稿（待修复草稿 / Agent 的可编辑草稿） ====================

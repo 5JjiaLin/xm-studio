@@ -27,7 +27,11 @@ def strict_json_loads(text: str):
             result[key] = value
         return result
 
-    return json.loads(text, object_pairs_hook=object_without_duplicates)
+    try:
+        return json.loads(text, object_pairs_hook=object_without_duplicates)
+    except DuplicateJSONKeyError as exc:
+        exc.response_text = text
+        raise
 
 
 def normalize_newlines(text: str) -> str:

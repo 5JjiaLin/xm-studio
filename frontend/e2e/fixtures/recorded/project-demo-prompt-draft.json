@@ -1,0 +1,38 @@
+{
+  "method": "GET",
+  "path": "/api/v1/projects/demo/episodes/1/drafts/reference_prompt_authoring",
+  "status": 200,
+  "body": {
+    "episode": 1,
+    "doc_type": "reference_prompt_authoring",
+    "revision": "sha256-v1:cd03d2d7e35fa891f05954a76742d27f309a70d0d12c8152fc6a6371caa09791",
+    "editable_by": "user",
+    "content": {
+      "title": "第一集",
+      "units": [
+        {
+          "text": "@[未登记人物] 出场"
+        },
+        {
+          "text": "镜头"
+        }
+      ]
+    },
+    "violations": [
+      {
+        "code": "unregistered_mention",
+        "label": "",
+        "message": "未登记人物",
+        "line": null,
+        "item_index": 0,
+        "item_id": "E1U1"
+      }
+    ],
+    "soft_violations": [],
+    "formal_exists": true,
+    "item_ids": [
+      "E1U1",
+      "E1U2"
+    ]
+  }
+}

@@ -87,7 +87,7 @@ async def test_narration_plan_accepts_references_to_listed_new_assets(
     nr_source(fake_ctx)
     new_assets = [
         _new("小桃", "register", description="十岁女童"),
-        _new("小桃", "register", description="重复的一项"),
+        _new("小桃", "register", description="十岁女童"),
     ]
     segment = nr_segment("E1S01", 4, "张三在村口等人", characters_in_segment=["张三", "小桃"])
     use_text_generator(monkeypatch, nr_generator_returning([segment], new_assets=new_assets))

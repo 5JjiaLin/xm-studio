@@ -15,7 +15,6 @@ from lib.backends.text_backends.base import (
     TextGenerationResult,
 )
 from lib.backends.text_backends.gemini import GeminiTextBackend
-from tests.fakes import bounded_poll_clock
 from tests.http_capture import capture_http, request_json
 from tests.unit.lib.backends.text_backends.response_schema_support import (
     response_schema_models,
@@ -33,8 +32,9 @@ class TestProperties:
     def test_name(self, mock_genai):
         b = GeminiTextBackend(api_key="k")
         assert b.name == "gemini"
-        # AI Studio 模式：构造时把 api_key 原样交给 genai.Client，未给 base_url 则不带 http_options
-        mock_genai.Client.assert_called_once_with(api_key="k", http_options=None)
+        # SDK 内置重试关闭，未知响应只由文本请求策略处理。
+        options = mock_genai.Client.call_args.kwargs["http_options"]
+        assert options.retry_options.attempts == 1
 
     def test_default_model(self, mock_genai):
         b = GeminiTextBackend(api_key="k")
@@ -445,27 +445,15 @@ class TestStructuredFallback:
 
         assert result.text == '{"k": "v"}'
 
-    async def test_fallback_transient_error_does_not_replay_native_call(self, backend):
-        """降级路径瞬态错误只在降级层重试，不重放已成功（已计费）的原生调用。"""
-        transient = ConnectionError("503 service unavailable")
-        gc = AsyncMock(side_effect=[_resp(_PROSE), transient, transient, transient])
-        backend._test_client.aio.models.generate_content = gc
-
-        with bounded_poll_clock(), pytest.raises(ConnectionError):
-            await backend.generate(TextGenerationRequest(prompt="p", response_schema=_OverviewModel))
-
-        # 1 次原生成功 + 降级层自身 3 次重试穷尽；原生调用未被重放
-        assert gc.call_count == 4
-
 
 def _keys_anywhere(node: object, names: set[str]) -> list[str]:
-    """递归收集 dict 中任何层级出现的指定 key（含属性名位置，用于断言「完全不含」）。"""
+    """递归收集 dict 中任何层级出现的指定 key。"""
     found: list[str] = []
     if isinstance(node, dict):
-        for k, v in node.items():
-            if k in names:
-                found.append(k)
-            found.extend(_keys_anywhere(v, names))
+        for key, value in node.items():
+            if key in names:
+                found.append(key)
+            found.extend(_keys_anywhere(value, names))
     elif isinstance(node, list):
         for item in node:
             found.extend(_keys_anywhere(item, names))

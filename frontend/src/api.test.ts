@@ -783,8 +783,8 @@ describe("API", () => {
       await API.getScriptReview("a b", 1);
       await API.saveScriptReviewContent("a b", 2, content);
       await API.saveScriptReviewContent("a b", 2, content, "fp 1");
-      await API.confirmScriptReview("a b", 3);
-      await API.confirmScriptReview("a b", 3, { overwriteRevision: "sha256-v1:abc" });
+      await API.confirmScriptReview("a b", 3, { planFingerprint: "fp1" });
+      await API.confirmScriptReview("a b", 3, { overwriteRevision: "sha256-v1:abc", planFingerprint: "fp2" });
 
       expect(requestSpy).toHaveBeenCalledWith("/projects/a%20b/episodes/1/script-review", {
         signal: undefined,
@@ -803,11 +803,11 @@ describe("API", () => {
       );
       expect(requestSpy).toHaveBeenCalledWith("/projects/a%20b/episodes/3/script-review/confirm", {
         method: "POST",
-        body: JSON.stringify({ overwrite_revision: null }),
+        body: JSON.stringify({ overwrite_revision: null, plan_fingerprint: "fp1" }),
       });
       expect(requestSpy).toHaveBeenCalledWith("/projects/a%20b/episodes/3/script-review/confirm", {
         method: "POST",
-        body: JSON.stringify({ overwrite_revision: "sha256-v1:abc" }),
+        body: JSON.stringify({ overwrite_revision: "sha256-v1:abc", plan_fingerprint: "fp2" }),
       });
     });
   });

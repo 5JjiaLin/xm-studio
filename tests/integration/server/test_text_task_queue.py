@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -41,9 +40,10 @@ from lib.generation.generation_result import (
 from lib.generation.generation_worker import CapacityTable, GenerationWorker
 from lib.generation.video_request_facts import VideoRequestFactsFailure
 from lib.infra.api_errors import ConflictError
+from lib.infra.app_data_dir import reset_for_tests
 from lib.infra.async_thread import run_sync_transaction
 from lib.infra.data_root_layout import DataRootLayout
-from lib.project.project_manager import ProjectManager
+from lib.project.project_manager import ProjectManager, reset_project_manager_for_tests
 from lib.project.project_migration_failure import ProjectMigrationError, record_migration_failure
 from lib.project.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
 from lib.script.draft_quarantine import (
@@ -73,7 +73,7 @@ from server.tool_runtime import (
     repair_draft,
 )
 from tests.factories import register_project_sources
-from tests.fakes import FakeTextGenerator, refuse_resume_execution, use_text_generator
+from tests.fakes import FakeTextGenerator, observe_json_replace, refuse_resume_execution, use_text_generator
 
 
 def _admit_text_operations(projects: ProjectManager, project_name: str) -> None:
@@ -737,6 +737,8 @@ async def test_queued_plan_resolves_data_root_from_current_config_and_preserves_
     projects.create_project("planning", content_mode="narration")
     projects.create_project_metadata("planning", "Planning", "", "narration")
     monkeypatch.setenv("ARCREEL_DATA_DIR", str(projects.data_root))
+    reset_for_tests()
+    reset_project_manager_for_tests()
     payload: dict[str, Any] = {"instructions": "按章节"}
     if legacy_data_root:
         # 旧版本排入的任务在载荷里带着入队时的数据根；数据根此后已挪走。
@@ -815,6 +817,8 @@ async def test_queued_plan_failure_carries_the_way_out(
     projects.create_project("planning", content_mode="narration")
     projects.create_project_metadata("planning", "Planning", "", "narration")
     monkeypatch.setenv("ARCREEL_DATA_DIR", str(projects.data_root))
+    reset_for_tests()
+    reset_project_manager_for_tests()
 
     class Planner:
         @classmethod
@@ -904,6 +908,8 @@ async def test_cancel_during_started_episode_script_commit_leaves_member_running
     projects = ProjectManager(tmp_path / "projects")
     # worker 按当前配置解析数据根。
     monkeypatch.setenv("ARCREEL_DATA_DIR", str(projects.data_root))
+    reset_for_tests()
+    reset_project_manager_for_tests()
     project_path = projects.create_project("script", content_mode="ad")
     projects.create_project_metadata("script", "Script", "", "ad")
     _admit_text_operations(projects, "script")
@@ -992,6 +998,8 @@ async def test_cancel_during_started_episode_plan_commit_leaves_member_running_t
     projects = ProjectManager(tmp_path / "projects")
     # worker 按当前配置解析数据根。
     monkeypatch.setenv("ARCREEL_DATA_DIR", str(projects.data_root))
+    reset_for_tests()
+    reset_project_manager_for_tests()
     project_path = projects.create_project("planning", content_mode="narration")
     projects.create_project_metadata("planning", "Planning", "", "narration")
     register_project_sources(projects, "planning", whole_source={"novel.txt": "第一章。少年得到古玉，玉中藏着剑诀。"})
@@ -1102,6 +1110,8 @@ async def test_cancel_during_invalid_script_plan_quarantine_leaves_member_runnin
     projects = ProjectManager(tmp_path / "projects")
     # worker 按当前配置解析数据根。
     monkeypatch.setenv("ARCREEL_DATA_DIR", str(projects.data_root))
+    reset_for_tests()
+    reset_project_manager_for_tests()
     project_path = projects.create_project(project_name, content_mode="narration")
     projects.create_project_metadata(project_name, project_name, "", "narration")
     projects.update_project(project_name, lambda project: project.update(generation_mode=generation_mode))
@@ -1118,15 +1128,12 @@ async def test_cancel_during_invalid_script_plan_quarantine_leaves_member_runnin
     draft_path = quarantine_path(project_path, 1, quarantine_kind)
     started = threading.Event()
     release = threading.Event()
-    original_replace = os.replace
-
-    def blocking_replace(src, dst):
-        original_replace(src, dst)
+    def block_after_replace(src, dst):
         if Path(dst) == draft_path and not started.is_set():
             started.set()
             release.wait()
 
-    monkeypatch.setattr("lib.infra.json_io.os.replace", blocking_replace)
+    observe_json_replace(monkeypatch, block_after_replace)
     queue = GenerationQueue(session_factory=file_db_factory, project_manager=projects)
 
     async def execute(task: dict[str, Any], *, claimed_provider_id: str | None = None) -> dict[str, Any]:

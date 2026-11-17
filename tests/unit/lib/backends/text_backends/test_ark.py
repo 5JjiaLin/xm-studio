@@ -10,7 +10,7 @@ import pytest
 
 from lib.backends.text_backends.ark import ArkTextBackend
 from lib.backends.text_backends.base import TextCapability, TextGenerationRequest, TextGenerationResult
-from tests.fakes import bounded_poll_clock, captured_ark_clients, patched_instructor_from_openai
+from tests.fakes import captured_ark_clients, patched_instructor_from_openai
 
 
 @contextmanager
@@ -369,27 +369,6 @@ class TestCapabilityAwareStructured:
         assert calls[0]["max_tokens"] == 24000
         assert "max_completion_tokens" not in calls[0]
 
-    async def test_native_failure_falls_back(self, backend_with_structured, sync_to_thread):
-        """原生 json_schema 运行时失败后降级到 json_object。"""
-        backend_with_structured._test_client.chat.completions.create = MagicMock(
-            side_effect=Exception("schema not supported")
-        )
-        mock_resp = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content='{"a": 1}'))],
-            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
-        )
-        backend_with_structured._openai_client.chat.completions.create = MagicMock(return_value=mock_resp)
-
-        result = await backend_with_structured.generate(
-            TextGenerationRequest(prompt="gen", response_schema={"type": "object"})
-        )
-
-        assert result.text == '{"a": 1}'
-        # 原生路径应该被尝试过
-        backend_with_structured._test_client.chat.completions.create.assert_called_once()
-        # 降级路径应该被使用
-        backend_with_structured._openai_client.chat.completions.create.assert_called_once()
-
 
 class TestSuccessPathReverify:
     """原生 200 后复验 schema：违例则降级带校验路径，并合并原生计费 token。"""
@@ -586,57 +565,10 @@ class TestSuccessPathReverify:
         assert result.output_tokens == 10
         mock_from_openai.assert_not_called()
 
-    async def test_empty_choices_on_200_falls_back(self, backend, sync_to_thread):
-        """原生 200 但 choices 为空（中转/内容审核）→ 解析异常被 catch → 降级，不逃逸。"""
-        from pydantic import BaseModel
-
-        class Person(BaseModel):
-            name: str
-            age: int
-
-        mock_resp = SimpleNamespace(choices=[], usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5))
-        backend._test_client.chat.completions.create = MagicMock(return_value=mock_resp)
-
-        instructor_result = Person(name="Bob", age=25)
-        completion = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=80, completion_tokens=30))
-        mock_patched = MagicMock()
-        mock_patched.chat.completions.create_with_completion = MagicMock(return_value=(instructor_result, completion))
-
-        with patched_instructor_from_openai(mock_patched):
-            result = await backend.generate(TextGenerationRequest(prompt="x", response_schema=Person))
-
-        # 解析异常落入 except → 降级路径，返回带校验结果（不并入原生 token：原生未成功解析）
-        assert result.text == instructor_result.model_dump_json()
-        assert result.input_tokens == 80
-        assert result.output_tokens == 30
-
-    async def test_fallback_transient_error_does_not_replay_native_call(self, backend, sync_to_thread):
-        """降级路径瞬态错误只在降级层重试，不重放已成功（已计费）的原生调用。"""
-        from pydantic import BaseModel
-
-        class Person(BaseModel):
-            name: str
-            age: int
-
-        mock_resp = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="非 JSON 散文"))],
-            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
-        )
-        backend._test_client.chat.completions.create = MagicMock(return_value=mock_resp)
-
-        with (
-            patch(
-                "lib.backends.text_backends.instructor_support.instructor_fallback_sync",
-                side_effect=ConnectionError("503 service unavailable"),
-            ) as mock_instructor,
-            bounded_poll_clock(),
-            pytest.raises(ConnectionError),
-        ):
-            await backend.generate(TextGenerationRequest(prompt="x", response_schema=Person))
-
-        # 原生 200 调用只发生一次；降级层自身重试 3 次穷尽
-        backend._test_client.chat.completions.create.assert_called_once()
-        assert mock_instructor.call_count == 3
+    async def test_empty_choices_on_200_is_incomplete(self, backend, sync_to_thread):
+        backend._test_client.chat.completions.create = MagicMock(return_value=SimpleNamespace(choices=[], usage=None))
+        with pytest.raises(RuntimeError, match="不完整结果"):
+            await backend.generate(TextGenerationRequest(prompt="x", response_schema={"type": "object"}))
 
 
 class TestBaseUrl:
@@ -647,8 +579,8 @@ class TestBaseUrl:
             _recorded_openai_clients() as oa_created,
         ):
             ArkTextBackend(api_key="k", base_url=url)
-        assert ark_created == [{"api_key": "k", "base_url": url}]
-        assert oa_created == [{"base_url": url, "api_key": "k"}]
+        assert ark_created == [{"api_key": "k", "base_url": url, "max_retries": 0}]
+        assert oa_created == [{"base_url": url, "api_key": "k", "max_retries": 0}]
 
     def test_default_base_url_keeps_ark_v3(self):
         from lib.backends.ark_shared import ARK_BASE_URL
@@ -658,5 +590,5 @@ class TestBaseUrl:
             _recorded_openai_clients() as oa_created,
         ):
             ArkTextBackend(api_key="k")
-        assert ark_created == [{"api_key": "k", "base_url": ARK_BASE_URL}]
-        assert oa_created == [{"base_url": ARK_BASE_URL, "api_key": "k"}]
+        assert ark_created == [{"api_key": "k", "base_url": ARK_BASE_URL, "max_retries": 0}]
+        assert oa_created == [{"base_url": ARK_BASE_URL, "api_key": "k", "max_retries": 0}]

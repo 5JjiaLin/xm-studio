@@ -1,18 +1,32 @@
 import { test, expect, expectAccessible, expectReachableLayout } from "../support/test.ts";
 import { waitForEntrance } from "../support/region-helpers.ts";
+import type { WorkflowStatus } from "../../src/types/workflow.ts";
 import { recorded } from "../support/recorded.ts";
 
 const projectFixture = recorded<{ project: Record<string, unknown>; scripts: Record<string, unknown> }>("project-demo.json");
-const workflowFixture = recorded<{ content: Record<string, unknown>; target: Record<string, unknown> }>("project-demo-workflow-status.json");
+const workflowFixture = recorded<WorkflowStatus>("project-demo-workflow-status.json");
 const unit = { unit_id: "E1U1", text: "@[阿明] 说：你好", duration_seconds: 7, note: null };
 const readyQuote = { submittable: true, units: [{ unit_id: "E1U1", outcome: "generate", script_duration_seconds: 7, request_duration_seconds: 8, problems: [] }], estimated_total: { CNY: 1.6 }, unpriced_count: 0, confirmed_request_durations: { E1U1: 8 } };
+const productionWorkflow = (referencesReady = true, videosReady = false) => ({
+  ...workflowFixture,
+  target: { ...workflowFixture.target, source: null },
+  content: { ...workflowFixture.content, formal_script: "present", script_item_count: 1 },
+  gates: { ...workflowFixture.gates, production_inputs: { references_ready: referencesReady, videos_ready: videosReady } },
+  operations: { ...workflowFixture.operations, author_prompts: { state: "admitted" } },
+});
+const assetWorkflow = (names: string[], ready = false) => ({
+  ...productionWorkflow(ready),
+  content: { ...productionWorkflow(ready).content, referenced_assets: names.map((name) => ({
+    name, asset_type: "character" as const, has_description: true, sheet_state: ready ? "current" as const : "missing" as const,
+  })) },
+});
 const productionBase = {
   "GET /api/v1/projects/demo/events/stream": { status: 204, body: "" },
   "GET /api/v1/files/demo/renders/final.mp4?v=1": { status: 204, body: "" },
   "GET /api/v1/files/demo/renders/final.mp4?v=2": { status: 204, body: "" },
   "GET /api/v1/files/demo/reference_videos/E1U1.mp4": { status: 204, body: "" },
   "GET /api/v1/projects/demo": { status: 200, body: { ...projectFixture, project: { ...projectFixture.project, content_mode: "drama", generation_mode: "reference_video" } } },
-  "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: { ...workflowFixture, target: { ...workflowFixture.target, source: null }, content: { ...workflowFixture.content, formal_script: "present" } } },
+  "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: productionWorkflow() },
   "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [{ ...unit, text: "@[阿明] @[阿红] 说：你好" }], unit_capabilities: {} } },
 };
 
@@ -26,8 +40,31 @@ test.beforeEach(({ api }) => {
     "GET /api/v1/auth/status": { status: 200, body: { enabled: false } } });
 });
 
+test("asset summary explains unused suggestions and respects server authoring refusal", async ({ page, api }) => {
+  const workflow = productionWorkflow();
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: {
+      ...workflow,
+      content: { ...workflow.content, asset_summary: {
+        suggested: 5, registered: 5, adopted: 4, missing: 0, stale: 1, unused_suggestions: ["银色纹饰针"],
+      } },
+      operations: { ...workflow.operations, author_prompts: { state: "refused", reason: "script_plan_pending_review" } },
+    } },
+    "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [{ ...unit, pending_authoring: true }], unit_capabilities: {} } },
+  });
+  await page.goto("/app/make/demo?step=assets&episode=1");
+  await expect(page.getByText("本次建议 5 项 · 项目已登记 5 项 · 本集采用 4 项 · 缺图 0 项 · 过期 1 项", { exact: true })).toBeVisible();
+  await expect(page.getByText(/银色纹饰针/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "确认资产并编写视频提示词", exact: true })).toBeDisabled();
+  await expectReachableLayout(page);
+});
+
 test("a referenced character variant has its own image and blocks video preparation until ready", async ({ page, api }) => {
   api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: { ...productionWorkflow(false), content: { ...workflowFixture.content, formal_script: "present", referenced_assets: [
+      { name: "阿明", asset_type: "character", has_description: true, sheet_state: "current" },
+      { name: "阿明/战斗装", asset_type: "character", has_description: true, sheet_state: "missing" },
+    ] } } },
     "GET /api/v1/files/demo/characters/base.png": { status: 204, body: "" },
     "GET /api/v1/projects/demo": { status: 200, body: { ...projectFixture, project: { ...projectFixture.project, content_mode: "drama", generation_mode: "reference_video", characters: { "阿明": { description: "主角", character_sheet: "characters/base.png", derivatives: { "战斗装": { description: "换上铠甲", character_sheet: "" } } } }, scenes: {}, props: {} } } },
     "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [{ ...unit, pending_authoring: true, text: "@[阿明/战斗装] 走进房间" }], unit_capabilities: {} } },
@@ -275,6 +312,7 @@ test("completed videos stay for review and only a confirmed single clip is regen
   let merged = 0;
   let saved = unit.text;
   api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: productionWorkflow(true, true) },
     "GET /api/v1/tasks?page=1&page_size=100": { status: 200, body: { items: [], total: 0 } },
     "GET /api/v1/files/demo/reference_videos/E1U2.mp4": { status: 204, body: "" },
     "POST /api/v1/projects/demo/reference-videos/episodes/1/units/E1U2/prompt-preview": { status: 200, body: { text: "完整视频框架", creative_text: "完整视频框架", declarations: "", references: [], unavailable: null } },
@@ -298,7 +336,7 @@ test("completed videos stay for review and only a confirmed single clip is regen
     generated.push(route.request().postDataJSON()); status = "active";
     await route.fulfill({ json: { episode: 1, status, stage: "videos", action: "videos" } });
   });
-  await page.route("**/api/v1/projects/demo/episodes/1/production/render", async (route) => {
+  await page.route("**/api/v1/projects/demo/episodes/1/production/finish", async (route) => {
     merged++;
     await route.fulfill({ json: { episode: 1, status: "active", stage: "render" } });
   });
@@ -312,6 +350,7 @@ test("completed videos stay for review and only a confirmed single clip is regen
   status = "completed";
   await expect(regenerate).toBeEnabled({ timeout: 10000 });
   await expect(merge).toBeEnabled();
+  await expect(page.getByText("保留视频原声，按剪辑时间线合成成片与剪映草稿，无需配置音频模型。", { exact: true })).toBeVisible();
   await expect(page).toHaveURL(/step=videos&episode=1$/);
   expect([generated.length, merged]).toEqual([0, 0]);
   await page.reload();
@@ -363,6 +402,7 @@ test("asset edits save and regenerate directly without a quote", async ({ page, 
   const paid: string[] = [];
   page.on("request", (request) => { if (request.method() === "POST" && request.url().includes("/generate/character/")) paid.push(request.url()); });
   api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: assetWorkflow(["阿明"], false) },
     "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: { episode: 1, status: "confirmed", fingerprint: "confirmed", content: null } },
     "GET /api/v1/projects/demo": { status: 200, body: { ...projectFixture, project: { ...projectFixture.project, content_mode: "drama", generation_mode: "reference_video", characters: { 阿明: { description: "青年" } }, scenes: {}, props: {} } } },
     "PATCH /api/v1/projects/demo/characters/%E9%98%BF%E6%98%8E": { status: 200, body: { success: true } },
@@ -399,6 +439,7 @@ test("only current rendered output has one working download", async ({ page, api
 test("stale or missing outputs cannot masquerade as current downloads", async ({ page, api }) => {
   for (const status of ["stale", "missing"]) {
     api.override({ ...productionBase,
+      "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: productionWorkflow(true, true) },
       "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [{ ...unit, generated_assets: { video_clip: "reference_videos/E1U1.mp4" } }], unit_capabilities: {} } },
       "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "completed", stage: "render", output: { status, artifact_path: "renders/final.mp4", version: status === "missing" ? null : 1 } } },
     });
@@ -413,14 +454,15 @@ test("render failure offers local rebuilding without paid video retry", async ({
   const posts: string[] = [];
   page.on("request", (request) => { if (request.method() === "POST" && !request.url().endsWith("/prompt-preview")) posts.push(new URL(request.url()).pathname); });
   api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: productionWorkflow(true, true) },
     "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [{ ...unit, generated_assets: { video_clip: "reference_videos/E1U1.mp4" } }], unit_capabilities: {} } },
     "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "failed", stage: "render", action: "videos", error: "render failed", members: [{ unit_id: "render-final-cut", status: "failed" }] } },
-    "POST /api/v1/projects/demo/episodes/1/production/render": { status: 200, body: { episode: 1, status: "active", stage: "render" } },
+    "POST /api/v1/projects/demo/episodes/1/production/finish": { status: 200, body: { episode: 1, status: "active", stage: "render", action: "finish" } },
   });
   await page.goto("/app/make/demo?step=videos");
   await expect(page.getByRole("button", { name: "重试失败项", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "确认视频并合成成片", exact: true }).click();
-  await expect.poll(() => posts.filter((path) => path.endsWith("/production/render")).length).toBe(1);
+  await expect.poll(() => posts.filter((path) => path.endsWith("/production/finish")).length).toBe(1);
   expect(posts.filter((path) => path.endsWith("/production/videos"))).toEqual([]);
 });
 
@@ -447,7 +489,7 @@ test("breakdown saves edited content before confirming its latest fingerprint", 
     "POST /api/v1/projects/demo/episodes/1/production/videos/preview": { status: 200, body: readyQuote },
   });
   await page.route("**/api/v1/projects/demo/episodes/1/script-review**", async (route) => {
-    if (route.request().method() === "POST") calls.push({ method: "confirm", body: { fingerprint } });
+    if (route.request().method() === "POST") calls.push({ method: "confirm", body: route.request().postDataJSON() });
     if (route.request().method() === "PUT") {
       content = route.request().postDataJSON() as typeof content;
       calls.push({ method: "save", body: content });
@@ -467,7 +509,7 @@ test("breakdown saves edited content before confirming its latest fingerprint", 
   expect(content.units[0].duration_seconds).toBe(8);
   expect(content.new_assets[0].generation_prompt).toBe("穿白衬衫的青年");
   expect(content.new_assets[0].description).toBe("青年");
-  expect(calls[1].body).toEqual({ fingerprint: "after-edit" });
+  expect(calls[1].body).toEqual({ overwrite_revision: null, plan_fingerprint: "after-edit" });
 });
 
 test("replanning requires a saved draft, reason and explicit confirmation", async ({ page, api }) => {
@@ -476,7 +518,7 @@ test("replanning requires a saved draft, reason and explicit confirmation", asyn
   let submissions = 0;
   let submittedBody: unknown;
   api.override({ ...productionBase,
-    "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: { episode: 1, content_mode: "drama", status: "pending_review", fingerprint: "draft", confirmed_at: null, content, quarantine: null, supported_durations: null, duration_tiers: null, script_overwrite: null } },
+    "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: { episode: 1, content_mode: "drama", status: "pending_review", fingerprint: "draft", confirmed_at: null, content, quarantine: null, supported_durations: null, duration_tiers: null, script_overwrite: null, repair_enabled: true, repair_allowed: true } },
   });
   await page.route("**/api/v1/projects/demo/episodes/1/script-plan", async (route) => {
     submittedBody = route.request().postDataJSON();
@@ -489,6 +531,8 @@ test("replanning requires a saved draft, reason and explicit confirmation", asyn
   await replan.click();
   const dialog = page.getByRole("alertdialog");
   await expect(dialog).toContainText("修改都会丢失");
+  const repairOnce = dialog.getByRole("checkbox", { name: "失败时最多修正一次（可能增加一次文本生成，默认关闭）", exact: true });
+  await expect(repairOnce).not.toBeChecked();
   const confirm = dialog.getByRole("button", { name: "重新拆解", exact: true });
   const reason = dialog.getByRole("textbox", { name: "重新拆解的原因", exact: true });
   await expect(confirm).toBeDisabled();
@@ -496,6 +540,7 @@ test("replanning requires a saved draft, reason and explicit confirmation", asyn
   await expect(confirm).toBeDisabled();
   await expectReachableLayout(page);
   await expectAccessible(page);
+  await repairOnce.check();
   await dialog.getByRole("button", { name: "取消" }).click();
   await expect(dialog).toHaveCount(0);
   expect(submissions).toBe(0);
@@ -505,17 +550,149 @@ test("replanning requires a saved draft, reason and explicit confirmation", asyn
   expect(submissions).toBe(0);
   await page.getByRole("textbox", { name: "单元 1 内容", exact: true }).fill(unit.text);
   await replan.click();
+  await expect(repairOnce).not.toBeChecked();
   await reason.fill("  手链脚链归入人物束缚形态，不单独建道具；保留束缚状态。  ");
+  await repairOnce.check();
   await confirm.click();
   await expect.poll(() => submissions).toBe(1);
-  expect(submittedBody).toEqual({ replan_reason: "手链脚链归入人物束缚形态，不单独建道具；保留束缚状态。" });
+  expect(submittedBody).toEqual({ replan_reason: "手链脚链归入人物束缚形态，不单独建道具；保留束缚状态。", repair_once: true });
   await expect(dialog).toHaveCount(0);
+});
+
+test("saved-response recheck is explicit and submits only the original task reference", async ({ page, api }) => {
+  const posts: unknown[] = [];
+  api.override({ ...productionBase,
+    "POST /api/v1/projects/demo/episodes/1/script-plan": { status: 200, body: { batch: { members: [] } } },
+    "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: {
+      episode: 1, content_mode: "drama", status: "pending_review", fingerprint: null, confirmed_at: null,
+      content: null, supported_durations: null, duration_tiers: null, script_overwrite: null,
+      repair_enabled: true,
+      repair_progress: { task_id: "task-response-saved", phase: "revalidating", calls_started: 2, can_recheck: true },
+      quarantine: {
+        doc_type: "reference_script_plan", revision: "sha256-v1:draft-1", editable_by: "user",
+        content: { units: [{ ...unit, source_text: "阿明说：你好" }], new_assets: [] },
+        violations: [], soft_violations: [], formal_exists: false,
+        repair: { available: true, target_count: 1, reason: null },
+      },
+    } },
+  });
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().endsWith("/script-plan")) posts.push(request.postDataJSON());
+  });
+  await page.goto("/app/make/demo?step=breakdown&episode=1");
+  const recheck = page.getByRole("button", { name: "复验已保存结果（不调用模型）", exact: true });
+  await expect(recheck).toBeVisible();
+  await expect.poll(() => posts).toEqual([]);
+  await recheck.click();
+  await expect.poll(() => posts).toEqual([{ repair_recheck_task_id: "task-response-saved" }]);
+  await expectReachableLayout(page);
+  await expectAccessible(page);
+});
+
+test("confirmed episodes cannot authorize repair even when the feature is enabled", async ({ page, api }) => {
+  let submittedBody: unknown;
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: {
+      episode: 1, status: "confirmed", fingerprint: "confirmed", content_mode: "drama",
+      content: { units: [{ ...unit, source_text: "阿明说：你好" }], new_assets: [] },
+      quarantine: null, repair_enabled: true, repair_allowed: false,
+    } },
+  });
+  await page.route("**/api/v1/projects/demo/episodes/1/script-plan", async (route) => {
+    submittedBody = route.request().postDataJSON();
+    await route.fulfill({ json: { batch: { members: [] } } });
+  });
+  await page.goto("/app/make/demo?step=breakdown&episode=1");
+  await page.getByRole("button", { name: "重新拆解", exact: true }).click();
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog.getByRole("checkbox")).toHaveCount(0);
+  await dialog.getByRole("textbox", { name: "重新拆解的原因", exact: true }).fill("重新核对剧情");
+  await dialog.getByRole("button", { name: "重新拆解", exact: true }).click();
+  await expect.poll(() => submittedBody).toEqual({ replan_reason: "重新核对剧情" });
+});
+
+test("disabled repair retains the local draft check without posting a generation", async ({ page, api }) => {
+  const posts: unknown[] = [];
+  api.override({ ...productionBase,
+    "PUT /api/v1/projects/demo/episodes/1/drafts/reference_script_plan": { status: 200, body: { episode: 1, doc_type: "reference_script_plan", adopted: false, draft: null } },
+    "POST /api/v1/projects/demo/episodes/1/script-plan": { status: 200, body: { batch: { members: [] } } },
+    "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: {
+      episode: 1, status: "pending_review", fingerprint: null, content: null, content_mode: "drama",
+      repair_enabled: false, repair_allowed: false,
+      repair_progress: { task_id: "saved", phase: "failed", can_recheck: true, calls_started: 2 },
+      quarantine: {
+        doc_type: "reference_script_plan", revision: "draft-revision", editable_by: "user",
+        content: { units: [{ ...unit, source_text: "阿明说：你好" }], new_assets: [] },
+        violations: [{ code: "dialogue_overload", label: "U1", message: "对白超载" }],
+        soft_violations: [], repair: { available: true, target_count: 1, reason: null },
+      },
+    } },
+  });
+  page.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/script-plan")) posts.push(request.postDataJSON()); });
+  await page.goto("/app/make/demo?step=breakdown&episode=1");
+  await expect(page.getByRole("button", { name: "按错误修复", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "复验已保存结果（不调用模型）", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "保存并校验", exact: true }).click();
+  expect(posts).toEqual([]);
+  await page.getByRole("button", { name: "复验已保存结果（不调用模型）", exact: true }).click();
+  await expect.poll(() => posts).toEqual([{ repair_recheck_task_id: "saved" }]);
+});
+
+test("entering or refreshing breakdown never opts into paid repair", async ({ page, api }) => {
+  const posts: unknown[] = [];
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: {
+      episode: 1, content_mode: "drama", status: "pending_review", fingerprint: null, confirmed_at: null,
+      content: null, supported_durations: null, duration_tiers: null, script_overwrite: null,
+      repair_enabled: true, repair_allowed: true,
+      repair_progress: { task_id: "task-no-response", phase: "failed", calls_started: 1, can_recheck: false },
+      quarantine: {
+        doc_type: "reference_script_plan", revision: "sha256-v1:draft-2", editable_by: "user",
+        content: { units: [{ ...unit, source_text: "阿明说：你好" }], new_assets: [] },
+        violations: [{ code: "unsupported", label: "U1", message: "需要人工处理" }],
+        soft_violations: [], formal_exists: false,
+        repair: { available: false, target_count: 0, reason: "需要人工处理" },
+      },
+    } },
+  });
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().endsWith("/script-plan")) posts.push(request.postDataJSON());
+  });
+  await page.goto("/app/make/demo?step=breakdown&episode=1");
+  await expect(page.getByRole("button", { name: "按错误修复", exact: true })).toBeDisabled();
+  await page.reload();
+  await expect(page.getByRole("button", { name: "按错误修复", exact: true })).toBeDisabled();
+  expect(posts).toEqual([]);
+});
+
+test("unreadable saved evidence explains recovery and never offers a blind model retry", async ({ page, api }) => {
+  const posts: string[] = [];
+  const reason = "原任务恢复证据不可读，请核对原任务；不会重新调用模型";
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: {
+      episode: 1, content_mode: "drama", status: "pending_review", fingerprint: null, confirmed_at: null,
+      content: null, quarantine: null, supported_durations: null, duration_tiers: null, script_overwrite: null,
+      repair_enabled: false, repair_allowed: false,
+      repair_progress: { task_id: "unreadable-result", phase: "failed", calls_started: 2, can_recheck: false, recheck_reason: reason },
+    } },
+  });
+  page.on("request", (request) => { if (request.method() === "POST") posts.push(new URL(request.url()).pathname); });
+  await page.goto("/app/make/demo?step=breakdown&episode=1");
+  await expect(page.getByText(reason, { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "复验已保存结果（不调用模型）", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "按错误修复", exact: true })).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByText(reason, { exact: true })).toBeVisible();
+  expect(posts).toEqual([]);
+  await expectReachableLayout(page);
+  await expectAccessible(page);
 });
 
 test("failed asset continuation can resume in place without submitting videos", async ({ page, api }) => {
   const paid: string[] = [];
   page.on("request", (request) => { if (request.method() === "POST") paid.push(new URL(request.url()).pathname); });
   api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: assetWorkflow(["阿明", "阿红"], false) },
     "GET /api/v1/projects/demo": { status: 200, body: assetsProject },
     "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "failed", stage: "prompts", action: "assets", error: "failed" } },
     "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: { episode: 1, status: "confirmed", fingerprint: "confirmed", content: null } },
@@ -618,6 +795,7 @@ test("asset prompts must be reviewed before explicit generation and refresh neve
   let started = 0;
   let state = { episode: 1, status: "idle", stage: null as string | null, action: "assets" };
   api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: assetWorkflow(["阿明", "阿红"], false) },
     "GET /api/v1/projects/demo": { status: 200, body: assetsProject },
     "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: { episode: 1, status: "confirmed", fingerprint: "confirmed", content: null } },
     "POST /api/v1/projects/demo/episodes/1/production/videos/preview": { status: 200, body: { ...readyQuote, submittable: false } },
@@ -656,6 +834,7 @@ test("completed images are preserved and each card regenerates independently", a
   let retried = 0;
   const imageTask = { ...planTask, task_id: "old-image", task_type: "character", media_type: "image", resource_id: "阿明", status: "succeeded", finished_at: "2026-01-01T08:00:00", updated_at: "2026-01-01T08:00:00" };
   api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: assetWorkflow(["阿明", "阿红"], true) },
     "GET /api/v1/projects/demo": { status: 200, body: { ...assetsProject, project: { ...assetsProject.project, characters: { 阿明: { description: "青年", character_sheet: "characters/a.png" }, 阿红: { description: "少女", character_sheet: "characters/b.png" } } } } },
     "GET /api/v1/files/demo/characters/a.png": { status: 204, body: "" },
     "GET /api/v1/files/demo/characters/b.png": { status: 204, body: "" },
@@ -684,6 +863,7 @@ test("failed image stays visible across reload and retries only when clicked", a
   const calls: string[] = [];
   page.on("request", (request) => { if (request.method() === "POST" && /\/generate\//.test(request.url())) calls.push(new URL(request.url()).pathname); });
   api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: assetWorkflow(["阿明", "阿红"], false) },
     "GET /api/v1/projects/demo": { status: 200, body: assetsProject },
     "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "failed", stage: "assets", action: "assets" } },
     "GET /api/v1/tasks?page_size=200&project_name=demo": { status: 200, body: { items: [{ ...planTask, task_type: "character", media_type: "image", resource_id: "阿明", status: "failed", error_message: "供应商生成失败" }], total: 1 } },
@@ -968,9 +1148,24 @@ test("manual clip and caption edits persist and export locally", async ({ page, 
     }
     await route.fulfill({ json: edit });
   });
+  // The saved timeline preview uses source audio even if the project once used TTS.
+  await page.route(`**/api/v1/projects/demo/edit-timelines/${edit.timeline_id}`, (route) => route.fulfill({ json: {
+    timeline: { id: edit.timeline_id, name: "人工初剪", episode: 1 }, revision: edit.revision, latest_revision: edit.revision,
+    duration: edit.duration, bgm: [], issues: [], clips: edit.clips.filter((c) => c.included !== false).map((c, index) => ({
+      id: c.id, unit_id: c.unit_id, status: "ready", start: index * 2, duration: 2, source_duration: 2,
+      video_version: 1, trim: null, source_volume: c.source_volume, hold: 0, carries_narration: false,
+      narration: null, reason: null, transition_to_next: null,
+    })),
+  } }));
+  await page.route(`**/api/v1/projects/demo/edit-timelines/${edit.timeline_id}/preview-media?narration=without_narration`, (route) => route.fulfill({ json: {
+    timeline_id: edit.timeline_id, revision: edit.revision, narration: "without_narration", bgm: [],
+    units: edit.clips.map((c) => ({ unit_id: c.unit_id, provider_audio: true, narration_audio: null, subtitles_follow_narration: false, subtitles: [] })),
+  } }));
   page.on("request", (request) => { if (request.method() === "POST" && !request.url().endsWith("/prompt-preview")) posts.push(new URL(request.url()).pathname); });
   await page.goto("/app/make/demo?step=output&episode=1");
   await page.getByRole("button", { name: "编辑成片", exact: true }).click();
+  await expect(page.getByText("配乐（可选）", { exact: true })).toBeVisible();
+  await expect(page.getByText("请先在模型配置中配置 MiniMax API Key。", { exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "增加字幕", exact: true }).click();
   await page.getByRole("textbox", { name: "字幕 1", exact: true }).fill("人工修改的字幕");
   await page.getByRole("spinbutton", { name: "开始秒数 1", exact: true }).fill("0.2");
@@ -993,7 +1188,7 @@ test("manual clip and caption edits persist and export locally", async ({ page, 
   await page.getByRole("textbox", { name: "字幕 1", exact: true }).fill("直接保存并导出的字幕");
   await page.getByRole("button", { name: "保存并重新导出", exact: true }).click();
   await expect.poll(() => posts.includes("/api/v1/projects/demo/episodes/1/production/render")).toBe(true);
-  expect(posts.filter((path) => /\/production\/(videos|assets)$/.test(path))).toEqual([]);
+  expect(posts.filter((path) => /\/production\/(videos|assets|music)$/.test(path))).toEqual([]);
 });
 
 
@@ -1214,6 +1409,7 @@ for (const entry of ["footer", "navigation"] as const) {
 
 const promptAuthoringBase = {
   ...productionBase,
+  "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: assetWorkflow(["阿明"], true) },
   "GET /api/v1/files/demo/characters/a.png": { status: 204, body: "" },
   "GET /api/v1/projects/demo": { status: 200, body: { ...assetsProject, project: { ...assetsProject.project, characters: { 阿明: { description: "青年", character_sheet: "characters/a.png" } } } } },
   "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "idle", stage: null } },
@@ -1318,6 +1514,7 @@ test("character angle crop uploads only the selected pixels with no generation c
   const paid: string[] = [];
   page.on("request", (r) => { if (r.method() === "POST" && /\/(generate|production\/(assets|videos))($|\/)/.test(new URL(r.url()).pathname)) paid.push(r.url()); });
   api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: assetWorkflow(["阿明"], true) },
     "GET /api/v1/projects/demo": { status: 200, body: { ...assetsProject, project: { ...assetsProject.project, characters: { 阿明: { description: "青年", character_sheet: sheet } } } } },
     "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "idle", stage: null } },
   });
@@ -1598,4 +1795,79 @@ test("unknown whole script submission remains read-only after refresh", async ({
   await expect(page.getByText("提交结果待核对，不会重复提交 · 0/1", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "继续未完成集", exact: true })).toHaveCount(0);
   expect(writes).toEqual([]);
+});
+
+test("authoring failure reveals its new repair draft without reload or generation", async ({ page, api }) => {
+  const posts: string[] = [];
+  page.on("request", (request) => { if (request.method() === "POST") posts.push(request.url()); });
+  const task = { ...planTask, task_id: "authoring-task", task_type: "text_episode_script", resource_id: "episode-1" };
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [{ ...unit, pending_authoring: true }], unit_capabilities: {} } },
+    "GET /api/v1/tasks?page_size=200&project_name=demo": { status: 200, body: { items: [task], total: 1 } },
+    "GET /api/v1/projects/demo/episodes/1/drafts": { status: 200, body: { episode: 1, drafts: [] } },
+  });
+  await page.goto("/app/make/demo?step=videos&episode=1");
+  await expect(page.getByRole("button", { name: "确认生成视频", exact: true })).toBeDisabled();
+  await expect(page.getByText(/^提示词编写草稿待修复/)).toHaveCount(0);
+  await expect(page.getByRole("status")).toContainText("正在编写视频提示词");
+  // Let the initial no-draft read and a subsequent task poll settle before failure.
+  await page.waitForResponse((response) => response.url().includes("/api/v1/tasks?") && response.status() === 200);
+  api.override({
+    "GET /api/v1/tasks?page_size=200&project_name=demo": { status: 200, body: { items: [{ ...task, status: "failed", error_message: "unit_count_changed", finished_at: "2026-01-01T08:00:00", updated_at: "2026-01-01T08:00:00" }], total: 1 } },
+    "GET /api/v1/projects/demo/episodes/1/drafts": { status: 200, body: { episode: 1, drafts: [{ doc_type: "reference_prompt_authoring", editable_by: "user", violation_count: 1 }] } },
+  });
+  await expect(page.getByText(/^提示词编写草稿待修复/)).toBeVisible({ timeout: 15000 });
+  await expect(page.getByRole("button", { name: "AI 修复", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "保存并校验", exact: true })).toBeVisible();
+  expect(posts).toEqual([]);
+  await expectReachableLayout(page);
+});
+
+
+test("adopted repair clears old authoring failure and offers remaining prompts without auto submitting", async ({ page, api }) => {
+  const posts: string[] = [];
+  page.on("request", (request) => { if (request.method() === "POST") posts.push(request.url()); });
+  const failed = { ...planTask, task_id: "authoring-failed", task_type: "text_episode_script", status: "failed", error_message: "旧资产引用错误" };
+  const repaired = { ...planTask, task_id: "repair-ok", task_type: "text_draft_repair", resource_id: "episode-1-reference_prompt_authoring", status: "succeeded", queued_at: "2026-01-01T08:02:00", result: { adopted: true, violation_count: 0 } };
+  const workflow = productionWorkflow();
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: { ...workflow, content: { ...workflow.content, drafts: [] } } },
+    "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: Array.from({ length: 12 }, (_, i) => ({ ...unit, unit_id: `E1U${i+1}`, pending_authoring: i >= 3 })), unit_capabilities: {} } },
+    "GET /api/v1/tasks?page_size=200&project_name=demo": { status: 200, body: { items: [repaired, failed], total: 2 } },
+    "GET /api/v1/projects/demo/episodes/1/drafts": { status: 200, body: { episode: 1, drafts: [] } },
+  });
+  await page.goto("/app/make/demo?step=videos&episode=1");
+  await expect(page.getByText("出错批次已修复并保存。视频提示词已完成 3 / 12 个，剩余 9 个待编写。", { exact: true })).toBeVisible();
+  await expect(page.getByText(/旧资产引用错误/)).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "继续编写剩余提示词", exact: true })).toBeEnabled();
+  expect(posts).toEqual([]);
+  await page.reload();
+  await expect(page.getByRole("button", { name: "继续编写剩余提示词", exact: true })).toBeVisible();
+  expect(posts).toEqual([]);
+  // A later failure must still be shown; the prior adoption is not a global mute.
+  api.override({ "GET /api/v1/tasks?page_size=200&project_name=demo": { status: 200, body: { items: [repaired, { ...failed, queued_at: "2026-01-01T08:03:00" }], total: 2 } } });
+  await page.reload();
+  await expect(page.getByText(/旧资产引用错误/)).toBeVisible();
+});
+
+test("confirmed breakdown starts a version-bound manual revision only after an explicit click", async ({ page, api }) => {
+  const content = { units: [{ ...unit, source_text: "阿明说：你好" }], new_assets: [] };
+  const state = { ...recorded<Record<string, unknown>>("project-demo-script-review.json"), episode: 1, status: "confirmed", fingerprint: "reviewed", content, quarantine: null };
+  const requests: unknown[] = [];
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: state },
+  });
+  await page.route("**/api/v1/projects/demo/episodes/1/script-review/revise", async (route) => {
+    requests.push(route.request().postDataJSON());
+    await route.fulfill({ json: state });
+  });
+  await page.goto("/app/make/demo?step=breakdown&episode=1");
+  const revise = page.getByRole("button", { name: "编辑 · 拆解", exact: true });
+  await expect(revise).toBeVisible();
+  await page.reload();
+  await expect(revise).toBeVisible();
+  expect(requests).toEqual([]);
+  await revise.click();
+  await expect.poll(() => requests).toEqual([{ plan_fingerprint: "reviewed" }]);
+  await expectReachableLayout(page);
 });

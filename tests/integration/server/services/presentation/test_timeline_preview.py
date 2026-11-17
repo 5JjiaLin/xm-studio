@@ -93,6 +93,18 @@ async def test_post_production_project_previews_without_narration(tmp_path: Path
     ]
 
 
+async def test_production_preview_can_use_source_audio_despite_tts_project_default(tmp_path: Path) -> None:
+    pm, _ = setup_project(tmp_path)
+    timeline_id = await edited_timeline(pm)
+    media = await TimelinePreviewService(pm).media("demo", timeline_id, narration="without_narration")
+    assert media.narration == "without_narration"
+    assert all(unit.narration_audio is None and unit.provider_audio for unit in media.units)
+    assert _rows(media) == [
+        ("E1S01", None, False, [("旁白一句", 0.0, 2.0)]),
+        ("E1S02", None, False, [("第二段", 0.0, 1.5)]),
+    ]
+
+
 async def test_unit_without_video_is_listed_without_subtitles(tmp_path: Path) -> None:
     pm, project_path = setup_project(tmp_path)
     script_path = project_path / "scripts" / "episode_1.json"

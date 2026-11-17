@@ -13,6 +13,7 @@ slots:
   body: 第二段：单元正文，mention 已换成主体记号，台词记号已重组，旁白记号已丢弃
   style: 项目画风
   style_description: 项目风格描述
+  policy_style: 新策略固定的 Style/Avoid 文本；空值时使用项目画风
   co_present_characters: 同框的不同角色，本体与衍生合并计一个；不足两个时为空
   products: 随请求发出参考图的商品名，按首现顺序去重；无商品参考图时为空
 protected: false
@@ -21,8 +22,12 @@ protected: false
 
 {{ body }}
 
+{% if policy_style %}
+{{ policy_style }}
+{% else %}
 {{ partial("shared/media_style") }}
 {{ partial("reference_video/unit/avoid") }}
+{% endif %}
 {% if products %}
 
 商品高保真还原（最高优先级，优先于前述文字/Logo 禁止项）：画面中的商品{{ partial("reference_video/unit/lists/products") }}必须与商品参考图完全一致——{{ partial("shared/product_fidelity") }}，不得重新设计或美化商品本身；前述文字/Logo 禁止项仅指画面中不得凭空新增文字或 Logo，商品参考图自带的文字与 Logo须原样保留；项目画风只作用于商品以外的画面元素。

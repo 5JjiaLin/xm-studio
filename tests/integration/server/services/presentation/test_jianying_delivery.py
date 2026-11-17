@@ -11,6 +11,7 @@ from lib.infra.json_io import atomic_write_json, load_json
 from lib.jianying_draft import local_delivery as local
 from server.services.presentation.jianying_delivery import delivery_store, execute_delivery
 from server.services.presentation.timeline_jianying_draft import TimelineJianyingDraftService
+from tests.fakes import use_jianying_compatibility_ready, use_jianying_process_state
 from tests.integration.server.services.presentation.timeline_render_support import (
     _append_revision,
     edited_timeline,
@@ -45,8 +46,8 @@ async def test_real_manual_subtitles_packaging_wait_resume_and_independent_new_v
     root = tmp_path / "剪映 草稿"
     root.mkdir()
     atomic_write_json(root / "root_meta_info.json", {"all_draft_store": [], "future": 42})
-    monkeypatch.setattr(local, "compatibility", lambda _: {"ready": True})
-    monkeypatch.setattr(local, "process_state", lambda: "running")
+    use_jianying_compatibility_ready(monkeypatch)
+    use_jianying_process_state(monkeypatch, "running")
     store = delivery_store(pm)
     store.save_settings(local.LocalSettings(enabled=True, app_path=str(tmp_path), draft_root=str(root)))
     args = {
@@ -76,7 +77,7 @@ async def test_real_manual_subtitles_packaging_wait_resume_and_independent_new_v
         assert segment["target_timerange"] == {"start": 100000, "duration": 600000}
         assert segment["clip"]["transform"]["y"] == 0.75
         assert all(m["path"].startswith(str(root / record["folder"])) for m in draft["materials"]["videos"])
-    monkeypatch.setattr(local, "process_state", lambda: "stopped")
+    use_jianying_process_state(monkeypatch, "stopped")
     result = await execute_delivery(pm, record["delivery_id"])
     assert result["state"] == "delivered"
     target = root / record["folder"] / "draft_info.json"

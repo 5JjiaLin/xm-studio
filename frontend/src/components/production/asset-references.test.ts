@@ -16,3 +16,8 @@ it("removes a parent character's angle references while preserving all dialogue"
   expect(replaceAssetReferences(text, "阿明", "")).toBe("阿明抬头。@[阿明]{别走} @[阿明二号]");
   expect(replaceAssetReferences(text, "阿明", "阿红")).toBe("@[阿红]抬头。@[阿红]{别走} @[阿明二号]");
 });
+
+it("replaces complete derivative speaker identity and keeps literal spoken references", () => {
+  expect(replaceAssetReferences("@[阿离/雨衣]进门。@[阿离/雨衣]{保留@[阿离/雨衣]。}", "阿离/雨衣", "裴与"))
+    .toBe("@[裴与]进门。@[裴与]{保留@[阿离/雨衣]。}");
+});

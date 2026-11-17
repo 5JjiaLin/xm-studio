@@ -810,6 +810,15 @@ def test_episode_with_videos_and_an_edit_timeline_is_complete_despite_in_episode
     assert episode.content.episode_complete
     assert episode.content.pending_authoring_ids == ["E1S01"]
     assert episode.content.referenced_assets_without_sheet == ["小明"]
+    assert [asset.model_dump() for asset in episode.content.referenced_assets] == [
+        {
+            "asset_type": "character",
+            "name": "小明",
+            "owner": None,
+            "has_description": True,
+            "sheet_state": "missing",
+        }
+    ]
     assert episode.next_action.type == "author_prompts"
     assert not workflow_finished(episode)
 
@@ -1397,6 +1406,10 @@ def test_referenced_asset_reminders_stay_out_of_the_next_step(tmp_path: Path) ->
     assert status.content is not None
     assert status.content.referenced_asset_sheets_stale == ["Alice"]
     assert status.content.referenced_assets_without_description == ["Bob"]
+    assert {asset.name: (asset.has_description, asset.sheet_state) for asset in status.content.referenced_assets} == {
+        "Alice": (True, "stale"),
+        "Bob": (False, "missing"),
+    }
     assert status.next_action.type == "generate_storyboards"
 
 
@@ -1697,6 +1710,40 @@ def test_schema8_ad_reference_video_does_not_treat_an_unregistered_file_as_curre
         "missing_ids": ["E1U1"],
         "stale_ids": [],
     }
+    assert status.gates["production_inputs"]["videos_ready"] is False
+
+
+def test_production_asset_summary_explains_five_registered_but_four_adopted(tmp_path: Path) -> None:
+    pm, project_path = _make_project(tmp_path, "drama", generation_mode="reference_video")
+    _write_source(pm, project_path)
+    _write_episode_source(project_path)
+    pm.update_project(
+        "demo", lambda project: project.update(
+            episodes=[{"episode": 1, "script_file": "scripts/episode_1.json", "ledger_status": "planned"}]
+        ),
+    )
+    suggestions = []
+    for kind, names in (("character", ("A", "B")), ("scene", ("石殿",)), ("prop", ("木箱", "银针"))):
+        for name in names:
+            suggestions.append({"type": kind, "name": name, "decision": "register", "description": "设计描述", "reason": "本集出现"})
+            if kind == "scene":
+                pm.add_scenes_batch("demo", {name: {"description": "设计描述"}})
+            else:
+                getattr(pm, {"character": "add_character", "prop": "add_prop"}[kind])("demo", name, "设计描述")
+    draft = project_path / "drafts/episode_1/script_plan_reference_units.json"
+    draft.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(draft, {"units": [], "new_assets": suggestions})
+    _register_script_plan(project_path)
+    _write_registered_script(project_path, {
+        "episode": 1, "title": "第一集", "content_mode": "drama", "generation_mode": "reference_video",
+        "video_units": [_valid_video_unit(text="@[A] 与 @[B] 站在 @[石殿]，手提 @[木箱]。")],
+    })
+    status = WorkflowStateService(pm).get_status("demo")
+    assert status.content.asset_summary == {
+        "suggested": 5, "registered": 5, "adopted": 4, "missing": 4, "stale": 0,
+        "unused_suggestions": ["银针"],
+    }
+    assert status.gates["production_inputs"]["references_ready"] is False
 
 
 def test_schema8_workflow_accepts_a_registered_manual_reference_video(tmp_path: Path) -> None:

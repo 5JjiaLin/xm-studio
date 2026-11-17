@@ -11,6 +11,7 @@ from lib.script.reference_video.draft_validation import (
     assert_dialogue_preserved,
     dialogue_speakers,
     normative_lines,
+    out_of_order_source_anchor_indices,
     validate_dialogue_load,
     validate_source_text_anchor,
     validate_unit_text,
@@ -32,6 +33,22 @@ DERIVATIVE_PROJECT = {
 #: 带组合附加符的角色名（越南语），两种编码屏幕显示相同、字节不同——资产名比对的坐标系用例。
 _NAME_NFC = unicodedata.normalize("NFC", "Hiếu")
 _NAME_NFD = unicodedata.normalize("NFD", "Hiếu")
+
+
+def test_template_only_mode_skips_content_checks_but_preserves_reference_binding(monkeypatch):
+    monkeypatch.setenv("ARCREEL_PROMPT_CONTENT_VALIDATION", "false")
+    assert validate_source_text_anchor("unit 1", "改写的摘录", "原文") is None
+    assert out_of_order_source_anchor_indices(["后", "前"], "前后") == []
+    assert validate_dialogue_load("unit 1", "@[李明]{" + "快走" * 100 + "}", 4, "zh") is None
+    assert assert_dialogue_preserved("unit 1", "@[李明]{原词}", "@[李明]{改词}") is None
+    refs = validate_unit_text("unit 1", "@[李明]走进@[酒馆]。", PROJECT, max_refs=2)
+    assert [(r.type, r.name) for r in refs] == [("character", "李明"), ("scene", "酒馆")]
+    with pytest.raises(DraftViolation) as missing:
+        validate_unit_text("unit 1", "@[未登记人物]进门。", PROJECT, max_refs=None)
+    assert missing.value.code == "unregistered_asset"
+    with pytest.raises(DraftViolation) as over_limit:
+        validate_unit_text("unit 1", "@[李明]走进@[酒馆]。", PROJECT, max_refs=1)
+    assert over_limit.value.code == "refs_over_limit"
 
 
 class TestSourceTextAnchor:
@@ -60,6 +77,23 @@ class TestSourceTextAnchor:
     def test_blank_anchor_rejected(self):
         with pytest.raises(DraftViolation, match="source_text 为空"):
             validate_source_text_anchor("unit E1U01", "   ", "李明推开酒馆的门。")
+
+    def test_source_anchor_order_allows_gaps_and_overlaps(self):
+        assert (
+            out_of_order_source_anchor_indices(
+                ["李明推开门", "推开门，进屋后他停下", "他停下"], "李明推开门，进屋后他停下。"
+            )
+            == []
+        )
+
+    def test_source_anchor_order_flags_only_provable_reversals(self):
+        assert out_of_order_source_anchor_indices(["李明推开门", "王五走进来"], "王五走进来，李明推开门。") == [1]
+        # Invalid anchors have their own per-unit violation; they are not mislabeled as order errors.
+        assert out_of_order_source_anchor_indices(["李明推开门", "不存在的句子"], "李明推开门。") == []
+
+    def test_source_anchor_order_allows_repeated_passages(self):
+        assert out_of_order_source_anchor_indices(["等候", "离开", "等候"], "他等候，然后离开，她仍在等候。") == []
+        assert out_of_order_source_anchor_indices(["等候", "等候"], "他在等候。") == []
 
 
 class TestUnitText:
@@ -342,3 +376,11 @@ class TestNeutralLayerReexport:
         assert draft_validation.collect_violations is draft_violation.collect_violations
         assert draft_validation.render_violation_report is draft_violation.render_violation_report
         assert draft_validation.violation_items is draft_violation.violation_items
+
+
+def test_mention_diagnostic_reports_bad_opener_before_valid_following_reference(monkeypatch):
+    monkeypatch.setenv("ARCREEL_PROMPT_CONTENT_VALIDATION", "false")
+    with pytest.raises(DraftViolation) as caught:
+        validate_unit_text("unit E1U14", "@[李明>握着@[长剑]。@[王五]{快走。}", PROJECT, max_refs=None, check_mention_syntax=True)
+    assert "@[李明>" in str(caught.value)
+    assert "@[长剑]" not in str(caught.value)

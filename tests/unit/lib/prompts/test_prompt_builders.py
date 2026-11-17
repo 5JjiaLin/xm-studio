@@ -15,6 +15,15 @@ from lib.prompts.reference_image_numbering import PREVIOUS_STORYBOARD_ROLE
 
 
 class TestCharacterPrompt:
+    def test_nonhuman_layout_keeps_the_four_panel_contract(self):
+        description = "四足黑狼，三角耳，长尾，黑色粗毛。"
+        prompt = build_character_prompt("暗影狼", description, style="水墨")
+        assert description in prompt
+        assert "Style: 水墨" in prompt
+        assert "正面全身 / 正侧全身（90° 侧视，面向画面右侧）/ 背面全身 / 正面面部特写" in prompt
+        assert "四足角色自然四足站立" in prompt
+        assert "若无头部则展示核心识别结构" in prompt
+
     def test_includes_supplied_character_details(self):
         prompt = build_character_prompt(
             "姜月茴",

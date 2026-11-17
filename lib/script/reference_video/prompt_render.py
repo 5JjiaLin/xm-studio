@@ -95,6 +95,7 @@ def render_unit_prompt(
     settings: VoiceRenderSettings,
     *,
     creative_text: str = "",
+    prompt_policy_version: str | None = None,
 ) -> RenderedUnitPrompt:
     """把一个 unit 的书写文稿渲染成三段论 backend prompt。
 
@@ -161,12 +162,23 @@ def render_unit_prompt(
         settings,
         request_character_forms,
     )
+    from lib.script.prompt_policy import DRAMA_DETAIL_V1, SUPPORTED_PROMPT_POLICIES
+
+    if prompt_policy_version and prompt_policy_version not in SUPPORTED_PROMPT_POLICIES:
+        raise ValueError(f"不支持的视频提示词策略版本: {prompt_policy_version}")
+    policy_style = (
+        "Style: 真人电视剧风格，精品短剧画风，大师级构图\n"
+        "Avoid: BGM、文字字幕、水印、Logo、外形着装完全一致的分身或双胞胎"
+        if prompt_policy_version == DRAMA_DETAIL_V1
+        else ""
+    )
     prompt = builtin_templates.render(
         "reference_video/unit",
         declarations=declarations,
         body=_render_segment_two(text, subjects, characters, catalog),
         style=normalize_style_value(project.get("style")),
         style_description=normalize_style_value(project.get("style_description")),
+        policy_style=policy_style,
         co_present_characters=co_present_characters if len(co_present_characters) >= 2 else [],
         products=list(dict.fromkeys(ref.name for ref in references if ref.type == "product" and ref.name)),
     )
@@ -207,7 +219,12 @@ def render_video_unit_prompt(
     if references is None:
         references, _missing = derive_references_from_text(text, project)
     return render_unit_prompt(
-        text, project, references, settings, creative_text=str(unit.get("generation_prompt") or "")
+        text,
+        project,
+        references,
+        settings,
+        creative_text=str(unit.get("generation_prompt") or ""),
+        prompt_policy_version=unit.get("prompt_policy_version"),
     )
 
 
@@ -456,22 +473,44 @@ def temporal_unit_issues(
     request_duration_seconds: int | None,
 ) -> tuple[TemporalIssue, ...]:
     """Validate effective creative content without asking request facts a second time."""
+    from lib.script.prompt_policy import SUPPORTED_PROMPT_POLICIES, prompt_content_validation_enabled
     from lib.script.reference_video.temporal_validation import has_timeline, validate_effective_timeline
 
-    if not (
-        unit.get("prompt_format_version")
-        or has_timeline(str(unit.get("text") or ""))
-        or has_timeline(str(unit.get("generation_prompt") or ""))
-    ):
+    policy = unit.get("prompt_policy_version")
+    custom = str(unit.get("generation_prompt") or "")
+    if policy and policy not in SUPPORTED_PROMPT_POLICIES:
+        return (TemporalIssue("prompt_policy_unknown", source="text", expected="已知策略版本", actual=str(policy)),)
+    if policy and (project.get("content_mode") != "drama" or project.get("generation_mode") != "reference_video"):
+        return (TemporalIssue("prompt_policy_unknown", source="text", expected="剧情参考生视频", actual=str(policy)),)
+
+    if not prompt_content_validation_enabled():
         return ()
+
+    policy_issues: list[TemporalIssue] = []
+    if policy == "drama_detail_v1" and not custom:
+        from lib.script.reference_video.prompt_policy_validation import validate_policy_text
+
+        policy_issues.extend(
+            TemporalIssue(issue.code, 0, "text", "有效的短剧提示词结构", str(issue))
+            for issue in validate_policy_text(str(unit.get("unit_id")), str(unit.get("text") or ""))
+        )
+
+    if policy_issues and not (
+        unit.get("prompt_format_version") or has_timeline(str(unit.get("text") or "")) or has_timeline(custom)
+    ):
+        return tuple(policy_issues)
+    if not (
+        policy or unit.get("prompt_format_version") or has_timeline(str(unit.get("text") or "")) or has_timeline(custom)
+    ):
+        return tuple(policy_issues)
     default = render_video_unit_prompt(
         {**unit, "generation_prompt": ""}, project, settings, request_references=request_references
     )
-    custom = str(unit.get("generation_prompt") or "")
-    return validate_effective_timeline(
+    temporal = validate_effective_timeline(
         unit=unit,
         project=project,
         default_creative=default.creative_text,
         effective_creative=custom or default.creative_text,
         request_duration_seconds=request_duration_seconds,
     )
+    return (*policy_issues, *temporal)

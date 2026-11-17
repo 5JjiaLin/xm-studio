@@ -29,6 +29,16 @@ def test_decode_utf16_be_bom():
     assert enc == "utf-16-be"
 
 
+@pytest.mark.parametrize("raw", [b"\xef\xbb\xbf\xff", b"\xff\xfe\x00", b"\xfe\xff\x00"])
+def test_corrupt_bom_text_uses_source_decode_error_with_filename(tmp_path, raw):
+    source = tmp_path / "损坏剧本.txt"
+    source.write_bytes(raw)
+    with pytest.raises(SourceDecodeError) as rejected:
+        TxtExtractor().extract(source)
+    assert rejected.value.filename == source.name
+    assert rejected.value.tried_encodings
+
+
 def test_decode_pure_utf8_no_bom():
     raw = "中文小说内容".encode()
     text, enc = decode_txt(raw)

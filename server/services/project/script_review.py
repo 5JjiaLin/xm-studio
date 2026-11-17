@@ -35,12 +35,14 @@ from lib.script.draft_quarantine import (
     DRAFT_OWNER_AGENT,
     DRAFT_OWNER_USER,
     QUARANTINE_KIND_PROMPT_AUTHORING,
+    QUARANTINE_KIND_SCRIPT_PLAN,
     QUARANTINE_KIND_TO_DOC_TYPE,
     draft_owner,
     draft_revision,
     quarantine_path,
     read_quarantine,
     violation_entries,
+    write_quarantine,
 )
 from lib.script.plan_new_assets import NEW_ASSETS_FIELD, NewAssetsError, UnregisteredReferencesError, resolve_new_assets
 from lib.script.script_generator import ScriptGenerator
@@ -219,6 +221,27 @@ class ScriptReviewService:
         project = await asyncio.to_thread(self.pm.load_project, project_name)
         supported_durations = await self._resolve_supported_durations(project)
         state = await run_sync_transaction(self._get_state_sync, project_name, project, episode, supported_durations)
+        if script_review.script_plan_kind(project) == "reference_video":
+            from server.services.project.script_plan_repair import (
+                PlanRepairError,
+                assert_repairable_stage,
+                read_repair_progress,
+                repair_enabled,
+            )
+
+            state["repair_enabled"] = repair_enabled()
+            try:
+                await asyncio.to_thread(
+                    lambda: assert_repairable_stage(self.pm.get_project_path(project_name), project, episode)
+                )
+                state["repair_allowed"] = state["repair_enabled"]
+            except PlanRepairError:
+                state["repair_allowed"] = False
+            progress = await asyncio.to_thread(
+                lambda: read_repair_progress(self.pm.get_project_path(project_name), episode)
+            )
+            if progress:
+                state["repair_progress"] = progress
         state["soft_violations"] = []
         content = state["content"]
         if script_review.script_plan_kind(project) == "reference_video" and isinstance(content, dict):
@@ -383,6 +406,13 @@ class ScriptReviewService:
             view["violations"] = [_unreadable_violation("草稿的产出上下文缺失或损坏，无法重新校验")]
             return view
         view["violations"] = violation_entries(revalidation.violations)
+        if (
+            quarantine_kind == script_review.script_plan_quarantine_kind(project)
+            and view["doc_type"] == "reference_script_plan"
+        ):
+            from server.services.project.script_plan_repair import repair_offer
+
+            view["repair"] = await repair_offer(project_path, project, episode, draft, revalidation)
         view["soft_violations"] = soft_violation_entries(list(revalidation.soft_violations))
         return view
 
@@ -391,8 +421,7 @@ class ScriptReviewService:
     ) -> dict | None:
         """返回参考路线带参考图的生效档位与逐单元定桶结论。
 
-        ``units`` 是本集脚本规划的单元：``units`` 键按 ``unit_id`` 给出每个单元按可用参考图
-        所落的桶、该桶档位与声明引用的分裂情况，面板据此取档。
+        ``units`` 按最终身份的计划视觉引用选档；缺图保留实际输入诊断，但不降到无图档。
         非参考路线或 r2v 桶的视频请求事实解析不出时返回 None，呈现层保持只读。项目文件读取卸到线程，避免阻塞请求循环。
         """
         project = await asyncio.to_thread(self.pm.load_project, project_name)
@@ -403,12 +432,27 @@ class ScriptReviewService:
         if isinstance(with_ref_facts, VideoRequestFactsFailure):
             return None
         project_path = await asyncio.to_thread(self.pm.get_project_path, project_name)
+        from lib.script.plan_new_assets import plan_reference_validation
+
+        def planning_view():
+            path = script_review.script_plan_path(project_path, project, episode)
+            content = _read_json(path) if path else None
+            return plan_reference_validation(project, content.get(NEW_ASSETS_FIELD) if content else None, units)
+
+        validation = await asyncio.to_thread(planning_view)
         unit_capabilities = await reference_unit_capabilities(
-            project,
-            project_path,
-            units,
-            request_facts=request_facts,
+            validation.project, project_path, validation.entries, request_facts=request_facts,
         )
+        for capability in unit_capabilities.values():
+            planned = with_ref_facts if capability.get("declared_capability") == "r2v" else await request_facts("i2v")
+            if isinstance(planned, VideoRequestFactsFailure):
+                capability["allowed_durations"] = None
+                capability["problem"] = planned.problem_payload()
+            else:
+                capability["allowed_durations"] = list(planned.allowed_durations)
+                capability["excluded_durations"] = dict(planned.excluded_durations)
+                capability["problem"] = None
+                capability["duration_endpoint_fixed"] = planned.duration_endpoint_fixed
         return {
             "with_references": list(with_ref_facts.allowed_durations),
             "units": unit_capabilities,
@@ -420,7 +464,7 @@ class ScriptReviewService:
         """校验并落盘编辑后的结构化中间态（手动或 Agent 编辑后回写），返回最新状态（重新等待确认）。
 
         内容变更使指纹漂移，``get_state`` 据此自动回到 pending_review——保存即重新需要确认。
-        已确认的脚本规划只读，保存抛 ``script_plan_confirmed``、不落盘；重跑脚本规划写出新内容后恢复可保存。
+        已确认的脚本规划只读，保存抛 ``script_plan_confirmed``；显式 start_revision 在既有隔离候选中修订。
         Agent 的可编辑草稿在场时，正式规划也只读，保存抛 ``draft_agent_owned``。
 
         ``base_fingerprint`` 是编辑方读取内容（``get_state``）时拿到的指纹：给定时在锁内与盘上
@@ -449,6 +493,10 @@ class ScriptReviewService:
         except ValidationError as exc:
             _require_changed_speech_admitted(kind, _read_json(path), content)
             raise ScriptReviewError("invalid_content", str(exc)) from exc
+        try:
+            resolve_new_assets(project, validated.get(NEW_ASSETS_FIELD))
+        except NewAssetsError as exc:
+            raise ScriptReviewError("invalid_new_assets", str(exc)) from exc
         if kind == "drama":
             for scene in validated["scenes"]:
                 if scene.get("needs_replan") is not True:
@@ -467,7 +515,11 @@ class ScriptReviewService:
                     script_review.script_plan_write_lock(project_path, episode),
                 ):
                     self._reject_readonly_script_plan(project_name, project_path, episode)
-                    _require_changed_speech_admitted(kind, _read_json(path), validated)
+                    previous = _read_json(path) or {}
+                    validated.pop("prompt_policy_version", None)
+                    if previous.get("prompt_policy_version"):
+                        validated["prompt_policy_version"] = previous["prompt_policy_version"]
+                    _require_changed_speech_admitted(kind, previous, validated)
                     script_review.write_script_plan_locked(
                         project_path, episode, validated, expected_fingerprint=expected
                     )
@@ -492,8 +544,32 @@ class ScriptReviewService:
         if script_review.formal_script_plan_confirmed(project_path, project, episode):
             raise ScriptReviewError("script_plan_confirmed")
 
+    async def start_revision(self, project_name: str, episode: int, plan_fingerprint: str | None) -> dict[str, Any]:
+        """显式取回一份有版本保护的人工修订候选；正式稿与素材保持到重新确认。"""
+        def start() -> None:
+            project = self.pm.load_project(project_name)
+            self._require_episode(project_name, project, episode)
+            project_path = self.pm.get_project_path(project_name)
+            path = script_review.script_plan_path(project_path, project, episode)
+            if path is None or script_review.script_plan_kind(project) != "reference_video":
+                raise ScriptReviewError("not_applicable")
+            draft_path = quarantine_path(project_path, episode, QUARANTINE_KIND_SCRIPT_PLAN)
+            with self.pm.file_lock(draft_path), script_review.formal_script_plan_lock(project_path, episode, path):
+                if not plan_fingerprint or script_review.content_fingerprint(path) != plan_fingerprint:
+                    raise ScriptReviewError("conflict", "拆解版本已变化，请重新审阅")
+                if draft_path.exists():
+                    raise ScriptReviewError("quarantined")
+                content = _read_json(path)
+                if not isinstance(content, dict) or not isinstance(content.get("units"), list):
+                    raise ScriptReviewError("invalid_content")
+                flat = {**content, "units": [{key: unit.get(key) for key in ("duration_seconds", "source_text", "text")} for unit in content["units"]]}
+                write_quarantine(project_path, episode, QUARANTINE_KIND_SCRIPT_PLAN, content=flat, violations=[],
+                    meta={"source": None, "base_fingerprint": plan_fingerprint, "user_revision": True})
+        await run_sync_transaction(start)
+        return await self.get_state(project_name, episode)
+
     async def confirm(
-        self, project_name: str, episode: int, *, overwrite_revision: str | None = None
+        self, project_name: str, episode: int, *, overwrite_revision: str | None = None, plan_fingerprint: str | None = None
     ) -> dict[str, Any]:
         """确认该集 script_plan：整份转为正式脚本，并在同一次写入里记录确认指纹，放行 prompt_authoring。
 
@@ -502,8 +578,8 @@ class ScriptReviewService:
         须等于其覆盖清单的 ``revision``（调用方认可覆盖的正是这一份）；缺失或不符时抛
         ``overwrite_required``，携带当前的覆盖清单，不写正式脚本与确认记录。
 
-        档位表先于加锁解析（同 ``get_state``）：确认路径同样要对存量草稿做一次读时收编，收编
-        用的档位表须与 gate 面板呈现的那份同源，否则确认会把面板上选不到的秒数固化到盘上。
+        必须提交已审阅的 plan_fingerprint；锁内先核对，再做兼容收编和校验，物化锁内再次核对。
+        相同指纹已确认时直接返回，不重建正式脚本。
         """
         project = await asyncio.to_thread(self.pm.load_project, project_name)
         supported_durations = await self._resolve_supported_durations(project)
@@ -513,9 +589,11 @@ class ScriptReviewService:
             return project_path, script_review.formal_script_overwrite(project_path, project, episode)
 
         project_path, overwrite = await asyncio.to_thread(_locate_overwrite)
-        fingerprint = await run_sync_transaction(
-            self._confirm_sync, project_name, project, episode, supported_durations
+        fingerprint, already_confirmed = await run_sync_transaction(
+            self._confirm_sync, project_name, project, episode, supported_durations, plan_fingerprint
         )
+        if already_confirmed:
+            return await self.get_state(project_name, episode)
         if overwrite is not None and script_review.fingerprint_of_revision(overwrite_revision) != overwrite.fingerprint:
             raise ScriptReviewError("overwrite_required", overwrite=overwrite.to_dict())
         await self._materialize(
@@ -569,7 +647,8 @@ class ScriptReviewService:
         project: dict[str, Any],
         episode: int,
         supported_durations: list[int] | None,
-    ) -> str:
+        plan_fingerprint: str | None,
+    ) -> tuple[str, bool]:
         """``confirm`` 的同步前半：待处置草稿校验、读时收编、结构校验，返回待确认内容的指纹。"""
         project_path = self.pm.get_project_path(project_name)
         path = script_review.script_plan_path(project_path, project, episode)
@@ -592,6 +671,12 @@ class ScriptReviewService:
             else nullcontext()
         )
         with prompt_authoring_lock, self.pm.file_lock(path):
+            if not path.exists():
+                raise ScriptReviewError("no_script_plan")
+            if not plan_fingerprint or script_review.content_fingerprint(path) != plan_fingerprint:
+                raise ScriptReviewError("conflict", "拆解版本已变化或缺少审阅指纹，请刷新并审阅后再确认")
+            if script_review.formal_script_plan_confirmed(project_path, self.pm.load_project(project_name), episode):
+                return plan_fingerprint, True
             content, project = self._read_script_plan_migrated(
                 project_name, project, episode, path, project_path, supported_durations
             )
@@ -604,7 +689,7 @@ class ScriptReviewService:
             except ValidationError as exc:
                 raise ScriptReviewError("invalid_content", str(exc)) from exc
             try:
-                resolve_new_assets(project, validated.model_dump().get(NEW_ASSETS_FIELD))
+                asset_resolution = resolve_new_assets(project, validated.model_dump().get(NEW_ASSETS_FIELD))
             except NewAssetsError as exc:
                 raise ScriptReviewError("invalid_new_assets", str(exc)) from exc
 
@@ -623,19 +708,55 @@ class ScriptReviewService:
             if kind == "reference_video":
                 # 指纹按刚写盘的这份对象直接算，确认记录与实际写入内容一致。
                 dumped = validated.model_dump()
+                from lib.episode.source_kinds import episode_source_kind
+                from lib.script.reference_video.draft_validation import (
+                    DraftViolation,
+                    out_of_order_source_anchor_indices,
+                    validate_source_text_anchor,
+                )
+                from lib.script.reference_video.prompt_policy_validation import validate_policy_asset_descriptions
+                from lib.script.reference_video.screenplay_coverage import (
+                    screenplay_speaker_aliases,
+                    validate_screenplay_coverage,
+                )
+                from server.text_generation import load_novel_source
+
+                if episode_source_kind(project, episode) == "screenplay":
+                    try:
+                        source = load_novel_source(project_path, None, episode=episode)
+                    except ValueError as exc:
+                        raise ScriptReviewError("invalid_content", str(exc)) from exc
+                    coverage_issues = []
+                    for unit in dumped["units"]:
+                        try:
+                            validate_source_text_anchor(str(unit["unit_id"]), unit.get("source_text", ""), source)
+                        except DraftViolation as issue:
+                            coverage_issues.append(issue)
+                    coverage_issues.extend(
+                        DraftViolation(f"unit {dumped['units'][index]['unit_id']}: 原文依据顺序与源剧本不符", code="source_text_out_of_order")
+                        for index in out_of_order_source_anchor_indices([unit.get("source_text", "") for unit in dumped["units"]], source)
+                    )
+                    coverage_issues.extend(validate_screenplay_coverage(
+                        asset_resolution.rewrite_entries(dumped["units"]),
+                        source,
+                        speaker_aliases=screenplay_speaker_aliases(project, resolution=asset_resolution),
+                    ))
+                    if coverage_issues:
+                        raise ScriptReviewError("invalid_content", "；".join(str(issue) for issue in coverage_issues))
+                if dumped.get("prompt_policy_version") == "drama_detail_v1":
+                    design_issues = validate_policy_asset_descriptions(dumped.get(NEW_ASSETS_FIELD))
+                    if design_issues:
+                        raise ScriptReviewError("invalid_content", "；".join(str(issue) for issue in design_issues))
                 for unit in dumped["units"]:
                     admission = admit_script_unit("video_units", unit)
                     if not admission.allowed:
                         raise ScriptReviewError("speech_admission", admission=admission)
-                # 单一写盘出口（已持同一把 per-path 锁，不再套 script_plan_write_lock）；同临界区
-                # 读改写无并发窗口，不做基线比对。内容真的变了时，prompt_authoring 草稿的基底随之
-                # 失效，由出口按变更清理。
-                script_review.write_script_plan_locked(project_path, episode, dumped)
-                fingerprint = script_review.content_fingerprint_of_data(dumped)
+                # 保留原规划字节的指纹，避免模型默认字段改变已审阅版本；正式物化另行持锁核对。
+                fingerprint = script_review.content_fingerprint_of_data(content)
             else:
                 # 指纹从校验通过的 content 派生，不二次读盘：确认记录须对应这里校验过的内容。
                 fingerprint = script_review.content_fingerprint_of_data(content)
-        return fingerprint
+        return fingerprint, False
 
 
 def _overwrite_dict(project_path: Path, project: Mapping[str, Any], episode: int) -> dict[str, Any] | None:

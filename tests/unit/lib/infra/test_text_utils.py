@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from lib.infra.text_utils import normalize_newlines, strip_json_code_fences
+from lib.infra.text_utils import DuplicateJSONKeyError, normalize_newlines, strict_json_loads, strip_json_code_fences
 
 
 @pytest.mark.parametrize(
@@ -50,6 +50,12 @@ def test_bare_json_untouched() -> None:
 def test_case_insensitive_opening_marker() -> None:
     """大小写变体开栏标记均剥离 7 字前缀，不把语言标注残留进正文。"""
     assert strip_json_code_fences('```JSON\n{"a": 1}\n```').startswith("{")
+
+
+@pytest.mark.parametrize("raw", ['{"units":[],"units":[{}]}', '{"units":[{"text":"甲","text":"乙"}]}'])
+def test_structured_json_rejects_duplicate_keys_at_any_depth(raw: str) -> None:
+    with pytest.raises(DuplicateJSONKeyError, match="重复字段"):
+        strict_json_loads(raw)
 
 
 @pytest.mark.parametrize(

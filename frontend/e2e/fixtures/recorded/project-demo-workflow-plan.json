@@ -39,6 +39,8 @@
         "unregistered_references": [],
         "referenced_asset_sheets_stale": [],
         "referenced_assets_without_description": [],
+        "referenced_assets": [],
+        "asset_summary": null,
         "episode_complete": false,
         "project_complete": false
       },
@@ -68,6 +70,10 @@
         "script_plan_review": {
           "state": "pending",
           "revision": null
+        },
+        "production_inputs": {
+          "references_ready": true,
+          "videos_ready": false
         }
       },
       "artifacts": {

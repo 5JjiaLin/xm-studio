@@ -18,6 +18,8 @@ export interface EditUnitOptions<T> {
    * 没有未保存修改时新值直接生效；有未保存修改时保留修改，并标出外部更新。
    */
   source: T;
+  /** CAS 编辑保留脏稿的原基线；放弃时才采用最新外部内容。 */
+  preserveDirtyBaseline?: boolean;
   /**
    * 提交未保存修改。`savedValue` 是提交前的已保存内容，供按字段生成增量 PATCH。
    * 返回服务端保存后的内容；不返回时以提交的内容为准。抛错即保存失败，错误信息显示在保存栏或提示条上。
@@ -103,6 +105,7 @@ function jsonEqual<T>(a: T, b: T): boolean {
  */
 export function useEditUnit<T>({
   source,
+  preserveDirtyBaseline = false,
   save: submit,
   isEqual = jsonEqual,
   leaveTitle,
@@ -129,7 +132,7 @@ export function useEditUnit<T>({
       current = {
         ...state,
         seenSource: source,
-        saved: source,
+        saved: preserveDirtyBaseline ? state.saved : source,
         externallyUpdated: !isEqual(state.value, source),
       };
     }
@@ -158,8 +161,8 @@ export function useEditUnit<T>({
   }, []);
 
   const discard = useCallback(() => {
-    setState((prev) => ({ ...prev, value: prev.saved, status: "idle", error: null, externallyUpdated: false }));
-  }, []);
+    setState((prev) => ({ ...prev, value: preserveDirtyBaseline && prev.externallyUpdated ? prev.seenSource : prev.saved, saved: preserveDirtyBaseline && prev.externallyUpdated ? prev.seenSource : prev.saved, status: "idle", error: null, externallyUpdated: false }));
+  }, [preserveDirtyBaseline]);
 
   const save = useCallback(async () => {
     if (!dirty) return true;

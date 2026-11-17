@@ -128,7 +128,9 @@ def _install_narration(project_path: Path, item: dict[str, Any], seconds: float)
     )
 
 
-def setup_project(tmp_path: Path, *, narration_delivery: str = "use_tts") -> tuple[ProjectManager, Path]:
+def setup_project(
+    tmp_path: Path, *, narration_delivery: str = "use_tts", narration_durations: tuple[float, float] = (1.2, 2.0),
+) -> tuple[ProjectManager, Path]:
     """两个画外音分镜：S01 视频 2 秒、带 1.2 秒旁白配音，S02 视频 1.5 秒、带比视频长的 2 秒旁白配音。
 
     视频是没有音轨的黑屏，旁白配音是 440 Hz 正弦音。
@@ -159,8 +161,8 @@ def setup_project(tmp_path: Path, *, narration_delivery: str = "use_tts") -> tup
     )
     _install_video(project_path, first, 2.0)
     _install_video(project_path, second, 1.5)
-    _install_narration(project_path, first, 1.2)
-    _install_narration(project_path, second, 2.0)
+    _install_narration(project_path, first, narration_durations[0])
+    _install_narration(project_path, second, narration_durations[1])
     return ProjectManager(tmp_path), project_path
 
 

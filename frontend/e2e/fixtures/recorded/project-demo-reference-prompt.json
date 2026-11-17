@@ -3,8 +3,8 @@
   "path": "/api/v1/projects/demo/reference-videos/episodes/1/units/E1U1/prompt-preview",
   "status": 200,
   "body": {
-    "text": null,
-    "unavailable": "无法解析 i2v 视频能力，请检查供应商与模型配置",
+    "text": "镜头\n\nAvoid: BGM、文字字幕、水印、Logo",
+    "unavailable": null,
     "is_text_form": true,
     "references": [],
     "warnings": [],
@@ -12,7 +12,20 @@
     "voice_only": [],
     "prompt_source": "default",
     "prompt_format_version": null,
+    "prompt_policy_version": null,
     "problems": [],
-    "generation_allowed": false
+    "generation_allowed": true,
+    "declarations": "",
+    "creative_text": "镜头\n\nAvoid: BGM、文字字幕、水印、Logo",
+    "audio_references": [],
+    "parameters": {
+      "provider": "gemini-aistudio",
+      "model": "veo-3.1-generate-preview",
+      "resolution": "720p",
+      "aspect_ratio": "9:16",
+      "duration_seconds": 4,
+      "generate_audio": true
+    },
+    "system_message": null
   }
 }

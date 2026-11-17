@@ -179,12 +179,15 @@ async def test_reference_script_plan_write_transaction_does_not_block_event_loop
     assert all(thread != caller_thread for thread in worker_threads)
 
 
-async def test_promote_draft_promotes_after_repair(fake_ctx: ToolHarness, monkeypatch) -> None:
+@pytest.mark.parametrize("policy", [None, "drama_detail_v1"])
+async def test_promote_draft_promotes_after_repair(fake_ctx: ToolHarness, monkeypatch, policy) -> None:
     """Agent 修好草稿后晋升：正式 script_plan 落盘、草稿清除、结构由正文机械派生。"""
     rv_source(fake_ctx)
     await run_rv_split(fake_ctx, monkeypatch, [rv_unit("@[不存在的人] 出场")])
 
     envelope = read_rv_quarantine(fake_ctx)
+    if policy:
+        envelope["meta"]["prompt_policy_version"] = policy
     envelope["content"]["units"][0]["text"] = "@[张三] 在 @[村口] 出场"
     rv_quarantine_path(fake_ctx).write_text(json.dumps(envelope, ensure_ascii=False), encoding="utf-8")
 
@@ -196,6 +199,43 @@ async def test_promote_draft_promotes_after_repair(fake_ctx: ToolHarness, monkey
     # 落盘时由服务端发号：夹具剧本已用过 1 号
     assert saved["units"][0]["unit_id"] == "E1U2"
     assert saved["units"][0]["text"] == "@[张三] 在 @[村口] 出场"
+    assert saved.get("prompt_policy_version") == policy
+
+
+async def test_promote_draft_repairs_span_response_mixed_speech_without_regeneration(
+    fake_ctx: ToolHarness, monkeypatch
+) -> None:
+    """新跨度响应隔离后仍用原草稿契约修复，保留台词与旁白并拆到两个单元。"""
+    rv_source(fake_ctx)
+    out = await run_rv_split(
+        fake_ctx,
+        monkeypatch,
+        [
+            {
+                "duration_seconds": 8,
+                "source_span_start": "S0001",
+                "source_span_end": "S0001",
+                "text": "@[张三] 在 @[村口] 等候\n@[张三]：{快走。}\n{风吹过旷野。}",
+            }
+        ],
+    )
+    assert out.problem is not None
+    envelope = read_rv_quarantine(fake_ctx)
+    assert "mixed_speech" in [item["code"] for item in envelope["violations"]]
+    assert envelope["content"]["units"][0] == rv_unit("@[张三] 在 @[村口] 等候\n@[张三]：{快走。}\n{风吹过旷野。}")
+    envelope["content"]["units"] = [
+        rv_unit("@[张三] 在 @[村口] 等候\n@[张三]：{快走。}"),
+        rv_unit("@[张三] 在 @[村口] 等候\n{风吹过旷野。}"),
+    ]
+    rv_quarantine_path(fake_ctx).write_text(json.dumps(envelope, ensure_ascii=False), encoding="utf-8")
+
+    out = await promote_reference_draft(fake_ctx)
+
+    assert out.problem is None, out
+    assert not rv_quarantine_path(fake_ctx).exists()
+    saved = json.loads(rv_script_plan_path(fake_ctx).read_text(encoding="utf-8"))
+    assert [unit["text"] for unit in saved["units"]] == [unit["text"] for unit in envelope["content"]["units"]]
+    assert all(unit["source_text"] == _RV_NOVEL for unit in saved["units"])
 
 
 async def test_promote_draft_reports_again_without_round_limit(fake_ctx: ToolHarness, monkeypatch) -> None:
@@ -705,46 +745,53 @@ def _write_rv_formal_script(fake_ctx: ToolHarness, text: str) -> str | None:
     return script_review.content_fingerprint(path)
 
 
-async def test_promote_draft_prompt_authoring_uses_async_factory(fake_ctx: ToolHarness, monkeypatch) -> None:
-    """prompt_authoring 晋升走 ``ScriptGenerator.create``：晋升同样经 _add_metadata 落盘，裸构造会把
-    metadata.generator 记成 "unknown"，与直接生成路径的同一份产物对不上。"""
-
-    rv_project(fake_ctx)
-    baseline = _write_rv_formal_script(fake_ctx, "@[张三] 在 @[村口] 等候")
-    write_quarantine(
-        fake_ctx.project_path,
-        1,
-        QUARANTINE_KIND_PROMPT_AUTHORING,
-        content={"title": "第1集", "units": [{"text": "镜头1：中景，平视。@[张三] 在 @[村口] 等候。"}]},
-        violations=[],
-        meta={"base_fingerprint": baseline, "unit_ids": ["E1U01"]},
-    )
-    seen: dict[str, object] = {}
-
-    class _TextBoundary:
-        model = "review-factory"
-
-    async def create_text_generator(task_type, project_name=None, **_kwargs):
-        seen["task_type"] = task_type
-        seen["project_name"] = project_name
-        return _TextBoundary()
-
-    use_text_generator(monkeypatch, create_text_generator)
-    out = await promote_reference_draft(fake_ctx)
-    assert out.problem is None, out
-    assert "episode_1.json" in said(out)
-    saved = json.loads((fake_ctx.project_path / "scripts" / "episode_1.json").read_text(encoding="utf-8"))
-    assert saved["metadata"]["generator"] == "review-factory"
-    assert seen["project_name"] == fake_ctx.project_name
-
-
-async def test_promote_draft_surfaces_model_not_in_catalog_with_reselect_guidance(
-    fake_ctx: ToolHarness, monkeypatch
+@pytest.mark.parametrize("text_failure", ["unconfigured", "retired"])
+async def test_promote_prompt_draft_without_text_model_preserves_provenance(
+    fake_ctx: ToolHarness, monkeypatch, text_failure: str
 ) -> None:
-    """晋升时文本模型已下架：不被包成 draft_promote_failed，给出重新选择模型的指引。"""
+    """人工修复只做本地校验，未配置或已下架的文本模型不阻断采用，也不改写生成来源。"""
     from lib.catalog.errors import ModelNotInCatalogError
 
     rv_project(fake_ctx)
+    _write_rv_formal_script(fake_ctx, "@[张三] 在 @[村口] 等候")
+    script_path = fake_ctx.project_path / "scripts" / "episode_1.json"
+    original = json.loads(script_path.read_text(encoding="utf-8"))
+    original["metadata"] = {"generator": "original-author", "custom": "preserved"}
+    ProjectManager.for_project_dir(fake_ctx.project_path).save_script(
+        fake_ctx.project_name, original, "episode_1.json", validate=False
+    )
+    baseline = script_review.content_fingerprint(script_path)
+    write_quarantine(
+        fake_ctx.project_path,
+        1,
+        QUARANTINE_KIND_PROMPT_AUTHORING,
+        content={"title": "第1集", "units": [{"text": "镜头1：中景，平视。@[张三] 在 @[村口] 等候。"}]},
+        violations=[],
+        meta={"base_fingerprint": baseline, "unit_ids": ["E1U01"]},
+    )
+    async def unavailable_text(*_args, **_kwargs):
+        if text_failure == "retired":
+            raise ModelNotInCatalogError(provider_id="ark", model_id="old-text", media_type="text")
+        raise ValueError("text provider is not configured")
+
+    use_text_generator(monkeypatch, unavailable_text)
+    out = await promote_reference_draft(fake_ctx)
+    assert out.problem is None, out
+    assert "episode_1.json" in said(out)
+    saved = json.loads(script_path.read_text(encoding="utf-8"))
+    assert saved["metadata"]["generator"] == "original-author"
+    assert saved["metadata"]["custom"] == "preserved"
+    assert saved["metadata"]["updated_at"]
+    assert saved["video_units"][0]["text"] == "镜头1：中景，平视。@[张三] 在 @[村口] 等候。"
+    assert not saved["video_units"][0].get("pending_authoring")
+    assert not quarantine_path(fake_ctx.project_path, 1, QUARANTINE_KIND_PROMPT_AUTHORING).exists()
+
+
+async def test_promote_prompt_draft_still_requires_video_capability(
+    fake_ctx: ToolHarness, set_video_request_facts
+) -> None:
+    """不依赖文本供应商仍保留视频能力校验，失败不覆盖正式稿并保留草稿。"""
+    rv_project(fake_ctx)
     baseline = _write_rv_formal_script(fake_ctx, "@[张三] 在 @[村口] 等候")
     write_quarantine(
         fake_ctx.project_path,
@@ -755,14 +802,14 @@ async def test_promote_draft_surfaces_model_not_in_catalog_with_reselect_guidanc
         meta={"base_fingerprint": baseline, "unit_ids": ["E1U01"]},
     )
 
-    async def retired(*_args, **_kwargs):
-        raise ModelNotInCatalogError(provider_id="ark", model_id="old-text", media_type="text")
-
-    use_text_generator(monkeypatch, retired)
+    script_path = fake_ctx.project_path / "scripts" / "episode_1.json"
+    before = script_path.read_bytes()
+    set_video_request_facts(VideoRequestFactsFailure("video_capability_unavailable", (("capability", "r2v"),)))
     out = await promote_reference_draft(fake_ctx)
     assert out.problem is not None
-    assert out.problem.code == "model_not_in_provider_catalog"
-    assert out.problem.action == "configure_provider"
+    assert out.problem.code == "video_capability_unavailable"
+    assert script_path.read_bytes() == before
+    assert quarantine_path(fake_ctx.project_path, 1, QUARANTINE_KIND_PROMPT_AUTHORING).exists()
 
 
 async def test_promote_draft_waits_for_file_lock_without_blocking_event_loop(

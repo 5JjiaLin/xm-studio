@@ -104,6 +104,15 @@ from lib.script.prompt_authoring_scope import (
     PromptOverwriteRequired,
     select_prompt_authoring,
 )
+from lib.script.reference_video.authoring_envelope import unpack_authoring_units
+from lib.script.reference_video.authoring_response import (
+    AUTHORING_RESPONSE_VERSION,
+    AuthoringCandidateViolation,
+    authoring_response_model,
+    normalize_authoring_text,
+    parse_authoring_json,
+    recover_repeated_unit_fields,
+)
 from lib.script.reference_video.draft_validation import (
     DraftViolation,
     DraftViolations,
@@ -362,7 +371,7 @@ class ScriptGenerator:
 
         Args:
             project_path: 项目目录路径，如 projects/test0205
-            generator: TextGenerator 实例（可选）。若为 None 则仅支持 build_prompt() dry-run。
+            generator: TextGenerator 实例（可选）。为 None 时支持本地校验、晋升及提示词预览，不调用模型。
             config_resolver: 能力解析器；缺省时解析期构造连接生产数据库的 ConfigResolver。
         """
         self.project_path = Path(project_path)
@@ -480,6 +489,7 @@ class ScriptGenerator:
         skipped_entry_ids: list[str] | None = None,
         before_quarantine_commit: Callable[[], None] | None = None,
         regenerate: bool = False,
+        prompt_policy_version: str | None = None,
         registered_assets: list[dict[str, str]] | None = None,
     ) -> Path:
         """
@@ -513,6 +523,13 @@ class ScriptGenerator:
         """
         if self.generator is None:
             raise RuntimeError("TextGenerator 未初始化，请使用 ScriptGenerator.create() 工厂方法")
+        if prompt_policy_version:
+            from lib.script.prompt_policy import SUPPORTED_PROMPT_POLICIES
+
+            if prompt_policy_version not in SUPPORTED_PROMPT_POLICIES:
+                raise ValueError(f"不支持的提示词策略版本: {prompt_policy_version}")
+            if self.content_mode != "drama" or self.generation_mode != "reference_video":
+                raise ValueError("该提示词策略仅适用于剧情参考生视频")
 
         # 兑现 docstring 的「只决定文件名、不接受目录」契约:写盘咽喉 _safe_subpath 能挡绝对
         # 路径与 path traversal,但不会挡子目录(`subdir/x.json` 拼出的 realpath 仍在 scripts/
@@ -596,6 +613,7 @@ class ScriptGenerator:
                 formal_baseline=formal_baseline,
                 instructions=instructions,
                 before_quarantine_commit=before_quarantine_commit,
+                prompt_policy_version=prompt_policy_version,
             )
 
         if targets.kind == "scenes":
@@ -711,7 +729,8 @@ class ScriptGenerator:
         """把本次编写的条目按 id 放回正式剧本快照，返回待落盘的整份剧本。
 
         条目级元数据（清除待编写标记、needs_replan 重判、参考单元取档校验）只作用于本次编写的
-        条目；剧本级字段沿用快照，metadata 只刷新 ``updated_at`` 与 ``generator``。
+        条目；剧本级字段沿用快照，metadata 刷新 ``updated_at``，实际调用文本模型时才更新
+        ``generator``，人工修复保留原生成来源。
         """
         finished = self._add_metadata(
             {targets.kind: authored},
@@ -732,7 +751,8 @@ class ScriptGenerator:
         raw_metadata = script.get("metadata")
         metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
         metadata["updated_at"] = datetime.now(UTC).isoformat()
-        metadata["generator"] = self.generator.model if self.generator else "unknown"
+        if self.generator is not None:
+            metadata["generator"] = self.generator.model
         script["metadata"] = metadata
         return script
 
@@ -1101,6 +1121,7 @@ class ScriptGenerator:
         instructions: str | None = None,
         entry_ids: Iterable[str] | None = None,
         rewrite: bool = False,
+        prompt_policy_version: str | None = None,
     ) -> str:
         """
         构建 Prompt（用于 dry-run 模式）
@@ -1133,7 +1154,9 @@ class ScriptGenerator:
             return self._build_ad_reference_prompt_authoring_prompt(episode, targets, instructions)
         facts = await self._fetch_video_request_facts()
         targets = replace(targets, entries=targets.entries[:PROMPT_AUTHORING_BATCH_SIZE])
-        return self._build_reference_prompt_authoring_prompt(episode, targets, facts, instructions)
+        return self._build_reference_prompt_authoring_prompt(
+            episode, targets, facts, instructions, prompt_policy_version=prompt_policy_version
+        )
 
     @property
     def _storyboard_bucket(self) -> VideoGenerationType:
@@ -1178,16 +1201,8 @@ class ScriptGenerator:
     def _unit_duration_off_every_tier(
         self, duration: int, *, facts: PlanningVideoFacts, generation_type: VideoGenerationType
     ) -> list[int] | None:
-        """时长在带图与不带图两桶档位下都出局时返回该单元所落桶的档位，任一合法则返回 None。
-
-        prompt_authoring 可以给 unit 增删 `@[名称]` 提及，只在其中一桶出局的时长仍可能落地合法——
-        提前判死会拦掉本会成功的生成。两桶都出局才是与参考图无关的必然失败
-        （模型或分辨率配置变化所致），可以在付费调用前拦下。解析不出的桶按出局计。
-        """
-        for candidate in ("r2v", "i2v"):
-            if self._unit_duration_off_tier(duration, facts=facts, generation_type=candidate) is None:
-                return None
-        return facts.planning_durations(generation_type)
+        """按实际请求桶检查；编写不能靠删掉必要引用来改变档位。"""
+        return self._unit_duration_off_tier(duration, facts=facts, generation_type=generation_type)
 
     def _unit_duration_off_tier(
         self, duration: int, *, facts: PlanningVideoFacts, generation_type: VideoGenerationType
@@ -1514,22 +1529,26 @@ class ScriptGenerator:
     def _assert_reference_script_plan_durations(
         self, script_plan_units: list[dict], *, facts: PlanningVideoFacts
     ) -> None:
-        """转为正式剧本前判脚本规划已确认的单元时长仍在当前生效档位内；正文由之后的提示词编写改写并校验。
-
-        单元按此刻可用的参考图定桶（无引用、引用缺图或图未被清单认领落 i2v），须有所落桶的事实。
-        """
-        for unit, hydration in zip(script_plan_units, self._hydrate_reference_units(script_plan_units), strict=True):
-            bucket = hydration.hydrated_generation_type
-            facts.require(bucket)
-            off_tiers = self._unit_duration_off_every_tier(
-                unit["duration_seconds"], facts=facts, generation_type=bucket
+        """按最终资产身份和预期视觉引用检查，缺图不降为无图档位。"""
+        validation = plan_reference_validation(self.project_json, self._script_plan_new_assets, script_plan_units)
+        if validation.asset_problems:
+            from lib.script.plan_new_assets import asset_problem_violations
+            raise DraftViolations(asset_problem_violations(validation.asset_problems))
+        missing = unregistered_references(validation.project, validation.entries, id_field="unit_id")
+        if missing:
+            raise UnregisteredReferencesError(missing)
+        for unit in validation.entries:
+            label = f"unit {unit['unit_id']}"
+            refs = validate_unit_text(
+                label, unit["text"], validation.project, max_refs=self._resolve_max_refs(facts),
+                tolerated_speakers=validation.tolerated_speakers, check_mention_syntax=True,
             )
+            bucket: VideoGenerationType = "r2v" if refs else "i2v"
+            facts.require(bucket)
+            off_tiers = self._unit_duration_off_tier(unit["duration_seconds"], facts=facts, generation_type=bucket)
             if off_tiers is not None:
-                raise ValueError(
-                    f"unit {unit['unit_id']} 已确认时长 {unit['duration_seconds']}s 不在当前生效档位 "
-                    f"{sorted(set(off_tiers))} 内；通常是模型或分辨率配置变化让档位收窄导致，"
-                    "请调整配置回原档位，或重新拆分该集 script_plan 并重新完成内容确认"
-                )
+                raise ValueError(f"{label} 时长 {unit['duration_seconds']}s 不在当前生效档位 {off_tiers} 内；请返回拆解修订")
+            validate_dialogue_load(label, unit["text"], unit["duration_seconds"], self.project_json.get("source_language"), project_speech_rate_override(self.project_json))
 
     def _assert_reference_units_authorable(self, units: list[dict], *, facts: PlanningVideoFacts) -> None:
         """提示词编写付费调用前对待编写单元现值的全部预判：时长档位仍生效 + 正文按机器口径合法。
@@ -1649,6 +1668,7 @@ class ScriptGenerator:
                     unit_id=str(unit["unit_id"]),
                     max_refs=max_refs,
                     tolerated_speakers=dialogue_speakers(text),
+                    check_mention_syntax=True,
                 )
                 validate_dialogue_load(
                     label, text, int(unit["duration_seconds"]), source_language, speech_rate_override
@@ -1672,7 +1692,8 @@ class ScriptGenerator:
                 raise DraftViolations(enriched) from exc
 
     def _build_reference_prompt_authoring_prompt(
-        self, episode: int, targets: PromptAuthoringTargets, facts: PlanningVideoFacts, instructions: str | None
+        self, episode: int, targets: PromptAuthoringTargets, facts: PlanningVideoFacts, instructions: str | None,
+        *, prompt_policy_version: str | None = None,
     ) -> str:
         return build_reference_video_prompt(
             project_overview=self.project_json.get("overview", {}),
@@ -1691,6 +1712,7 @@ class ScriptGenerator:
             source_language=self.project_json.get("source_language"),
             speech_rate_override=project_speech_rate_override(self.project_json),
             timeline_enabled=self.content_mode == "drama",
+            drama_detail_enabled=prompt_policy_version == "drama_detail_v1",
             voice_conditions="\n".join(
                 f"{bucket}: 用户音频意图={'开启' if value.requested_generate_audio else '关闭'}；"
                 f"模型音轨={'支持' if value.has_audio_track else '不支持'}；"
@@ -1716,6 +1738,7 @@ class ScriptGenerator:
         formal_baseline: str | None,
         instructions: str | None,
         before_quarantine_commit: Callable[[], None] | None,
+        prompt_policy_version: str | None,
     ) -> Path:
         """参考生视频的提示词编写：只改写本次选中单元的正文，其余单元逐字不动。
 
@@ -1748,14 +1771,17 @@ class ScriptGenerator:
             )
         max_refs = self._resolve_max_refs(facts)
         logger.info("正在为第 %d 集编写提示词（video_units，%d/%d 个单元）...", episode, len(units), len(targets.items))
-        initial_prompt = self._build_reference_prompt_authoring_prompt(episode, targets, facts, instructions)
+        initial_prompt = self._build_reference_prompt_authoring_prompt(
+            episode, targets, facts, instructions, prompt_policy_version=prompt_policy_version
+        )
         assert self.generator is not None
         progress = PromptAuthoringProgress(
             self.project_path,
             episode,
             canonical_json_digest(
                 {
-                    "version": 1,
+                    "version": AUTHORING_RESPONSE_VERSION,
+                    "prompt_policy_version": prompt_policy_version,
                     "baseline": formal_baseline,
                     "prompt": initial_prompt,
                     "model": self.generator.model,
@@ -1770,18 +1796,36 @@ class ScriptGenerator:
         )
         context = copy.deepcopy(targets.script)
         output_units: list[dict[str, str]] = []
-        responses: list[str] = []
+        batch_titles: list[str] = []
 
         def validate_and_save(batch: list[dict], text: str, cached: bool, key: str) -> list[dict]:
-            authored = self._merge_reference_visual(batch, text, episode, max_refs=max_refs)
+            if prompt_policy_version == "drama_detail_v1":
+                text = recover_repeated_unit_fields(text, batch) or text
+            authored = self._merge_reference_visual(
+                batch,
+                text,
+                episode,
+                max_refs=max_refs,
+                prompt_policy_version=prompt_policy_version,
+                context_units=context[targets.kind],
+                normalize_model_references=True,
+                model_response=True,
+            )
+            title = self._parse_prompt_authoring_response(text, episode).title
             if not cached:
-                progress.save(key, text)
+                progress.save(key, json.dumps({
+                    "title": title,
+                    "units": [{"text": unit["text"]} for unit in authored],
+                }, ensure_ascii=False))
+            batch_titles.append(title)
             return authored
 
         for offset in range(0, len(units), PROMPT_AUTHORING_BATCH_SIZE):
             batch = units[offset : offset + PROMPT_AUTHORING_BATCH_SIZE]
             batch_targets = replace(targets, entries=tuple(batch), script=context)
-            prompt = self._build_reference_prompt_authoring_prompt(episode, batch_targets, facts, instructions)
+            prompt = self._build_reference_prompt_authoring_prompt(
+                episode, batch_targets, facts, instructions, prompt_policy_version=prompt_policy_version
+            )
             key = canonical_json_digest({"ids": batch_targets.ids, "prompt": prompt})
             response_text = await asyncio.to_thread(progress.read, key)
             cached = response_text is not None
@@ -1789,15 +1833,24 @@ class ScriptGenerator:
                 # Recheck before every paid batch; completed batches do not permit silently
                 # continuing against a changed formal script or a newly edited repair draft.
                 await asyncio.to_thread(self._assert_prompt_authoring_snapshot, episode, filename, formal_baseline)
-                result = await self._generate_text(
-                    TextGenerationRequest(
-                        prompt=prompt,
-                        response_schema=ReferencePromptAuthoringFlatScript,
-                        max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
-                        prefer_stream=True,
+                try:
+                    result = await self._generate_text(
+                        TextGenerationRequest(
+                            prompt=prompt,
+                            response_schema=(authoring_response_model(len(batch))
+                                             if prompt_policy_version == "drama_detail_v1"
+                                             else ReferencePromptAuthoringFlatScript),
+                            preserve_raw_response=prompt_policy_version == "drama_detail_v1",
+                            max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                            prefer_stream=True,
+                        )
                     )
-                )
-                response_text = result.text
+                    response_text = result.text
+                except DuplicateJSONKeyError as exc:
+                    # Backend detected ambiguity before the authoring draft could capture it.
+                    response_text = getattr(exc, "response_text", None)
+                    if response_text is None:
+                        raise
 
             try:
                 # Finish validation and persistence together even if the awaiting task is cancelled.
@@ -1812,24 +1865,25 @@ class ScriptGenerator:
                     base_fingerprint=formal_baseline,
                     expected_draft_revision=None,
                     before_commit=before_quarantine_commit,
+                    prompt_policy_version=prompt_policy_version,
+                    fallback_units=batch if exc.code == "prompt_authoring_response_invalid" else None,
+                    completed_units=[
+                        {**unit, **text} for unit, text in zip(units[:offset], output_units, strict=True)
+                    ],
                 ) from exc
-            responses.append(response_text)
             output_units.extend({"text": unit["text"]} for unit in authored_batch)
             completed = {str(unit["unit_id"]): unit for unit in authored_batch}
             context[targets.kind] = [
-                {**entry, **completed[str(entry[targets.id_field])], "pending_authoring": False}
+                {**entry, **completed[str(entry[targets.id_field])], "pending_authoring": False,
+                 "_authoring_source_text": str(entry.get("text") or "")}
                 if str(entry[targets.id_field]) in completed
                 else entry
                 for entry in context[targets.kind]
             ]
             logger.info("第 %d 集提示词已校验 %d/%d 单元（复用=%s）", episode, len(output_units), len(units), cached)
-        response_text = (
-            responses[0]
-            if len(responses) == 1
-            else json.dumps(
-                {"title": self._parse_unit_texts(responses[0], episode).title, "units": output_units},
-                ensure_ascii=False,
-            )
+        response_text = json.dumps(
+            {"title": batch_titles[0], "units": output_units},
+            ensure_ascii=False,
         )
 
         async def quarantine(exc: DraftViolation) -> DraftViolation:
@@ -1842,12 +1896,20 @@ class ScriptGenerator:
                 base_fingerprint=formal_baseline,
                 expected_draft_revision=None,
                 before_commit=before_quarantine_commit,
+                prompt_policy_version=prompt_policy_version,
             )
 
         # _add_metadata 一并纳入草稿保护：它按落地后的最终正文重算生效档位，一个新增 / 去掉了
         # `@` 引用的 unit 要到合并之后才判出档——不接住的话，这份已付费产出只存在于内存里。
         def author() -> dict[str, Any]:
-            authored = self._merge_reference_visual(units, response_text, episode, max_refs=max_refs)
+            authored = self._merge_reference_visual(
+                units,
+                response_text,
+                episode,
+                max_refs=max_refs,
+                prompt_policy_version=prompt_policy_version,
+                context_units=context[targets.kind],
+            )
             return self._authored_script(
                 episode, targets, authored, reference_unit_durations=self._unit_durations(targets), facts=facts
             )
@@ -1889,7 +1951,7 @@ class ScriptGenerator:
     def _parse_unit_texts(self, response_text: str, episode: int) -> ReferencePromptAuthoringFlatScript:
         text = strip_json_code_fences(response_text)
         try:
-            data = strict_json_loads(text)
+            data = parse_authoring_json(text)
         except (json.JSONDecodeError, DuplicateJSONKeyError) as e:
             raise ValueError(f"JSON 解析失败: {e}") from e
         # title 缺失/空白兜底须在校验之前：title 不参与写回，非约束解码通道下模型整字段漏写
@@ -1903,6 +1965,22 @@ class ScriptGenerator:
         except ValidationError as e:
             raise ValueError(f"prompt_authoring 提示词编写结构校验失败: {e}") from e
 
+    def _parse_prompt_authoring_response(
+        self, response_text: str, episode: int
+    ) -> ReferencePromptAuthoringFlatScript:
+        """Treat malformed model structure as a recoverable content failure."""
+        try:
+            return self._parse_unit_texts(response_text, episode)
+        except ValueError as exc:
+            if isinstance(exc.__cause__, DuplicateJSONKeyError):
+                failure = f"JSON 存在重复字段（{exc.__cause__}），不同正文未被覆盖"
+            else:
+                failure = "JSON 格式无法解析" if str(exc).startswith("JSON 解析失败") else "JSON 字段结构无效"
+            raise DraftViolation(
+                f"视频提示词编写返回的{failure}。正式剧本未改动；可编辑本批草稿或显式使用 AI 修复后重验，不会自动重跑模型。",
+                code="prompt_authoring_response_invalid",
+            ) from exc
+
     def _merge_reference_visual(
         self,
         units: list[dict],
@@ -1910,6 +1988,10 @@ class ScriptGenerator:
         episode: int,
         *,
         max_refs: int | None,
+        prompt_policy_version: str | None = None,
+        context_units: Sequence[dict] | None = None,
+        normalize_model_references: bool = False,
+        model_response: bool = False,
     ) -> list[dict]:
         """参考路径提示词编写合并：LLM 只出引用语法正文，按位写回待编写单元，其余字段原样保留。
 
@@ -1920,20 +2002,51 @@ class ScriptGenerator:
         逐 unit 的违约收齐后一次抛出（``DraftViolations``），供调用方把整份产出连同报告落到
         待修复草稿——单条抛出会让 Agent 每修一个 unit 就要重跑一次付费的展开。
         """
-        flat = self._parse_unit_texts(response_text, episode)
+        if model_response and prompt_policy_version == "drama_detail_v1":
+            response_text = recover_repeated_unit_fields(response_text, units) or response_text
+        flat = (
+            self._parse_prompt_authoring_response(response_text, episode)
+            if model_response
+            else self._parse_unit_texts(response_text, episode)
+        )
+        if self.content_mode == "drama":
+            flat = unpack_authoring_units(flat, len(units))
         if len(flat.units) != len(units):
             raise DraftViolation(
                 f"prompt_authoring 产出的 unit 数（{len(flat.units)}）与待编写单元数（{len(units)}）不一致；"
                 "prompt_authoring 只做提示词编写，不得合并、拆分或增删 unit",
-                code="unit_count_changed",
+                code=("prompt_authoring_response_invalid"
+                      if model_response and prompt_policy_version == "drama_detail_v1"
+                      else "unit_count_changed"),
             )
 
         authored: list[dict] = []
         violations: list[DraftViolation] = []
+        from lib.script.reference_video.prompt_policy_validation import (
+            compile_policy_handoffs,
+            validate_policy_text,
+        )
+
+        model_units = [
+            {**unit, "text": normalize_model_timeline_newlines(flat_unit.text),
+             "prompt_policy_version": prompt_policy_version}
+            for unit, flat_unit in zip(units, flat.units, strict=True)
+        ]
+        if prompt_policy_version == "drama_detail_v1" and normalize_model_references:
+            for model_unit, source in zip(model_units, units, strict=True):
+                model_unit["text"] = normalize_authoring_text(
+                    model_unit["text"], self.project_json, str(source.get("text") or ""),
+                )
+        if prompt_policy_version == "drama_detail_v1" and context_units is not None:
+            try:
+                model_units = compile_policy_handoffs(model_units, context_units)
+            except DraftViolation as exc:
+                raise AuthoringCandidateViolation(violation_items(exc), flat.title, model_units) from exc
+
         for index, (unit, flat_unit) in enumerate(zip(units, flat.units, strict=True)):
             label = f"unit {unit['unit_id']}"
             authored_text = (
-                normalize_model_timeline_newlines(flat_unit.text) if self.content_mode == "drama" else flat_unit.text
+                model_units[index]["text"] if self.content_mode == "drama" else flat_unit.text
             )
             # 逐 unit 收集而非首个违约即抛：报告要覆盖所有坏 unit，Agent 一轮就能看全要改什么。
             # 一个 unit 内部仍是首个违约即停——正文解析不出时，后续判定都建立在同一个问题上。
@@ -1944,6 +2057,7 @@ class ScriptGenerator:
                     self.project_json,
                     max_refs=max_refs,
                     tolerated_speakers=dialogue_speakers(str(unit.get("text") or "")),
+                    check_mention_syntax=prompt_policy_version == "drama_detail_v1",
                 )
                 assert_dialogue_preserved(label, str(unit.get("text") or ""), authored_text)
                 if self.content_mode == "drama":
@@ -1969,6 +2083,15 @@ class ScriptGenerator:
                                 for issue in temporal_issues
                             ]
                         )
+                if prompt_policy_version == "drama_detail_v1":
+                    policy_issues = validate_policy_text(
+                        str(unit["unit_id"]),
+                        authored_text,
+                        required_source_text=str(unit.get("text") or ""),
+                        scene_names=tuple(self.project_json.get("scenes", {})),
+                    )
+                    locate_violations(policy_issues, item_index=index, item_id=str(unit["unit_id"]))
+                    violations.extend(policy_issues)
             except DraftViolation as exc:
                 items = violation_items(exc)
                 locate_violations(items, item_index=index, item_id=str(unit["unit_id"]))
@@ -1979,11 +2102,16 @@ class ScriptGenerator:
                     **unit,
                     "text": authored_text,
                     **({"prompt_format_version": "timeline_v1"} if self.content_mode == "drama" else {}),
+                    **({"prompt_policy_version": prompt_policy_version} if prompt_policy_version else {}),
                 }
             )
 
+        if prompt_policy_version == "drama_detail_v1" and context_units is not None:
+            from lib.script.reference_video.prompt_policy_validation import validate_policy_handoffs
+
+            violations.extend(validate_policy_handoffs(authored, context_units))
         if violations:
-            raise DraftViolations(violations)
+            raise AuthoringCandidateViolation(violations, flat.title, model_units)
         return authored
 
     async def _author_ad_reference_units(
@@ -2101,6 +2229,9 @@ class ScriptGenerator:
         base_fingerprint: str | _UnsetExpectedFingerprint | None = _UNSET_EXPECTED_FINGERPRINT,
         expected_draft_revision: str | None,
         before_commit: Callable[[], None] | None = None,
+        prompt_policy_version: str | None = None,
+        fallback_units: Sequence[dict] | None = None,
+        completed_units: Sequence[dict] = (),
     ) -> DraftViolation:
         """把违约的 prompt_authoring 产出与报告落待修复草稿，返回携带报告的违约异常（由调用方抛出）。
 
@@ -2125,12 +2256,54 @@ class ScriptGenerator:
             if before_commit is not None:
                 before_commit()
             violations = violation_items(exc)
+            response_diagnostic: dict[str, Any] | None = None
+            try:
+                if fallback_units is not None and exc.code == "prompt_authoring_response_invalid":
+                    raise ValueError("Model envelope does not map to the expected batch")
+                content = (
+                    copy.deepcopy(exc.content) if isinstance(exc, AuthoringCandidateViolation)
+                    else self._prompt_authoring_flat_content(response_text, episode)
+                )
+                if self.content_mode == "drama":
+                    content = unpack_authoring_units(
+                        ReferencePromptAuthoringFlatScript.model_validate(content), len(unit_ids)
+                    ).model_dump()
+            except ValueError:
+                if fallback_units is None or exc.code != "prompt_authoring_response_invalid":
+                    raise
+                content = {
+                    "title": episode_title(self.project_json, episode),
+                    "units": [{"text": str(unit.get("text") or "")} for unit in fallback_units],
+                }
+                response_diagnostic = {
+                    "kind": "invalid_json_or_schema",
+                    "response_chars": len(response_text),
+                    "response_sha256": hashlib.sha256(response_text.encode("utf-8")).hexdigest(),
+                    "raw_response": response_text,
+                    "failed_unit_ids": list(unit_ids),
+                    "fallback_digest": canonical_json_digest(content),
+                }
+            if isinstance(exc, AuthoringCandidateViolation):
+                response_diagnostic = {
+                    "kind": "candidate_validation_failed", "raw_response": response_text,
+                    "response_sha256": hashlib.sha256(response_text.encode("utf-8")).hexdigest(),
+                    "failed_unit_ids": list(unit_ids),
+                }
+            # Repair and promotion change the formal baseline. Carry already validated
+            # batches into the same draft, otherwise their exact-basis cache becomes
+            # unusable after promotion and the user pays to author them again.
+            if completed_units and len(content["units"]) == len(unit_ids):
+                content["units"] = [{"text": unit["text"]} for unit in completed_units] + content["units"]
+                unit_ids = [str(unit["unit_id"]) for unit in completed_units] + list(unit_ids)
+                for violation in violations:
+                    if violation.item_index is not None:
+                        violation.item_index += len(completed_units)
             locate_violations_by_id(violations, unit_ids)
             report = quarantine_and_report(
                 self.project_path,
                 episode,
                 QUARANTINE_KIND_PROMPT_AUTHORING,
-                content=self._prompt_authoring_flat_content(response_text, episode),
+                content=content,
                 violations=violations,
                 meta={
                     "base_fingerprint": (
@@ -2139,6 +2312,8 @@ class ScriptGenerator:
                         else base_fingerprint
                     ),
                     "unit_ids": list(unit_ids),
+                    **({"prompt_policy_version": prompt_policy_version} if prompt_policy_version else {}),
+                    **({"response_diagnostic": response_diagnostic} if response_diagnostic else {}),
                 },
             )
         return DraftViolation(report, code="quarantined")
@@ -2233,7 +2408,15 @@ class ScriptGenerator:
             raise self._formal_unit_promotion_violation(targets, exc) from exc
         max_refs = self._resolve_max_refs(facts)
         try:
-            authored = self._merge_reference_visual(units, json.dumps(draft.content), episode, max_refs=max_refs)
+            prompt_policy_version = draft.meta.get("prompt_policy_version")
+            authored = self._merge_reference_visual(
+                units,
+                json.dumps(draft.content),
+                episode,
+                max_refs=max_refs,
+                prompt_policy_version=prompt_policy_version if isinstance(prompt_policy_version, str) else None,
+                context_units=targets.script[targets.kind],
+            )
             if unit_ids is None:
                 # 整份草稿里正文未变的单元不算已编写：只写回正文实际改变的单元，其余单元（含待编写标记）
                 # 沿用正式剧本。全部单元仍经上面的合并重判，违约照常落报告。

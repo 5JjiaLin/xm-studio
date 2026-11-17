@@ -282,6 +282,98 @@ async def test_ai_repair_rewrites_only_the_violating_item_and_adopts_when_clean(
     assert "保持口语化" in requirements
 
 
+async def test_complete_nonhuman_draft_adopts_without_rewriting_or_model_calls(narration, monkeypatch):
+    pm, project_path = narration
+    model = FakeTextGenerator("unexpected generation")
+    use_text_generator(monkeypatch, model.create)
+    pm.update_project("demo", lambda p: p.update(content_mode="drama", generation_mode="reference_video"))
+    content = {
+        "units": [{"text": "@[张三]在村口等人。", "source_text": _NOVEL, "duration_seconds": 4}],
+        "new_assets": [{
+            "name": "巨型暗影狼", "type": "character", "decision": "register",
+            "reason": "剧本中的魔兽，尺寸和外观为设计补全。",
+            "description": "体长约3.2米、肩高约1.5米的四足狼形魔兽，肩胛高耸、胸腔宽阔；"
+                           "狭长狼头、三角耳、暗红眼睛、尖锐獠牙；粗长尾巴；"
+                           "全身粗硬黑色短毛，黑紫色黏液沿毛束结成条块。",
+        }],
+    }
+    write_quarantine(project_path, 1, QUARANTINE_KIND_SCRIPT_PLAN, content=content, violations=[],
+                     meta={"source": None, "prompt_policy_version": "drama_detail_v1"})
+    service = EpisodeDraftService(pm)
+    view = await service.get_draft("demo", 1, "reference_script_plan")
+    assert view["violations"] == []
+    result = await service.save_draft("demo", 1, "reference_script_plan", content, view["revision"])
+    assert result["adopted"] is True
+    saved = json.loads((project_path / "drafts/episode_1/script_plan_reference_units.json").read_text())
+    assert len(saved["new_assets"]) == 1
+    for key, value in content["new_assets"][0].items():
+        assert saved["new_assets"][0][key] == value
+    for key, value in content["units"][0].items():
+        assert saved["units"][0][key] == value
+    assert not quarantine_path(project_path, 1, QUARANTINE_KIND_SCRIPT_PLAN).exists()
+    assert model.requests == []
+
+
+async def test_template_only_draft_can_be_saved_and_confirmed_without_model_repair(narration, monkeypatch):
+    monkeypatch.setenv("ARCREEL_PROMPT_CONTENT_VALIDATION", "false")
+    pm, project_path = narration
+    model = FakeTextGenerator("unexpected generation")
+    use_text_generator(monkeypatch, model.create)
+    pm.update_project("demo", lambda p: p.update(content_mode="drama", generation_mode="reference_video"))
+    content = {
+        "units": [{"text": "@[张三]等人。", "source_text": "自由改写的摘要", "duration_seconds": 4}],
+        "new_assets": [{"name": "木箱", "type": "prop", "decision": "register",
+                        "reason": "出现的道具", "description": "破旧木箱。"}],
+    }
+    write_quarantine(project_path, 1, QUARANTINE_KIND_SCRIPT_PLAN, content=content, violations=[],
+                     meta={"source": None, "prompt_policy_version": "drama_detail_v1"})
+    service = EpisodeDraftService(pm)
+    view = await service.get_draft("demo", 1, "reference_script_plan")
+    assert view["violations"] == []
+    result = await service.save_draft("demo", 1, "reference_script_plan", content, view["revision"])
+    assert result["adopted"] is True
+    review = ScriptReviewService(pm)
+    state = await review.get_state("demo", 1)
+    await review.confirm("demo", 1, plan_fingerprint=state["fingerprint"])
+    project = pm.load_project("demo")
+    assert project["props"]["木箱"]["description"] == "破旧木箱。"
+    script = json.loads((project_path / "scripts/episode_1.json").read_text())
+    assert script["video_units"][0]["text"] == content["units"][0]["text"]
+    assert model.requests == []
+
+
+async def test_prop_dimension_repair_uses_asset_scope_and_adopts_without_changing_units(narration, monkeypatch):
+    pm, project_path = narration
+    pm.update_project("demo", lambda p: p.update(content_mode="drama", generation_mode="reference_video"))
+    content = {
+        "units": [{"text": "@[张三]在村口等人。", "source_text": _NOVEL, "duration_seconds": 4}],
+        "new_assets": [{"name": "传音符", "type": "prop", "decision": "register",
+                        "reason": "尺寸与材质为设计补全", "description": "掌心大小的黄色符纸。"}],
+    }
+    write_quarantine(project_path, 1, QUARANTINE_KIND_SCRIPT_PLAN, content=content, violations=[],
+                     meta={"source": None, "prompt_policy_version": "drama_detail_v1"})
+    view = await EpisodeDraftService(pm).get_draft("demo", 1, "reference_script_plan")
+    assert [v["code"] for v in view["violations"]] == ["prompt_policy_prop_scale_missing"]
+    assert view["violations"][0].get("item_index") is None
+    description = "约长9厘米、宽6厘米，掌心大小的黄色符纸。"
+    model = FakeTextGenerator(json.dumps({"new_assets": [{
+        "name": "传音符", "type": "prop", "description": description,
+    }]}, ensure_ascii=False))
+    use_text_generator(monkeypatch, model.create)
+
+    result = await _repair(pm).repair(1, "reference_script_plan", view["revision"])
+
+    assert result["adopted"] is True
+    saved = json.loads((project_path / "drafts/episode_1/script_plan_reference_units.json").read_text())
+    for key, value in content["units"][0].items():
+        assert saved["units"][0][key] == value
+    assert saved["new_assets"][0]["description"] == description
+    assert saved["new_assets"][0]["reason"] == content["new_assets"][0]["reason"]
+    (request,) = model.requests
+    assert '## `new_assets[0]`' in request.prompt
+    assert '缺少可执行尺寸' in request.prompt
+
+
 async def test_ai_repair_rewrites_the_whole_draft_for_episode_level_violations(narration, monkeypatch) -> None:
     pm, project_path = narration
     _write_narration_draft(project_path, [_segment(), _segment(segment_id="E1S02")])

@@ -140,9 +140,25 @@ class NewAssetResolution:
                     outcome = self.outcomes.get(("character", asset_name_comparison_key(speech["speaker"])))
                     if outcome is not None and outcome.speaker is not None:
                         speech["speaker"] = outcome.speaker
+        def remap(name: str, speaker: bool) -> str | None:
+            outcome = by_name.get(name)
+            if outcome is not None:
+                return _remap_mention(outcome, speaker)
+            if "/" not in name:
+                return None
+            base, form = name.split("/", 1)
+            base_outcome = by_name.get(base)
+            final_base = base_outcome.name if base_outcome and base_outcome.kind == "asset" else base
+            form_outcome = by_name.get(form)
+            if form_outcome and form_outcome.kind == "derivative" and form_outcome.name == final_base:
+                return f"@[{form_outcome.visual}]"
+            if final_base != base:
+                return f"@[{final_base}/{form}]"
+            return None
+
         text = entry.get("text")
         if isinstance(text, str):
-            entry["text"] = remap_mentions(text, lambda name, speaker: _remap_mention(by_name.get(name), speaker))
+            entry["text"] = remap_mentions(text, remap)
         return entry
 
     def _rewrite_names(self, asset_type: str, values: list[Any]) -> list[Any]:
@@ -288,6 +304,8 @@ class _Resolver:
             if not self._valid_name(item.name, index, "name"):
                 continue
             if (item.type, key) in self.items:
+                if item != self.items[(item.type, key)][1]:
+                    self._problem("new_asset_duplicate_conflict", index, f"临时名称「{item.name}」重复但归属、决定或输入不同；请使用唯一临时名")
                 continue
             owner = self.owners.get(key, item_types.get(key))
             if owner is not None and owner != item.type:
@@ -523,14 +541,15 @@ def unregistered_references(
 
 def dedupe_new_assets(raw_items: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """同类同名（规范化后）的新增项只留第一项。"""
-    seen: set[tuple[object, str]] = set()
+    seen: dict[tuple[object, str], list[dict[str, Any]]] = {}
     result: list[dict[str, Any]] = []
     for item in raw_items:
         name = item.get("name")
         marker = (item.get("type"), asset_name_comparison_key(name) if isinstance(name, str) else "")
-        if marker in seen:
+        previous = seen.setdefault(marker, [])
+        if dict(item) in previous:
             continue
-        seen.add(marker)
+        previous.append(dict(item))
         result.append(dict(item))
     return result
 

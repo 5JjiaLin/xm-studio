@@ -4,6 +4,8 @@
   "status": 200,
   "body": {
     "timeline_id": "tl-recorded",
+    "aspect_ratio": "9:16",
+    "content_mode": "narration",
     "revision": 1,
     "clips": [
       {
@@ -27,6 +29,8 @@
         "transition_to_next": null
       }
     ],
+    "bgm": [],
+    "bgm_library": [],
     "media": {
       "E1U1": {
         "version": null,

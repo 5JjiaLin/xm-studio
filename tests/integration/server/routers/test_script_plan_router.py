@@ -80,3 +80,50 @@ def test_oversized_replan_reason_is_rejected_without_submission(planning_http):
 
     assert response.status_code == 422
     planning_http.command.assert_not_awaited()
+
+
+def test_repair_preserves_instructions_and_only_passes_selected_revision(planning_http):
+    before = planning_http.pm.load_project("demo")
+    response = planning_http.client.post(
+        "/api/v1/projects/demo/episodes/1/script-plan", json={"repair_draft_revision": "rev-original"}
+    )
+    assert response.status_code == 200, response.text
+    request = planning_http.command.await_args.args[0].value
+    assert request.instructions == "保留对白原文"
+    assert request.repair_draft_revision == "rev-original"
+    assert not request.repair_once
+    assert planning_http.pm.load_project("demo") == before
+
+
+@pytest.mark.parametrize("extra", [{"repair_once": True}, {"instructions": "改写"}, {"replan_reason": "重做"}, {"repair_draft_revision": "rev"}])
+def test_local_recheck_rejects_generation_flags_without_mutating_instructions(planning_http, extra):
+    before = planning_http.pm.load_project("demo")
+    response = planning_http.client.post(
+        "/api/v1/projects/demo/episodes/1/script-plan", json={"repair_recheck_task_id": "task-original", **extra}
+    )
+    assert response.status_code == 422
+    planning_http.command.assert_not_awaited()
+    assert planning_http.pm.load_project("demo") == before
+
+
+def test_local_recheck_is_not_a_saved_instruction_change(planning_http):
+    before = planning_http.pm.load_project("demo")
+    response = planning_http.client.post(
+        "/api/v1/projects/demo/episodes/1/script-plan", json={"repair_recheck_task_id": "task-original"}
+    )
+    assert response.status_code == 200, response.text
+    request = planning_http.command.await_args.args[0].value
+    assert request.repair_recheck_task_id == "task-original"
+    assert request.instructions is None
+    assert planning_http.pm.load_project("demo") == before
+
+
+def test_conflicting_repair_modes_are_rejected_before_any_write(planning_http):
+    before = planning_http.pm.load_project("demo")
+    response = planning_http.client.post(
+        "/api/v1/projects/demo/episodes/1/script-plan",
+        json={"repair_once": True, "repair_draft_revision": "rev", "instructions": "不应保存"},
+    )
+    assert response.status_code == 422
+    planning_http.command.assert_not_awaited()
+    assert planning_http.pm.load_project("demo") == before

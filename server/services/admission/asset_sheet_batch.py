@@ -107,6 +107,7 @@ class AssetSheetUnit:
     #: 是否声明了原图：声明了原图的资产图按图生图生成。
     has_originals: bool
     candidate: GenerationCandidate
+    generation_prompt: str = ""
 
     @property
     def unit_id(self) -> str:
@@ -171,6 +172,7 @@ def project_asset_sheet_units(project: Mapping[str, Any], asset_type: str | None
                     name=name,
                     owner=None,
                     description=_clean_description(entry),
+                    generation_prompt=str(entry.get("generation_prompt") or ""),
                     has_originals=_declares_originals(entry, spec.asset_type),
                     candidate=GenerationCandidate(
                         unit_id=asset_unit_id(spec.asset_type, name),
@@ -340,7 +342,7 @@ def plan_asset_sheet_batch(
     for state in selection.targets:
         unit = by_id[state.unit_id]
         label = ASSET_SPECS[unit.asset_type].label_zh
-        if unit.description is None:
+        if unit.description is None and not (not unit.is_derivative and unit.generation_prompt.strip()):
             builder.block(
                 unit.unit_id,
                 problem=(
@@ -514,7 +516,7 @@ def asset_sheet_statuses(project: Mapping[str, Any], resolver: ArtifactCurrencyR
                 "name": owner,
                 "derivative": derivative,
                 "status": (status or ArtifactStatus.MISSING).value,
-                "description_missing": unit.description is None,
+                "description_missing": unit.description is None and not unit.generation_prompt.strip(),
                 "image_to_image": unit.image_to_image,
             }
         )

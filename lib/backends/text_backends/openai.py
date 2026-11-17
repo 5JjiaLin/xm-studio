@@ -115,7 +115,8 @@ class OpenAITextBackend:
         失败会连带重放已成功的原生调用（重试叠乘），且降级异常消息含模型侧动态文本，
         可能误中重试判定的字符串模式。
         """
-        if request.response_schema and self._provider_name == PROVIDER_MINIMAX:
+        prefer_stream = request.prefer_stream or self._model in LONG_THINKING_TEXT_MODELS
+        if request.response_schema and self._provider_name == PROVIDER_MINIMAX and not request.prefer_native_schema:
             # MiniMax 的 wire schema 拒收数字 enum，TOOLS 又可能把字符串数组编码为
             # {"item": ...}。沿用已带校验及有限反馈重试的 prompt 路径，避免重复走这两个通道。
             return await prompt_json_fallback(
@@ -124,7 +125,7 @@ class OpenAITextBackend:
         # 带图请求要读本地图片编码 data URI，放线程里构建，避免阻塞事件循环
         messages = await asyncio.to_thread(_build_messages, request)
         if request.response_schema and TextCapability.STRUCTURED_OUTPUT not in self._capabilities:
-            if request.prefer_stream:
+            if prefer_stream:
                 return await self._prompt_json_fallback(request)
             logger.info("%s/%s 未声明原生结构化输出，直接走 Instructor", self._provider_name, self._model)
             return await _instructor_fallback(
@@ -138,7 +139,7 @@ class OpenAITextBackend:
 
         native = await self._generate_native(request, messages)
         if native is None:
-            if request.prefer_stream:
+            if prefer_stream:
                 return await self._prompt_json_fallback(request)
             # 原生 response_format 通道不兼容（schema 错误），结构化输出整体降级
             return await _instructor_fallback(
@@ -150,7 +151,7 @@ class OpenAITextBackend:
                 token_param=self._max_tokens_param,
             )
 
-        if request.response_schema:
+        if request.response_schema and not request.preserve_raw_response:
             fallback_reason = structured_fallback_reason(native.text, request.response_schema)
             if fallback_reason:
                 logger.warning(
@@ -158,7 +159,7 @@ class OpenAITextBackend:
                     fallback_reason,
                     truncate_for_log(native.text),
                 )
-                if request.prefer_stream:
+                if prefer_stream:
                     result = await self._prompt_json_fallback(request)
                     merge_billed_usage(result, native)
                     return result
@@ -224,7 +225,7 @@ class OpenAITextBackend:
         except Exception as exc:
             if request.response_schema and _is_schema_error(exc):
                 logger.warning(
-                    "原生 response_format 失败 (%s)，降级到 Instructor 路径",
+                    "原生 response_format 失败 (%s)，转入结构化输出兼容路径",
                     exc,
                 )
                 return None

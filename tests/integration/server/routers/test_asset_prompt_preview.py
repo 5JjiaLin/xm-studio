@@ -18,6 +18,7 @@ from server.error_handlers import register_error_handlers
 from server.routers._asset_router_factory import build_asset_router
 from server.services.admission import prompt_preview
 from tests.auth_deps import AUTH_DEPENDENCIES, override_auth
+from tests.fakes import use_generation_context, use_project_manager
 from tests.integration.server.services.tasks.generation_tasks_support import FakeGenerator, fake_resolve_ctx
 
 _OWNER_SHEET = "characters/阿岚.png"
@@ -206,3 +207,22 @@ def test_missing_project_is_not_an_asset_unavailable_result(preview_client):
 
     assert response.status_code == 404
     assert response.json()["detail"] == "项目 'missing' 不存在或未初始化"
+
+
+async def test_saved_derivative_instruction_matches_preview_and_executed_request(preview_client, monkeypatch):
+    from server.services.tasks import derivative_sheet_tasks
+    client, manager, _app = preview_client
+    instruction = "穿上红色雨衣，其余外观不变"
+    saved = client.patch("/projects/demo/characters/阿岚/derivatives/战斗装", json={"description": instruction})
+    assert saved.status_code == 200, saved.text
+    generator = FakeGenerator(manager.get_project_path("demo"))
+    context = fake_resolve_ctx(generator)
+    monkeypatch.setattr(prompt_preview, "resolve_generation_context", context)
+    use_project_manager(monkeypatch, manager)
+    use_generation_context(monkeypatch, context)
+    preview = _preview(client, "characters/阿岚/derivatives/战斗装", instruction)
+    assert preview["unavailable"] is None
+    assert generator.image_calls == []
+    await derivative_sheet_tasks.execute_character_derivative_task("demo", "阿岚/战斗装", {})
+    assert generator.image_calls[0]["prompt"] == preview["text"]
+    assert manager.load_project("demo")["characters"]["阿岚"]["derivatives"]["战斗装"]["description"] == instruction

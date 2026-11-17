@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 
 from lib.infra.text_metrics import reading_unit_noun
@@ -72,6 +73,7 @@ def build_reference_units_split_prompt(
     episode_outline: dict | None = None,
     next_episode_outline: dict | None = None,
     instructions: str | None = None,
+    drama_detail_enabled: bool = False,
 ) -> str:
     """Step-1 video_unit 拆分 prompt：源文 → 扁平 unit 表（时长 + 原文锚 + 引用语法正文）。
 
@@ -165,6 +167,7 @@ def build_reference_units_split_prompt(
         max_reference_images=max_reference_images,
         episode_target_duration=episode_target_duration,
         instructions=instructions,
+        drama_detail_enabled=drama_detail_enabled,
     )
 
 
@@ -193,6 +196,27 @@ def render_reference_units_for_prompt_authoring(
     return "\n\n".join(blocks)
 
 
+def render_authoring_context(units: list[dict], targets: list[dict]) -> str:
+    """Project only local batch expansions; never summarize saved/manual prose."""
+    from lib.script.reference_video.prompt_policy_validation import section_body
+
+    target_ids = {str(unit.get("unit_id")) for unit in targets}
+    projected = []
+    for unit in units:
+        item = dict(unit)
+        if str(unit.get("unit_id")) in target_ids:
+            item["text"] = "本次输出目标，完整内容契约见下方 script_plan_units；此处不重复。"
+            item.pop("generation_prompt", None)  # still included verbatim in the target block
+        elif "_authoring_source_text" in unit and not unit.get("generation_prompt"):
+            tail = section_body(str(unit.get("text") or ""), "组尾交接")
+            # Without a recognized handoff, keep the complete candidate rather than
+            # losing information under template-only validation.
+            if tail:
+                item["text"] = str(unit["_authoring_source_text"]) + "\n已完成扩写的有效组尾交接：\n" + tail
+        projected.append(item)
+    return render_reference_units_for_prompt_authoring(projected)
+
+
 def build_reference_video_prompt(
     *,
     project_overview: dict,
@@ -212,6 +236,7 @@ def build_reference_video_prompt(
     speech_rate_override: float | None = None,
     voice_conditions: str = "声音能力未确认，不承诺生成声音或已绑定音频。",
     timeline_enabled: bool = True,
+    drama_detail_enabled: bool = False,
 ) -> str:
     """构建参考生视频 prompt_authoring（提示词编写）的 LLM Prompt。
 
@@ -239,12 +264,22 @@ def build_reference_video_prompt(
         units_content=render_reference_units_for_prompt_authoring(
             script_plan_units, context_units=context_units, output_targets=True
         ),
+        output_count=len(script_plan_units),
+        output_shape=json.dumps(
+            {"title": "本集标题", "units": [
+                {"text": f"输出序号 {i + 1} 的完整正文"} for i in range(len(script_plan_units))
+            ]}, ensure_ascii=False,
+        ),
         timeline_enabled=timeline_enabled,
+        drama_detail_enabled=drama_detail_enabled,
         speech_rate=f"{speech_rate_units_per_second(source_language, speech_rate_override):g}",
         speech_unit=reading_unit_noun(source_language),
         voice_conditions=voice_conditions,
-        context_content=render_reference_units_for_prompt_authoring(
-            context_units if context_units is not None else script_plan_units
+        context_content=(
+            render_authoring_context(context_units or script_plan_units, script_plan_units)
+            if drama_detail_enabled else render_reference_units_for_prompt_authoring(
+                context_units if context_units is not None else script_plan_units
+            )
         ),
         episode=episode,
         max_refs=max_refs,

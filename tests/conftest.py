@@ -30,6 +30,7 @@ import tempfile
 import uuid as _uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
+from importlib import import_module
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -101,6 +102,18 @@ def _remove_owned_test_home_dir() -> None:
 
 
 atexit.register(_remove_owned_test_home_dir)
+
+# Only suppress the developer's .env during the initial package import. Tests
+# of explicit env-file loading must still exercise the real loader afterward.
+_INITIAL_DOTENV_DISABLED = os.environ.get("PYTHON_DOTENV_DISABLED")
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+try:
+    import_module("lib")
+finally:
+    if _INITIAL_DOTENV_DISABLED is None:
+        os.environ.pop("PYTHON_DOTENV_DISABLED", None)
+    else:
+        os.environ["PYTHON_DOTENV_DISABLED"] = _INITIAL_DOTENV_DISABLED
 
 import lib.generation.generation_queue as generation_queue_module
 from lib.db.base import Base

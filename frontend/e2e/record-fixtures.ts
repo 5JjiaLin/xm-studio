@@ -58,6 +58,7 @@ const RECORDINGS: Recording[] = [
   { file: "project-demo-feedback-objects", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/production/feedback/objects` },
   { file: "project-demo-production", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/episodes/1/production` },
   { file: "project-demo-script-review", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/episodes/1/script-review` },
+  { file: "project-demo-episode-drafts", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/episodes/1/drafts` },
   { file: "project-demo-production-asset-prompt", method: "POST", path: `/api/v1/projects/${DEMO_PROJECT}/production/asset-prompt`, json: { kind: "character", name: "阿明", description: "青年" } },
   { file: "project-demo-production-edit", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/episodes/1/production/edit`, status: 409 },
   // 工作区与集页的启动请求（项目事件流是 SSE，不录制，场景里按需替换）。
@@ -270,6 +271,11 @@ async function main() {
     AUTH_USERNAME: USERNAME,
     AUTH_PASSWORD: PASSWORD,
     AUTH_TOKEN_SECRET: "e2e-token-secret-for-recording-only",
+    // 外部目录同步不得改变录制时的模型能力；后端只允许访问回环测试服务。
+    HTTP_PROXY: "http://127.0.0.1:9",
+    HTTPS_PROXY: "http://127.0.0.1:9",
+    ALL_PROXY: "http://127.0.0.1:9",
+    NO_PROXY: "127.0.0.1,localhost",
   };
   // 数据库落在临时数据目录里，不碰开发者自己的库。
   delete env.DATABASE_URL;
@@ -316,7 +322,12 @@ async function main() {
       };
       writeFileSync(join(RECORDED_DIR, `${recording.file}.json`), `${JSON.stringify(recorded, null, 2)}\n`);
     }
-    // The remaining fixture uses original services in this temporary data root only.
+    // Only local capability resolution is needed for draft adoption. No generation endpoint is called.
+    // Register a dummy credential after base recordings so configuration fixtures remain unconfigured.
+    await postJson(baseUrl, token, "/api/v1/providers/gemini-aistudio/credentials", {
+      name: "Offline fixture recording", api_key: "fixture-not-a-real-key", base_url: "http://127.0.0.1:9",
+    });
+    // The remaining fixtures use original services in this temporary data root only.
     const seed = spawnSync(resolve(REPO_ROOT, ".venv/bin/python"), ["-c", `
 import asyncio, os
 from pathlib import Path
@@ -325,7 +336,7 @@ from lib.edit_timeline import EditTimelineService
 from lib.edit_timeline.model import RevisionAuthor
 from lib.infra.json_io import atomic_write_json
 pm = ProjectManager(Path(os.environ["ARCREEL_DATA_DIR"]))
-pm.update_project("demo", lambda p: p.update({"generation_mode": "reference_video"}))
+pm.update_project("demo", lambda p: p.update({"generation_mode": "reference_video", "video_backend": "gemini-aistudio/veo-3.1-generate-preview", "model_settings": {"gemini-aistudio/veo-3.1-generate-preview": {"resolution": "720p"}}}))
 pm.save_script("demo", {"episode": 1, "title": "第一集", "content_mode": "narration", "generation_mode": "reference_video", "novel": {"title": "小说", "chapter": "第一章"}, "summary": "验收", "video_units": [{"unit_id": u, "text": "镜头", "duration_seconds": 4} for u in ("E1U1", "E1U2")]}, "episode_1.json")
 timeline = asyncio.run(EditTimelineService(pm).create_from_script("demo", episode=1, name="剪辑初稿", author=RevisionAuthor(kind="creator"))).timeline
 journal = pm.get_project_path("demo") / "production" / "episode_1.json"
@@ -339,6 +350,32 @@ atomic_write_json(journal, {"episode": 1, "status": "completed", "timeline_id": 
     const promptRecording: Recording = { file: "project-demo-reference-prompt", method: "POST", path: `/api/v1/projects/${DEMO_PROJECT}/reference-videos/episodes/1/units/E1U1/prompt-preview`, json: { prompt: "镜头" } };
     const prompt = await request(baseUrl, token, promptRecording);
     writeFileSync(join(RECORDED_DIR, `${promptRecording.file}.json`), JSON.stringify({ method: promptRecording.method, path: promptRecording.path, status: prompt.status, body: normalize(prompt.body, dataDir) }, null, 2) + "\n");
+    const draftSeed = spawnSync(resolve(REPO_ROOT, ".venv/bin/python"), ["-c", `
+import os
+from pathlib import Path
+from lib.project.project_manager import ProjectManager
+from lib.script.draft_quarantine import QUARANTINE_KIND_PROMPT_AUTHORING, write_quarantine
+from lib.script.draft_violation import DraftViolation
+from lib.script.script_review import content_fingerprint
+pm = ProjectManager(Path(os.environ["ARCREEL_DATA_DIR"]))
+project_path = pm.get_project_path("demo")
+write_quarantine(project_path, 1, QUARANTINE_KIND_PROMPT_AUTHORING,
+    content={"title": "第一集", "units": [{"text": "@[未登记人物] 出场"}, {"text": "镜头"}]},
+    violations=[DraftViolation("未登记人物", code="unregistered_mention", item_index=0, item_id="E1U1")],
+    meta={"base_fingerprint": content_fingerprint(project_path / "scripts/episode_1.json"), "unit_ids": ["E1U1", "E1U2"]})
+`], { cwd: REPO_ROOT, env, encoding: "utf8" });
+    if (draftSeed.status !== 0) throw new Error(draftSeed.stderr);
+    const draftPath = `/api/v1/projects/${DEMO_PROJECT}/episodes/1/drafts/reference_prompt_authoring`;
+    const draft = await request(baseUrl, token, { method: "GET", path: draftPath });
+    writeFileSync(join(RECORDED_DIR, "project-demo-prompt-draft.json"), JSON.stringify({ method: "GET", path: draftPath, status: draft.status, body: normalize(draft.body, dataDir) }, null, 2) + "\n");
+    const saved = await fetch(`${baseUrl}${draftPath}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ base_revision: (draft.body as { revision: string }).revision, content: { units: [{ text: "镜头缓慢推进" }, { text: "镜头" }] } }),
+    });
+    const savedBody: unknown = await saved.json();
+    if (!saved.ok || !(savedBody as { adopted?: boolean }).adopted) throw new Error(`保存草稿未采用：${JSON.stringify(savedBody)}`);
+    writeFileSync(join(RECORDED_DIR, "project-demo-prompt-draft-save.json"), JSON.stringify({ method: "PUT", path: draftPath, status: saved.status, body: normalize(savedBody, dataDir) }, null, 2) + "\n");
     console.log(`已录制 ${readdirSync(RECORDED_DIR).length} 个接口到 ${RECORDED_DIR}`);
   } finally {
     if (!exited) backend.kill("SIGTERM");

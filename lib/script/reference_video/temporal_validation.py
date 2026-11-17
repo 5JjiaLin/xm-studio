@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 
+from lib.script.prompt_policy import prompt_content_validation_enabled
 from lib.script.reference_video.text_parser import SpeechMark, split_speech_line
 from lib.speech.speech_rate import estimate_spoken_seconds
 
@@ -19,6 +20,13 @@ TIMELINE_CODES = frozenset(
         "segment_speech_overflow",
         "creative_override_mismatch",
         "timeline_speech_outside_segment",
+        "prompt_policy_structure",
+        "prompt_policy_state_binding",
+        "prompt_policy_unknown",
+        "prompt_policy_style_duplicate",
+        "prompt_policy_handoff_mismatch",
+        "prompt_policy_narrative_relation",
+        "prompt_policy_asset_reference_missing",
     }
 )
 _HEADING = re.compile(r"^\s*【([0-9]+(?:\.[0-9]{1,3})?)-([0-9]+(?:\.[0-9]{1,3})?)s】\s*$")
@@ -31,6 +39,7 @@ _STRUCTURAL_HEADING = re.compile(
 _TIME_TITLE = re.compile(r"^\s*[【\[]\s*(?:[-+]?\d|NaN|inf|[Tab](?=\s*[-–—~～])).*(?:[-–—~～]|s|秒).*", re.I)
 _RENDERED_SPEAKER = re.compile(r"<([^<>\n]+)>说\s*(?=\{)")
 _SECTION = re.compile(r"^\s*【[^】]+】\s*$")
+_POLICY_SECTIONS = ("本组设定", "开场承接", "分段时间轴", "组尾交接", "必要限制")
 
 
 @dataclass(frozen=True)
@@ -96,6 +105,8 @@ def validate_timeline(
     rendered: bool = False,
 ) -> tuple[tuple[TemporalSegment, ...], tuple[TemporalIssue, ...]]:
     """Validate continuous ranges and segment speech, leaving original text untouched."""
+    if not prompt_content_validation_enabled():
+        return (), ()
     # Shared tolerance with whole-unit speech validation; local import avoids an import cycle.
     from lib.script.reference_video.draft_validation import SPEECH_OVERFLOW_TOLERANCE
 
@@ -178,11 +189,18 @@ def validate_effective_timeline(
     request_duration_seconds: int | None,
 ) -> tuple[TemporalIssue, ...]:
     """Check source and the actual creative text, including manual overrides."""
+    if not prompt_content_validation_enabled():
+        return ()
     from lib.speech.speech_rate import project_speech_rate_override
 
     text = str(unit.get("text") or "")
     custom = str(unit.get("generation_prompt") or "")
-    required = unit.get("prompt_format_version") == TIMELINE_V1 or has_timeline(text) or has_timeline(custom)
+    required = (
+        unit.get("prompt_format_version") == TIMELINE_V1
+        or bool(unit.get("prompt_policy_version"))
+        or has_timeline(text)
+        or has_timeline(custom)
+    )
     if not required:
         return ()
     duration = int(unit.get("duration_seconds") or 0)
@@ -242,3 +260,7 @@ def retain_timeline_contract(before: dict | None, after: dict) -> None:
             or has_timeline(str(item.get("generation_prompt") or ""))
         ):
             item["prompt_format_version"] = TIMELINE_V1
+        if old.get("prompt_policy_version"):
+            if item.get("prompt_policy_version") not in (None, old["prompt_policy_version"]):
+                raise ValueError("prompt_policy_version 不能通过普通脚本保存修改")
+            item["prompt_policy_version"] = old["prompt_policy_version"]

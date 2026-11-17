@@ -933,6 +933,19 @@ class TestStructuredModeChainSync:
         assert self._modes(mock_gen) == [Mode.TOOLS, Mode.MD_JSON]
         assert result.text == sample.model_dump_json()
 
+    @pytest.mark.parametrize("detail", ["tools upstream timeout", "functions backend unavailable", "tool_calls failed"])
+    def test_tool_mentions_without_explicit_rejection_do_not_downgrade(self, detail):
+        rejection = _bad_request(detail)
+        with (
+            patch(
+                "lib.backends.text_backends.instructor_support.generate_structured_via_instructor",
+                side_effect=[instructor_api_call_exhausted(rejection)],
+            ) as mock_gen,
+            pytest.raises(BadRequestError),
+        ):
+            self._call()
+        assert self._modes(mock_gen) == [Mode.TOOLS]
+
     def test_downgrade_carries_billed_tokens_of_failed_mode(self):
         """TOOLS 档拿到过 HTTP 200（已计费）后才降档，这部分 token 并入最终结果。"""
         sample = SampleModel(name="Heidi", age=29)

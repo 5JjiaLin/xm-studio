@@ -85,6 +85,32 @@ def _asset(kind: str, name: str, path: str, *, image_kind: str = "asset") -> Res
     )
 
 
+@pytest.mark.parametrize("target_index", [0, 1])
+async def test_manual_tail_change_blocks_both_adjacent_requests_without_rewriting(target_index):
+    def body(opening, ending, relation):
+        return (f"【本组设定】\n叙事关系：{relation}\n空景。\n【开场承接】\n{opening}\n"
+                f"【分段时间轴】\n【0-8s】\n固定机位拍摄空景。\n【组尾交接】\n{ending}\n【必要限制】\n无。")
+
+    first = {"unit_id": "E1U1", "duration_seconds": 8, "prompt_policy_version": "drama_detail_v1",
+             "text": body("起点。", "A在左侧，B在右侧。", "首组"),
+             "generation_prompt": body("起点。", "A在右侧，B在左侧。", "首组")}
+    second = {"unit_id": "E1U2", "duration_seconds": 8, "prompt_policy_version": "drama_detail_v1",
+              "text": body("A在左侧，B在右侧。", "终点。", "连续")}
+    script = {"video_units": [first, second]}
+    before = json.dumps(script, ensure_ascii=False)
+    projector = ReferenceUnitRequestProjector(
+        _fixed_request_facts(make_video_request_facts(generation_type="i2v", allowed_durations=(8,), supported_durations=(8,))),
+        _FakeAssets(set()),
+    )
+    result = await projector.project_current(
+        project={"content_mode": "drama", "generation_mode": "reference_video"}, script=script,
+        unit=script["video_units"][target_index], resolved_assets=[], options=ReferenceRequestOptions(),
+    )
+    assert any(p.code == "prompt_policy_handoff_mismatch" and p.blocking and p.action == "fix_input"
+               for p in result.problems)
+    assert json.dumps(script, ensure_ascii=False) == before
+
+
 def test_request_options_only_treat_payload_without_options_as_legacy_confirmed() -> None:
     legacy = ReferenceRequestOptions.from_payload({}, legacy_duration_confirmed=True)
     malformed = ReferenceRequestOptions.from_payload(

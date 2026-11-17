@@ -341,7 +341,7 @@ describe("ReferenceScriptPlanPreviewPanel", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /确认拆分，继续生成/ }));
 
-    await waitFor(() => expect(confirm).toHaveBeenCalledWith("p", 1, {}));
+    await waitFor(() => expect(confirm).toHaveBeenCalledWith("p", 1, { planFingerprint: "fp1" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "已确认" })).toBeDisabled());
     expect(useAppStore.getState().toast?.text).toBe("已确认 — 视觉生成已放行");
     expect(useAssistantStore.getState().input).toBe("");
@@ -379,7 +379,7 @@ describe("ReferenceScriptPlanPreviewPanel", () => {
 
     fireEvent.click(button);
 
-    await waitFor(() => expect(confirm).toHaveBeenCalledWith("p", 1, {}));
+    await waitFor(() => expect(confirm).toHaveBeenCalledWith("p", 1, { planFingerprint: "fp1" }));
     expect(await screen.findByRole("button", { name: "已确认" })).toBeDisabled();
   });
 
@@ -404,7 +404,7 @@ describe("ReferenceScriptPlanPreviewPanel", () => {
     expect(await screen.findByRole("alertdialog")).toHaveTextContent(itemIdsInEpisodeText(overwrite.text));
     fireEvent.click(screen.getByRole("button", { name: "覆盖并确认" }));
 
-    await waitFor(() => expect(confirm).toHaveBeenCalledWith("p", 1, { overwriteRevision: "sha256-v1:listed" }));
+    await waitFor(() => expect(confirm).toHaveBeenCalledWith("p", 1, { overwriteRevision: "sha256-v1:listed", planFingerprint: "fp1" }));
   });
 
   it("keeps the overwrite dialog open with the refreshed list when the formal script changed meanwhile", async () => {
@@ -449,7 +449,7 @@ describe("ReferenceScriptPlanPreviewPanel", () => {
     expect(screen.getByRole("alertdialog")).not.toHaveTextContent("U05");
 
     fireEvent.click(screen.getByRole("button", { name: "覆盖并确认" }));
-    await waitFor(() => expect(confirm).toHaveBeenLastCalledWith("p", 1, { overwriteRevision: "sha256-v1:refreshed" }));
+    await waitFor(() => expect(confirm).toHaveBeenLastCalledWith("p", 1, { overwriteRevision: "sha256-v1:refreshed", planFingerprint: "fp1" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   });
 
@@ -832,7 +832,7 @@ describe("ReferenceScriptPlanPreviewPanel", () => {
     expect(await durationOptions()).toEqual(["4", "6", "8"]);
   });
 
-  it("pins unit-less violations at the top and offers no hand fix when the draft structure is broken", async () => {
+  it("pins unit-less violations at the top and exposes the retained JSON for manual repair", async () => {
     vi.spyOn(API, "getScriptReview").mockResolvedValue({
       ...quarantinedState(),
       quarantine: draftView({
@@ -845,7 +845,7 @@ describe("ReferenceScriptPlanPreviewPanel", () => {
 
     await waitFor(() => expect(screen.getByText("待修复草稿的 content.units 必须是非空数组")).toBeInTheDocument());
     expect(screen.getByText("整集层面的问题")).toBeInTheDocument();
-    expect(screen.queryByText(/被改坏了/)).not.toBeInTheDocument();
+    expect((screen.getByRole("textbox", { name: "JSON" }) as HTMLTextAreaElement).value).toContain("被改坏了");
     expect(screen.queryByRole("button", { name: /保存并校验/ })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /交给 Agent 修复/ })).toBeInTheDocument();
   });

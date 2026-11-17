@@ -61,6 +61,7 @@ def render_reference_prompt_preview(
     ]
     result["prompt_source"] = "manual" if unit.get("generation_prompt") else "default"
     result["prompt_format_version"] = unit.get("prompt_format_version")
+    result["prompt_policy_version"] = unit.get("prompt_policy_version")
     result["problems"] = [
         {
             **problem.to_payload(unit_id=str(unit.get("unit_id") or "")),

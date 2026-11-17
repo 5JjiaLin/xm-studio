@@ -68,7 +68,11 @@ def localize_draft_view(view: dict | None, _t: Translator, names: DisplayNames) 
     for violation in view["violations"]:
         if violation["code"] == "quarantine_unreadable":
             violation["message"] = _t("script_review_quarantine_unreadable")
-        elif isinstance(violation.get("params"), dict):
+        elif isinstance(violation.get("params"), dict) and violation["code"] not in {
+            "dialogue_overload",
+            "duration_off_tier",
+            "source_span_invalid",
+        }:
             violation["message"] = render_message(violation["code"], violation["params"], _t, names)
     for soft in view.get("soft_violations") or []:
         soft["message"] = render_message(soft["code"], soft["params"], _t, names)
@@ -143,6 +147,8 @@ async def update_script_review_content(
 class ConfirmScriptReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    plan_fingerprint: str | None = None
+
     overwrite_revision: str | None = Field(
         default=None, description="认可覆盖的正式脚本版本，取自 script_overwrite.revision；该集尚无正式脚本时不必给"
     )
@@ -173,8 +179,25 @@ async def confirm_script_review(
         # 确认会写正式脚本并登记新资产；不标来源时变更按 filesystem 广播，前端当作外部改动跳到资产窗格。
         with project_change_source("webui"):
             state = await service.confirm(
-                project_name, episode, overwrite_revision=req.overwrite_revision if req is not None else None
+                project_name, episode, overwrite_revision=req.overwrite_revision if req is not None else None,
+                plan_fingerprint=req.plan_fingerprint if req is not None else None
             )
+        await _attach_duration_tiers(service, project_name, episode, state, _t, names)
+        _attach_overwrite_text(state, _t)
+        state["quarantine"] = localize_draft_view(await service.get_quarantine_info(project_name, episode), _t, names)
+        return state
+    except ScriptReviewError as exc:
+        raise_review_error(exc, episode, _t)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/script-review/revise", dependencies=[Depends(require_project_migration_ok)])
+async def revise_script_review(project_name: str, episode: int, req: ConfirmScriptReviewRequest, _t: Translator, names: DisplayNamesCatalog):
+    try:
+        service = ScriptReviewService(get_project_manager())
+        with project_change_source("webui"):
+            state = await service.start_revision(project_name, episode, req.plan_fingerprint)
         await _attach_duration_tiers(service, project_name, episode, state, _t, names)
         _attach_overwrite_text(state, _t)
         state["quarantine"] = localize_draft_view(await service.get_quarantine_info(project_name, episode), _t, names)

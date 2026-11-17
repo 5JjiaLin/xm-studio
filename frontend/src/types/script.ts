@@ -217,6 +217,9 @@ export interface ScriptReviewState {
   content: DramaNormalizedScript | NarrationScriptPlanDraft | ReferenceScriptPlanDraft | null;
   /** 草稿在场时非 null（三条 script_plan 路线都可能出现），否则 null。 */
   quarantine: ScriptReviewQuarantine | null;
+  repair_progress?: { task_id: string; phase: string; calls_started: number; can_recheck?: boolean; recheck_reason?: string | null };
+  repair_enabled?: boolean;
+  repair_allowed?: boolean;
   /** 正式参考规划的逐单元降级提示，只提示、不阻断。 */
   soft_violations?: DraftSoftViolation[];
   /**
@@ -226,12 +229,12 @@ export interface ScriptReviewState {
    */
   supported_durations: number[] | null;
   /**
-   * 按「是否带参考图」收窄后的逐 unit 生效档位，与 prompt_authoring 落盘前的校验同一把尺；无法解析型号
+   * 按计划视觉引用收窄后的逐 unit 生效档位，与 prompt_authoring 落盘前的校验同一把尺；无法解析型号
    * 时为 null。
    */
   duration_tiers: {
     with_references: number[];
-    /** 逐 unit 的服务端定桶结论（按可用参考图），面板据此取档与判越档，不按已登记引用自判。 */
+    /** 逐 unit 的服务端规划定桶结论（按最终身份的视觉引用），面板据此取档与判越档，不按已登记引用自判。 */
     units: ReferenceUnitCapabilityMap;
   } | null;
   /**
@@ -426,6 +429,9 @@ export interface AuthorPromptsResponse {
 export interface PlanScriptRequest {
   instructions?: string | null;
   replan_reason?: string | null;
+  repair_draft_revision?: string;
+  repair_once?: boolean;
+  repair_recheck_task_id?: string;
 }
 
 /** 提交后立即返回的生成批次，形状同提示词编写。 */

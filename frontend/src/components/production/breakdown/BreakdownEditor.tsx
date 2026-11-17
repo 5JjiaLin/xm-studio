@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { API, ApiRequestError } from "@/api";
 import { CharacterAnglePicker } from "../assets/CharacterAnglePicker";
@@ -35,13 +35,16 @@ export function BreakdownEditor({ project, episode, projectData, review, busy, o
   const [replacement, setReplacement] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [overwrite, setOverwrite] = useState<ScriptOverwrite | null>(null);
-  const content = review.content && "units" in review.content ? review.content : null;
-  const save = useCallback(async (value: ReferenceScriptPlanDraft | null) => {
+  const content = review.content && "units" in review.content ? { ...review.content, planFingerprint: review.fingerprint } : null;
+  const confirmationFingerprint = useRef<string | null>(null);
+  const save = useCallback(async (value: (ReferenceScriptPlanDraft & { planFingerprint: string | null }) | null, baseline: (ReferenceScriptPlanDraft & { planFingerprint: string | null }) | null) => {
     if (!value) return;
-    const saved = await API.saveScriptReviewContent(project, episode, value, review.fingerprint);
-    return saved.content && "units" in saved.content ? saved.content : value;
-  }, [project, episode, review.fingerprint]);
-  const unit = useEditUnit({ source: content, save });
+    const { planFingerprint: _fingerprint, ...payload } = value;
+    const saved = await API.saveScriptReviewContent(project, episode, payload, baseline?.planFingerprint);
+    confirmationFingerprint.current = saved.fingerprint;
+    return saved.content && "units" in saved.content ? { ...saved.content, planFingerprint: saved.fingerprint } : value;
+  }, [project, episode]);
+  const unit = useEditUnit({ source: content, save, preserveDirtyBaseline: true });
   const locked = busy || writing || submitting || unit.status === "saving" || review.status === "confirmed";
   const submit = async (overwriteRevision?: string) => {
     if (locked || review.quarantine) return;
@@ -54,8 +57,9 @@ export function BreakdownEditor({ project, episode, projectData, review, busy, o
       if (current.status !== "confirmed" && current.script_overwrite && current.script_overwrite.revision !== overwriteRevision) {
         setOverwrite(current.script_overwrite); return;
       }
+      confirmationFingerprint.current = unit.savedValue?.planFingerprint ?? null;
       await unit.saveAndGenerate(async () => {
-        if (current.status !== "confirmed") await API.confirmScriptReview(project, episode, { overwriteRevision });
+        await API.confirmScriptReview(project, episode, { overwriteRevision, planFingerprint: confirmationFingerprint.current ?? undefined });
         setOverwrite(null); onStarted();
       });
     } catch (cause) {
@@ -84,10 +88,12 @@ export function BreakdownEditor({ project, episode, projectData, review, busy, o
           {Object.entries((existing ?? {}) as Record<string, { description: string; generation_prompt?: string }>).filter(([name]) => unit.value?.units.some((u) => [...extractMentions(u.text), ...dialogueSpeakers(u.text)].some((ref) => belongsToAsset(ref, name))) && !unit.value?.new_assets?.some((a) => a.name === name)).map(([name, asset]) => <BreakdownExistingAsset key={name} project={project} kind={kind} name={name} description={asset.description} generationPrompt={asset.generation_prompt || ""} disabled={locked} tableDirty={unit.dirty} onDirty={assetDirty} onChanged={onChanged} onRemove={() => { setRemoveIndex(null); setExistingRemoval({ name, type: kind }); setReplacement(""); }} />)}
           {!!Object.keys(existing ?? {}).length && <div className="flex flex-wrap gap-2"><select aria-label={`${t("production_asset_adopt")} ${kind}`} className="h-9 max-w-full rounded-md border border-input bg-background px-2 text-sm" disabled={locked} value={adoptName[kind] ?? ""} onChange={(e) => setAdoptName((v) => ({ ...v, [kind]: e.target.value }))}><option value="">{t("production_asset_adopt")}</option>{Object.keys(existing ?? {}).map((name) => <option key={name} value={name}>{name}</option>)}</select><select aria-label={`${t("production_shot")} ${kind}`} className="h-9 rounded-md border border-input bg-background px-2 text-sm" disabled={locked} value={adoptUnit[kind] || unit.value?.units[0]?.unit_id || ""} onChange={(e) => setAdoptUnit((v) => ({ ...v, [kind]: e.target.value }))}>{unit.value?.units.map((u) => <option key={u.unit_id} value={u.unit_id}>{u.unit_id}</option>)}</select><Button type="button" variant="outline" disabled={locked || !adoptName[kind]} onClick={() => unit.setValue((old) => old && ({ ...old, units: old.units.map((u) => u.unit_id === (adoptUnit[kind] || old.units[0]?.unit_id) ? { ...u, text: `${u.text}\n@[${adoptName[kind]}]` } : u) }))}>{t("production_asset_add")}</Button></div>}
           {unit.value?.new_assets?.map((asset, i) => asset.type !== kind ? null : <div key={i} className="flex flex-col gap-2 rounded-lg border border-border p-3">
+            {asset.reason?.trim() && <p className="text-sm text-muted-foreground">{t("new_asset_reason", { reason: asset.reason })}</p>}
             <Label htmlFor={`asset-name-${i}`}>{t("production_asset_name")}</Label><Input id={`asset-name-${i}`} value={asset.asset_name || asset.name} disabled={locked} onChange={(e) => unit.setValue((old) => old && ({ ...old, new_assets: old.new_assets?.map((a, j) => j === i ? { ...a, asset_name: e.target.value } : a) }))} />
             <Label htmlFor={`adopt-${i}`}>{t("production_asset_adopt")}</Label><select id={`adopt-${i}`} className="h-9 rounded-md border border-input bg-background px-2 text-sm" disabled={locked} value={asset.decision === "derivative" ? `__derivative:${asset.target}` : asset.decision === "merge" ? asset.target : asset.decision === "skip" ? "__skip" : ""} onChange={(e) => unit.setValue((old) => old && ({ ...old, new_assets: old.new_assets?.map((a, j) => j === i ? { ...a, decision: e.target.value.startsWith("__derivative:") ? "derivative" : e.target.value === "__skip" ? "skip" : e.target.value ? "merge" : "register", target: e.target.value.startsWith("__derivative:") ? e.target.value.slice(13) : e.target.value === "__skip" ? "" : e.target.value } : a) }))}>
               <option value="">{t("production_asset_new")}</option><option value="__skip">{t("production_asset_text_only")}</option>{Object.keys(existing ?? {}).map((name) => <option key={name} value={name}>{name}</option>)}{kind === "character" && Object.keys(existing ?? {}).map((name) => <option key={`derivative:${name}`} value={`__derivative:${name}`}>{t("production_character_variant_of", { name })}</option>)}
             </select>
+            {asset.decision === "derivative" && <label className="text-sm">{t("assets:derivative_description")}<Textarea value={asset.description} disabled={locked} onChange={(e) => unit.setValue((old) => old && ({ ...old, new_assets: old.new_assets?.map((a, j) => j === i ? { ...a, description: e.target.value } : a) }))} /></label>}
             {asset.decision === "register" && <AssetPromptEditor project={project} kind={kind} name={asset.asset_name || asset.name} description={asset.description} prompt={asset.generation_prompt || ""} disabled={locked} onChange={(prompt) => unit.setValue((old) => old && ({ ...old, new_assets: old.new_assets?.map((a, j) => j === i ? { ...a, generation_prompt: prompt } : a) }))} />}
             <Button type="button" variant="outline" className="self-start" disabled={locked} onClick={() => { setExistingRemoval(null); setRemoveIndex(i); setReplacement(""); }}>{t("production_asset_remove")}</Button>
           </div>)}
@@ -99,14 +105,17 @@ export function BreakdownEditor({ project, episode, projectData, review, busy, o
       const asset = existingRemoval || unit.value.new_assets![removeIndex!];
       const newAsset = existingRemoval ? null : unit.value.new_assets![removeIndex!];
       const variantReference = newAsset?.decision === "derivative" ? `${newAsset.target}/${newAsset.asset_name || newAsset.name}` : null;
+      const dependencies = unit.value.new_assets?.filter((a, i) => i !== removeIndex && a.type === asset.type && ((a.decision === "merge" || a.decision === "derivative") && !!a.target && (a.target === asset.name || (!!newAsset?.asset_name && a.target === newAsset.asset_name)))) ?? [];
       const references = unit.value.units.filter((u) => [...extractMentions(u.text), ...dialogueSpeakers(u.text)].some((ref) => belongsToAsset(ref, asset.name) || (variantReference && belongsToAsset(ref, variantReference))));
       return <section className="flex flex-col gap-3 rounded-lg border border-border p-4"><p>{t("production_asset_remove_hint", { name: asset.name, units: references.map((u) => u.unit_id).join("、") || "—" })}</p>
-        <Label htmlFor="replacement-asset">{t("production_asset_replacement")}</Label><select id="replacement-asset" className="h-9 rounded-md border border-input bg-background px-2 text-sm" value={replacement} onChange={(e) => setReplacement(e.target.value)}><option value="">{t("production_asset_text_only")}</option>{[...new Set([...Object.keys(asset.type === "character" ? projectData.characters ?? {} : asset.type === "scene" ? projectData.scenes ?? {} : projectData.props ?? {}), ...(unit.value.new_assets || []).filter((a, i) => i !== removeIndex && a.type === asset.type && a.decision !== "skip").map((a) => a.name)])].filter((name) => name !== asset.name).map((name) => <option key={name} value={name}>{name}</option>)}</select>
-        <div className="flex gap-2"><Button type="button" disabled={locked} onClick={() => {
-          unit.setValue((old) => old && ({ ...old, units: old.units.map((u) => ({ ...u, text: replaceAssetReferences(variantReference ? replaceAssetReferences(u.text, variantReference, replacement) : u.text, asset.name, replacement) })), new_assets: old.new_assets?.filter((_, i) => i !== removeIndex) })); setRemoveIndex(null); setExistingRemoval(null);
+        {dependencies.length > 0 && <p role="alert">{t("production_asset_adopt")}: {dependencies.map((a) => a.name).join("、")}</p>}
+        <Label htmlFor="replacement-asset">{t("production_asset_replacement")}</Label><select id="replacement-asset" className="h-9 rounded-md border border-input bg-background px-2 text-sm" value={replacement} onChange={(e) => setReplacement(e.target.value)}><option value="">{t("production_asset_text_only")}</option>{[...new Set([...Object.keys(asset.type === "character" ? projectData.characters ?? {} : asset.type === "scene" ? projectData.scenes ?? {} : projectData.props ?? {}), ...(unit.value.new_assets || []).filter((a, i) => i !== removeIndex && a.type === asset.type && a.decision !== "skip" && a.decision !== "derivative").map((a) => a.name)])].filter((name) => name !== asset.name).map((name) => <option key={name} value={name}>{name}</option>)}</select>
+        <div className="flex gap-2"><Button type="button" disabled={locked || (!!dependencies.length && !replacement)} onClick={() => {
+          unit.setValue((old) => old && ({ ...old, units: old.units.map((u) => ({ ...u, text: replaceAssetReferences(variantReference ? replaceAssetReferences(u.text, variantReference, replacement) : u.text, asset.name, replacement, dependencies.some((a) => a.decision === "derivative")) })), new_assets: old.new_assets?.filter((_, i) => i !== removeIndex).map((a) => dependencies.includes(a) ? { ...a, target: replacement } : a) })); setRemoveIndex(null); setExistingRemoval(null);
         }}>{t("production_asset_remove")}</Button><Button type="button" variant="ghost" onClick={() => { setRemoveIndex(null); setExistingRemoval(null); }}>{t("common:cancel")}</Button></div>
       </section>;
     })()}
+    {unit.externallyUpdated && <div role="alert"><p>{t("common:updated_by_agent")}</p><Button variant="outline" onClick={unit.discard}>{t("common:discard_changes")}</Button></div>}
     {unit.error && <p role="alert" className="text-sm text-destructive">{unit.error}</p>}
     {review.status !== "confirmed" && <Button variant="outline" className="self-start" disabled={locked || !unit.dirty} onClick={() => void unit.save()}>{t("common:save")}</Button>}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}

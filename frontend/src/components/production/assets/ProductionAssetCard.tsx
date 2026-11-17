@@ -12,7 +12,7 @@ import { CharacterAngleCropper } from "./CharacterAngleCropper";
 import { AssetPromptEditor } from "./AssetPromptEditor";
 import { TaskElapsedReadout } from "@/components/shared/TaskElapsedReadout";
 
-export function ProductionAssetCard({ project, episode, kind, name, description, generationPrompt = "", path, busy: productionBusy, onChanged }: { project: string; episode: number; kind: "character" | "scene" | "prop"; name: string; description: string; generationPrompt?: string; path?: string; busy: boolean; onChanged: () => void }) {
+export function ProductionAssetCard({ project, episode, kind, name, description, generationPrompt = "", path, stale = false, busy: productionBusy, onChanged }: { project: string; episode: number; kind: "character" | "scene" | "prop"; name: string; description: string; generationPrompt?: string; path?: string; stale?: boolean; busy: boolean; onChanged: () => void }) {
   const { t } = useTranslation("dashboard");
   const [promptOpen, setPromptOpen] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -28,7 +28,7 @@ export function ProductionAssetCard({ project, episode, kind, name, description,
   }, [kind, project, name, onChanged, t]);
   const unit = useEditUnit({ source: { generation_prompt: generationPrompt }, save });
   const failure = !occupied && (latest?.status === "failed" || latest?.status === "cancelled") ? latest : undefined;
-  const statusKey = busy ? "production_image_submitting" : occupied ? latest?.status === "running" ? "production_image_running" : "production_image_queued" : failure ? "production_image_failed" : path ? "production_image_ready" : "production_image_waiting";
+  const statusKey = busy ? "production_image_submitting" : occupied ? latest?.status === "running" ? "production_image_running" : "production_image_queued" : failure ? "production_image_failed" : stale ? "production_image_stale" : path ? "production_image_ready" : "production_image_waiting";
   const regenerate = async () => {
     if (locked || unit.dirty || unit.status === "saving" || isResourceBusy(kind, project, name)) return;
     setBusy(true); setError(null);
@@ -46,7 +46,7 @@ export function ProductionAssetCard({ project, episode, kind, name, description,
     {path && <a href={API.getFileUrl(project, path, fingerprint)} target="_blank" rel="noreferrer"><img src={API.getFileUrl(project, path, fingerprint)} alt={name} className="aspect-video w-full object-contain" /></a>}
     <div className="flex flex-col gap-3 p-4"><h3 className="text-sm font-medium wrap-break-word">{name}</h3>
       <div role="status" className="flex flex-wrap items-center gap-2 text-sm">
-        {occupied || busy ? <Loader2 aria-hidden className="size-4 animate-spin text-primary" /> : failure ? <CircleAlert aria-hidden className="size-4 text-destructive" /> : path ? <CheckCircle2 aria-hidden className="size-4 text-primary" /> : <Clock3 aria-hidden className="size-4 text-muted-foreground" />}
+        {occupied || busy ? <Loader2 aria-hidden className="size-4 animate-spin text-primary" /> : failure ? <CircleAlert aria-hidden className="size-4 text-destructive" /> : stale ? <CircleAlert aria-hidden className="size-4 text-destructive" /> : path ? <CheckCircle2 aria-hidden className="size-4 text-primary" /> : <Clock3 aria-hidden className="size-4 text-muted-foreground" />}
         <span>{t(statusKey)}</span>{latest && <TaskElapsedReadout task={latest} />}
       </div>
       <p className="text-xs text-muted-foreground">{t("production_asset_reference_facts_hint")}</p>

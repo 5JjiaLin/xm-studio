@@ -17,18 +17,21 @@ import { ProductionAssetCard } from "./assets/ProductionAssetCard";
 import { ProductionDerivativeCard } from "./assets/ProductionDerivativeCard";
 import { ProductionVideoCard } from "./videos/ProductionVideoCard";
 import { BreakdownEditor } from "./breakdown/BreakdownEditor";
-import { dialogueSpeakers, extractMentions } from "@/utils/reference-mentions";
+import { resolveCharacterForm } from "@/utils/reference-mentions";
 import { errMsg } from "@/utils/async";
 import { enqueuePromptAuthoring, enqueueProductionAssets, enqueueProductionRender, enqueueProductionFinish, enqueueProductionVideos, enqueueScriptPlan } from "@/actions/generation";
 import { API } from "@/api";
 import { useAppStore } from "@/stores/app-store";
 import { useHasUnsavedChanges } from "@/components/shared/edit-unit/LeaveGuard";
 import { BreakdownStatus } from "./breakdown/BreakdownStatus";
+import { ReferenceScriptPlanPreviewPanel } from "@/components/canvas/reference/ReferenceScriptPlanPreviewPanel";
+import { PromptAuthoringDraftPanel, usePromptAuthoringDraft } from "@/components/canvas/reference/PromptAuthoringDraftPanel";
 import { useScriptPlanEntry } from "@/hooks/useScriptPlanEntry";
 import { isResourceBusy, useActiveResourceIds, useLatestTasksByResource } from "@/stores/tasks-store";
-import { scriptPlanResourceId, promptAuthoringResourceId } from "@/actions/generation";
+import { scriptPlanResourceId, promptAuthoringResourceId, draftRepairResourceId } from "@/actions/generation";
 import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
 import { useProductionVideoProgress } from "./videos/useProductionVideoProgress";
+import { buildMentionLookup } from "@/utils/reference-mentions";
 import { AlertDialog, AlertDialogAction, AlertDialogBody, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 
 const finishErrors = [
@@ -56,10 +59,12 @@ export function ProductionPage() {
   const requestedStep = new URLSearchParams(search).get("step");
   const episodeQuery = new URLSearchParams(search).get("episode");
   const requestedEpisode = episodeQuery && /^[1-9][0-9]*$/.test(episodeQuery) ? Number(episodeQuery) : null;
-  const { episode, project, units, source, workflow, production, review, refresh, loading, error } = useProductionProject(projectName ?? null, episodeQuery !== null && requestedEpisode === null ? -1 : requestedEpisode);
+  const { episode, project, units, source, workflow, production, review, refresh, loading, refreshing, error } = useProductionProject(projectName ?? null, episodeQuery !== null && requestedEpisode === null ? -1 : requestedEpisode);
+  const mentionLookup = buildMentionLookup(project);
   const [picker, setPicker] = useState(false);
   const [confirmReplan, setConfirmReplan] = useState(false);
   const [replanReason, setReplanReason] = useState("");
+  const [repairOnce, setRepairOnce] = useState(false);
   const step = PRODUCTION_STEPS.find((s) => s === requestedStep) ?? (workflow?.content?.formal_script === "present" ? "assets" : "script");
   const [actionError, setActionError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -83,8 +88,13 @@ export function ProductionPage() {
   const videosBusy = useActiveResourceIds("reference_video", projectName).size > 0;
   const authoring = useActiveResourceIds("text_episode_script", projectName).has(promptAuthoringResourceId(episode ?? 0));
   const authoringTask = useLatestTasksByResource(projectName ?? "", "text_episode_script").get(promptAuthoringResourceId(episode ?? 0));
-  const authoringFailed = authoringTask?.status === "failed" || authoringTask?.status === "cancelled";
-  const active = loading || imagesBusy || videosBusy || authoring || planning || starting || production?.status === "active" || production?.status === "submitting" || production?.status === "unknown";
+  const repairTask = useLatestTasksByResource(projectName ?? "", "text_draft_repair").get(draftRepairResourceId(episode ?? 0, "reference_prompt_authoring"));
+  const promptDraftPresent = workflow?.content?.drafts.some((draft) => draft.kind === "reference_video_prompt_authoring") ?? false;
+  const repairedAuthoring = !promptDraftPresent && repairTask?.status === "succeeded" && repairTask.result?.adopted === true
+    && !!authoringTask && repairTask.queued_at > authoringTask.queued_at;
+  const authoringFailed = !repairedAuthoring && (authoringTask?.status === "failed" || authoringTask?.status === "cancelled");
+  const pendingPromptCount = units.filter((unit) => unit.pending_authoring).length;
+  const active = loading || refreshing || imagesBusy || videosBusy || authoring || planning || starting || production?.status === "active" || production?.status === "submitting" || production?.status === "unknown";
   const promptsReady = workflow?.content?.formal_script === "present" && units.length > 0 && !units.some((unit) => unit.pending_authoring);
   const failedUnitIds = production?.status === "failed" ? production.members?.filter((member) => ["failed", "cancelled", "blocked"].includes(member.status)).map((member) => member.unit_id) : undefined;
   const retryVideos = production?.stage === "videos" && production.action === "videos" && Boolean(failedUnitIds?.length);
@@ -93,18 +103,12 @@ export function ProductionPage() {
   const outputCurrent = output?.status === "current" && output.version != null && Boolean(output.artifact_path);
   const previousOutputUrl = projectName && output?.artifact_path && output.version != null ? API.getFileUrl(projectName, output.artifact_path, output.version) : null;
   const outputUrl = projectName && outputCurrent ? API.getFileUrl(projectName, output.artifact_path, output.version) : null;
-  const canRebuild = units.length > 0 && units.every((unit) => unit.generated_assets?.video_clip);
-  const adoptedNames = new Set(units.flatMap((unit) => [...extractMentions(unit.text), ...dialogueSpeakers(unit.text)]).flatMap((name) => [name, name.split("/")[0]]));
-  const visualNames = new Set(units.flatMap((unit) => extractMentions(unit.text)));
-  const derivatives = Object.entries(project?.characters ?? {}).flatMap(([owner, character]) => Object.entries(character.derivatives ?? {}).filter(([name]) => visualNames.has(`${owner}/${name}`)).map(([name, asset]) => ({ owner, name, asset, ownerPath: character.character_sheet })));
-  const assetItems = [
-    ...Object.entries(project?.characters ?? {}).filter(([name]) => adoptedNames.has(name)).map(([, asset]) => asset.character_sheet),
-    ...Object.entries(project?.scenes ?? {}).filter(([name]) => adoptedNames.has(name)).map(([, asset]) => asset.scene_sheet),
-    ...Object.entries(project?.props ?? {}).filter(([name]) => adoptedNames.has(name)).map(([, asset]) => asset.prop_sheet),
-    ...derivatives.map(({ asset }) => asset.character_sheet),
-  ];
-  const completedImages = assetItems.filter(Boolean).length;
-  const allImagesReady = completedImages === assetItems.length && units.length > 0;
+  const inputGate = workflow?.gates.production_inputs;
+  const canRebuild = inputGate?.videos_ready === true;
+  const assetItems = workflow?.content?.referenced_assets ?? [];
+  const completedImages = assetItems.filter((asset) => asset.sheet_state === "current" || asset.sheet_state === "stale").length;
+  const allImagesReady = inputGate?.references_ready === true;
+  const assetSummary = workflow?.content?.asset_summary;
   const videoProgress = useProductionVideoProgress(projectName ?? "", units, production);
   const videoCounts = { succeeded: 0, running: 0, queued: 0, failed: 0, waiting: 0, submitting: 0, unknown: 0 };
   for (const item of videoProgress.values()) videoCounts[item.status] += 1;
@@ -113,9 +117,9 @@ export function ProductionPage() {
     const scope = actionScope.current;
     setStarting(true); setActionError(null);
     try {
-      await enqueueScriptPlan(projectName, episode, { replan_reason: replanReason.trim() });
+      await enqueueScriptPlan(projectName, episode, { replan_reason: replanReason.trim(), ...(review?.repair_allowed && repairOnce ? { repair_once: true } : {}) });
       if (scope?.signal.aborted) { reportBackground(t("production_submitted_background")); return; }
-      setConfirmReplan(false); setReplanReason("");
+      setConfirmReplan(false); setReplanReason(""); setRepairOnce(false);
       refresh(); navigate(productionPath(projectName, "breakdown", episode));
     } catch (e) {
       if (scope?.signal.aborted) reportBackground(errMsg(e), true); else setActionError(errMsg(e));
@@ -125,18 +129,43 @@ export function ProductionPage() {
     if (!projectName || !episode || active || isResourceBusy("text_script_plan", projectName, scriptPlanResourceId(episode))) return;
     if (hasUnsavedChanges()) { setActionError(t("common:unsaved_changes")); return; }
     setActionError(null);
-    setConfirmReplan(true);
+    setRepairOnce(false); setConfirmReplan(true);
   };
-  const recoverDraft = async () => {
-    if (!projectName || !episode || active || hasUnsavedChanges()) return;
+  const revisePlan = async () => {
+    if (!projectName || !episode || active || isResourceBusy("text_script_plan", projectName, scriptPlanResourceId(episode)) || !review?.fingerprint || hasUnsavedChanges()) return;
+    const scope = actionScope.current;
     setStarting(true); setActionError(null);
     try {
-      const draft = await API.getEpisodeDraft(projectName, episode, "reference_script_plan");
-      if (!draft.content || !draft.revision || draft.editable_by !== "user") throw new Error(t("production_draft_unavailable"));
-      const result = await API.saveEpisodeDraft(projectName, episode, draft.doc_type, draft.content, draft.revision);
-      if (!result.adopted) throw new Error(result.draft?.violations.map((v) => v.message).join("；") || t("production_draft_unavailable"));
+      await API.startScriptReviewRevision(projectName, episode, review.fingerprint);
+      if (scope?.signal.aborted) return;
+      refresh(); navigate(productionPath(projectName, "breakdown", episode));
+    } catch (cause) { if (!scope?.signal.aborted) setActionError(errMsg(cause)); }
+    finally { setStarting(false); }
+  };
+  const repairPlan = async () => {
+    const draft = review?.quarantine;
+    if (!projectName || !episode || !review?.repair_allowed || active || !draft?.revision || !draft.repair?.available || isResourceBusy("text_script_plan", projectName, scriptPlanResourceId(episode))) return;
+    if (hasUnsavedChanges()) { setActionError(t("common:unsaved_changes")); return; }
+    const scope = actionScope.current;
+    setStarting(true); setActionError(null);
+    try {
+      await enqueueScriptPlan(projectName, episode, { repair_draft_revision: draft.revision });
+      if (scope?.signal.aborted) { reportBackground(t("production_submitted_background")); return; }
       refresh();
-    } catch (e) { setActionError(errMsg(e)); }
+    } catch (cause) { if (scope?.signal.aborted) reportBackground(errMsg(cause), true); else setActionError(errMsg(cause)); }
+    finally { setStarting(false); }
+  };
+  const recheckPlan = async () => {
+    const taskId = review?.repair_progress?.can_recheck ? review.repair_progress.task_id : null;
+    if (!projectName || !episode || !taskId || active || isResourceBusy("text_script_plan", projectName, scriptPlanResourceId(episode))) return;
+    if (hasUnsavedChanges()) { setActionError(t("common:unsaved_changes")); return; }
+    const scope = actionScope.current;
+    setStarting(true); setActionError(null);
+    try {
+      await enqueueScriptPlan(projectName, episode, { repair_recheck_task_id: taskId });
+      if (scope?.signal.aborted) { reportBackground(t("production_submitted_background")); return; }
+      refresh();
+    } catch (cause) { if (scope?.signal.aborted) reportBackground(errMsg(cause), true); else setActionError(errMsg(cause)); }
     finally { setStarting(false); }
   };
   const startVideos = async (selectedIds?: string[]) => {
@@ -187,7 +216,7 @@ export function ProductionPage() {
     finally { setStarting(false); }
   };
   const prepareVideoPrompts = async (enterVideos = false) => {
-    if (!projectName || !episode || active || !allImagesReady || promptsReady || isResourceBusy("text_episode_script", projectName, promptAuthoringResourceId(episode))) return;
+    if (!projectName || !episode || active || !allImagesReady || promptsReady || workflow?.operations.author_prompts?.state !== "admitted" || isResourceBusy("text_episode_script", projectName, promptAuthoringResourceId(episode))) return;
     if (hasUnsavedChanges()) { setActionError(t("common:unsaved_changes")); return; }
     const scope = actionScope.current;
     setStarting(true); setActionError(null);
@@ -239,20 +268,48 @@ export function ProductionPage() {
         {production?.action === "finish" && production.status === "active" && <p role="status" className="text-sm">{t(production.stage === "draft" ? "finish_draft" : "finish_render")}</p>}
         {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
         {loading ? <LoadingState variant="pane" /> : !projectName ? <ScriptInput /> : project && episode && <>
-          {step === "script" && <ScriptInput key={`${projectName}/${episode}`} projectName={projectName} episode={episode} source={source ?? ""} disabled={active} readOnly={project.episodes?.find((entry) => entry.episode === episode)?.source_origin === "whole_source"} />}
-          {step === "breakdown" && <><BreakdownStatus task={planTask} busy={planning} review={review} />{review?.quarantine?.doc_type === "reference_script_plan" && review.quarantine.content && <Button type="button" variant="outline" className="self-start" disabled={active} onClick={() => void recoverDraft()}>{t("production_draft_recheck")}</Button>}{review?.content && <Button type="button" variant="outline" className="self-start" disabled={active} onClick={requestReplan}>{t("production_breakdown_retry")}</Button>}<div>{!planning && review?.content && episode && <BreakdownEditor project={projectName} episode={episode} projectData={project} review={review} busy={active} onChanged={refresh} onStarted={() => { refresh(); navigate(productionPath(projectName, "assets", episode)); }} />}</div></>}
-          {step === "assets" && <><div role="status" className="flex flex-col gap-2 rounded-lg border border-border bg-card p-4"><p className="font-medium">{t("production_images_summary", { done: completedImages, total: assetItems.length })}</p><p className="text-sm text-muted-foreground">{t("production_images_hint")}</p></div>{groups.map((kind) => {
-            const items: Record<string, { description: string; generation_prompt?: string; character_sheet?: string; scene_sheet?: string; prop_sheet?: string }> = (kind === "character" ? project.characters : kind === "scene" ? project.scenes : project.props) ?? {};
+          {step === "script" && <ScriptInput key={`${projectName}/${episode}`} projectName={projectName} episode={episode} source={source ?? ""} disabled={active} repairEnabled={review?.repair_allowed === true} readOnly={project.episodes?.find((entry) => entry.episode === episode)?.source_origin === "whole_source"} />}
+          {step === "breakdown" && <>
+            <BreakdownStatus task={planTask} busy={planning} review={review} />
+            {review?.repair_progress?.can_recheck && <Button type="button" variant="outline" className="self-start" disabled={active} onClick={() => void recheckPlan()}>{t("production_recheck_saved_result")}</Button>}
+            {review?.repair_progress?.recheck_reason && <p role="status" className="text-sm text-muted-foreground">{review.repair_progress.recheck_reason}</p>}
+            {review?.quarantine?.doc_type === "reference_script_plan" ? <ReferenceScriptPlanPreviewPanel
+              key={`${projectName}:${episode}`} allowAgentActions={false}
+              projectName={projectName}
+              episode={episode}
+              lookup={mentionLookup}
+              onOpenTimeline={() => navigate(productionPath(projectName, "videos", episode))}
+            /> : null}
+            {review?.quarantine?.doc_type === "reference_script_plan" && review.repair_allowed && <Button type="button" variant="outline" className="self-start" disabled={active || !review.quarantine.repair?.available} onClick={() => void repairPlan()}>{t("production_repair_errors")}</Button>}
+            {!review?.quarantine && review?.content && <Button type="button" variant="outline" className="self-start" disabled={active} onClick={requestReplan}>{t("production_breakdown_retry")}</Button>}
+            <div>{!planning && review?.content && episode && !review.quarantine && <BreakdownEditor project={projectName} episode={episode} projectData={project} review={review} busy={active} onChanged={refresh} onStarted={() => { refresh(); navigate(productionPath(projectName, "assets", episode)); }} />}</div>
+          </>}
+          {step === "assets" && <><div role="status" className="flex flex-col gap-2 rounded-lg border border-border bg-card p-4"><p className="font-medium">{t("production_images_summary", { done: completedImages, total: assetItems.length })}</p><p className="text-sm text-muted-foreground">{t("production_images_hint")}</p>{assetSummary && <><p className="text-sm">{t("production_assets_counts", assetSummary)}</p>{assetSummary.unused_suggestions.length > 0 && <p className="text-sm text-muted-foreground">{t("production_assets_unused", { names: assetSummary.unused_suggestions.join("、") })}</p>}</>}</div>{groups.map((kind) => {
+            const assets = assetItems.filter((asset) => asset.asset_type === kind);
             return <section key={kind} className="flex flex-col gap-3"><h2 className="font-medium">{t(kind === "character" ? "characters" : kind === "scene" ? "scenes" : "props")}</h2>
-              <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,18rem),1fr))] gap-4">{Object.entries(items ?? {}).filter(([name]) => adoptedNames.has(name)).map(([name, a]) => {
-                const path = kind === "character" ? a.character_sheet : kind === "scene" ? a.scene_sheet : a.prop_sheet;
-                return <ProductionAssetCard key={name} project={projectName} episode={episode} kind={kind} name={name} description={a.description} generationPrompt={a.generation_prompt} path={path} busy={planning || starting || production?.status === "unknown" || production?.status === "submitting" || production?.status === "active" && production.stage !== "assets"} onChanged={refresh} />;
-              })}{kind === "character" && derivatives.map(({ owner, name, asset, ownerPath }) => <ProductionDerivativeCard key={`${owner}/${name}`} project={projectName} owner={owner} name={name} description={asset.description} path={asset.character_sheet} ownerPath={ownerPath} busy={planning || starting || production?.status === "unknown" || production?.status === "submitting" || production?.status === "active" && production.stage !== "assets"} onChanged={refresh} />)}</div></section>;
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,18rem),1fr))] gap-4">{assets.map((asset) => {
+                if (kind === "character") {
+                  const form = resolveCharacterForm(project.characters, asset.name);
+                  if (!form) return null;
+                  if (form.derivativeName) return <ProductionDerivativeCard key={asset.name} project={projectName} owner={form.ownerName} name={form.derivativeName} description={form.asset.description} path={form.asset.character_sheet} ownerPath={project.characters?.[form.ownerName]?.character_sheet} stale={asset.sheet_state === "stale"} busy={planning || starting || production?.status === "unknown" || production?.status === "submitting" || production?.status === "active" && production.stage !== "assets"} onChanged={refresh} />;
+                  const base = project.characters?.[form.ownerName];
+                  if (!base) return null;
+                  return <ProductionAssetCard key={asset.name} project={projectName} episode={episode} kind="character" name={form.ownerName} description={base.description} generationPrompt={base.generation_prompt} path={base.character_sheet} stale={asset.sheet_state === "stale"} busy={planning || starting || production?.status === "unknown" || production?.status === "submitting" || production?.status === "active" && production.stage !== "assets"} onChanged={refresh} />;
+                }
+                if (kind === "scene") {
+                  const item = project.scenes?.[asset.name];
+                  if (!item) return null;
+                  return <ProductionAssetCard key={asset.name} project={projectName} episode={episode} kind="scene" name={asset.name} description={item.description} generationPrompt={item.generation_prompt} path={item.scene_sheet} stale={asset.sheet_state === "stale"} busy={planning || starting || production?.status === "unknown" || production?.status === "submitting" || production?.status === "active" && production.stage !== "assets"} onChanged={refresh} />;
+                }
+                const item = project.props?.[asset.name];
+                if (!item) return null;
+                return <ProductionAssetCard key={asset.name} project={projectName} episode={episode} kind="prop" name={asset.name} description={item.description} generationPrompt={item.generation_prompt} path={item.prop_sheet} stale={asset.sheet_state === "stale"} busy={planning || starting || production?.status === "unknown" || production?.status === "submitting" || production?.status === "active" && production.stage !== "assets"} onChanged={refresh} />;
+              })}</div></section>;
           })}</>}
-          {step === "videos" && <>{!promptsReady ? <section className="flex flex-col gap-3 rounded-lg border border-border bg-card p-4">
-            <p role="status" className="flex items-center gap-2">{authoring && <Loader2 aria-hidden className="size-4 animate-spin text-primary" />}{t(authoring ? "production_video_authoring" : "production_video_prepare_hint")}</p>
+          {step === "videos" && <><ProductionPromptDraftRecovery key={`${projectName}:${episode}`} projectName={projectName} episode={episode} onSettled={refresh} />{!promptsReady ? <section className="flex flex-col gap-3 rounded-lg border border-border bg-card p-4">
+            <p role="status" className="flex items-center gap-2">{authoring && <Loader2 aria-hidden className="size-4 animate-spin text-primary" />}{t(authoring ? "production_video_authoring" : repairedAuthoring ? "production_video_repaired_continue" : "production_video_prepare_hint", { done: units.length - pendingPromptCount, total: units.length, remaining: pendingPromptCount })}</p>
             {!authoring && authoringFailed && <p role="alert" className="whitespace-pre-wrap text-sm text-destructive">{t("prompt_authoring_failed", { reason: authoringTask?.error_message || t("script_plan_failed_unknown") })}</p>}
-            {!authoring && <Button variant="outline" className="self-start" disabled={active || !allImagesReady} onClick={() => void prepareVideoPrompts()}>{t("production_prepare_video_prompts")}</Button>}
+            {!authoring && <Button variant="outline" className="self-start" disabled={active || !allImagesReady || workflow?.operations.author_prompts?.state !== "admitted"} onClick={() => void prepareVideoPrompts()}>{t(repairedAuthoring ? "production_continue_video_prompts" : "production_prepare_video_prompts")}</Button>}
           </section> : <><p className="text-sm text-muted-foreground">{t("production_video_review_hint")}</p><section aria-label={t("production_videos_progress")} className="flex flex-col gap-3 rounded-lg border border-border bg-card p-4">
             <Progress value={videoCounts.succeeded} max={units.length || 1}>
               <ProgressLabel>{t("production_videos_summary", { done: videoCounts.succeeded, total: units.length })}</ProgressLabel><ProgressValue />
@@ -267,7 +324,8 @@ export function ProductionPage() {
         </>}
       </div>
     </main>
-    <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border bg-card px-4 py-3"><p className="text-sm text-muted-foreground">{active ? t("production_running") : step === "assets" ? t("production_video_targets", { count: units.length }) : step === "videos" && canRebuild ? t("finish_merge_hint") : t("production_saved")}</p>{step === "output" && outputUrl ? <a className={buttonVariants()} href={outputUrl} download>{t("production_download")}</a> : <Button form={step === "breakdown" && !retryPlan || !projectName || step === "script" ? "production-action" : undefined} type={step === "breakdown" && !retryPlan || !projectName || step === "script" ? "submit" : "button"} onClick={retryPlan && projectName ? requestReplan : step === "assets" ? assetAction : step === "videos" ? () => void (canRebuild ? rebuild() : startVideos()) : undefined} disabled={active || (step !== "script" && step !== "breakdown" && step !== "assets" && step !== "videos") || (step === "breakdown" && !retryPlan && (!review?.content || !!review.quarantine)) || (step === "assets" && !allImagesReady && (!review?.fingerprint || review.status !== "confirmed")) || (step === "videos" && !canRebuild && (!allImagesReady || !promptsReady || videoTimelineBlocked))}>{t(planning ? "production_breakdown_running" : retryPlan ? "production_breakdown_retry" : step === "script" ? "production_start" : step === "breakdown" ? "production_confirm_assets" : step === "assets" ? allImagesReady ? promptsReady ? "production_review_videos" : "production_confirm_assets_write_prompts" : "production_confirm_image_prompts" : step === "videos" && canRebuild ? "production_confirm_merge" : step === "videos" && retryVideos ? "production_retry_failed" : step === "videos" ? "production_confirm_videos" : "production_download")}</Button>}</footer>
+    {review?.status === "confirmed" && !review.quarantine && <div className="px-4 py-2"><Button variant="outline" disabled={active} onClick={() => void revisePlan()}>{t("common:edit")} · {t("production_step_breakdown")}</Button></div>}
+    <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border bg-card px-4 py-3"><p className="text-sm text-muted-foreground">{active ? t("production_running") : step === "assets" ? t("production_video_targets", { count: units.length }) : step === "videos" && canRebuild ? t("finish_merge_hint") : t("production_saved")}</p>{step === "output" && outputUrl ? <a className={buttonVariants()} href={outputUrl} download>{t("production_download")}</a> : <Button form={step === "breakdown" && !retryPlan || !projectName || step === "script" ? "production-action" : undefined} type={step === "breakdown" && !retryPlan || !projectName || step === "script" ? "submit" : "button"} onClick={retryPlan && projectName ? requestReplan : step === "assets" ? assetAction : step === "videos" ? () => void (canRebuild ? rebuild() : startVideos()) : undefined} disabled={active || (step !== "script" && step !== "breakdown" && step !== "assets" && step !== "videos") || (step === "breakdown" && !retryPlan && (!review?.content || !!review.quarantine)) || (step === "assets" && (allImagesReady ? !promptsReady && workflow?.operations.author_prompts?.state !== "admitted" : !review?.fingerprint || review.status !== "confirmed")) || (step === "videos" && !canRebuild && (!allImagesReady || !promptsReady || videoTimelineBlocked))}>{t(planning ? "production_breakdown_running" : retryPlan ? "production_breakdown_retry" : step === "script" ? "production_start" : step === "breakdown" ? "production_confirm_assets" : step === "assets" ? allImagesReady ? promptsReady ? "production_review_videos" : "production_confirm_assets_write_prompts" : "production_confirm_image_prompts" : step === "videos" && canRebuild ? "production_confirm_merge" : step === "videos" && retryVideos ? "production_retry_failed" : step === "videos" ? "production_confirm_videos" : "production_download")}</Button>}</footer>
     {picker && <WorkPicker onClose={() => setPicker(false)} />}
     <AlertDialog open={confirmReplan} onOpenChange={(open) => { if (!starting) setConfirmReplan(open); }}>
       <AlertDialogContent>
@@ -275,12 +333,29 @@ export function ProductionPage() {
         <AlertDialogBody><div className="flex flex-col gap-3">
           <AlertDialogDescription>{t(review?.status === "confirmed" ? "script_plan_replace_confirmed_hint" : review?.quarantine ? "script_plan_replace_draft_warning" : review?.content ? "script_plan_replace_pending_warning" : "script_plan_retry_failed_hint")}</AlertDialogDescription>
           <Label htmlFor="replan-reason">{t("script_plan_replan_reason")}</Label>
-          <Textarea id="replan-reason" className="placeholder:text-subtle-foreground" value={replanReason} onChange={(event) => setReplanReason(event.target.value)} placeholder={t("script_plan_replan_reason_placeholder")} maxLength={4000} rows={5} disabled={starting} aria-describedby="replan-reason-hint" />
+          <div className="text-foreground"><Textarea id="replan-reason" value={replanReason} onChange={(event) => setReplanReason(event.target.value)} placeholder={t("script_plan_replan_reason_placeholder")} maxLength={4000} rows={5} disabled={starting} aria-describedby="replan-reason-hint" /></div>
           <p id="replan-reason-hint">{t("script_plan_replan_reason_hint")}</p>
+          {review?.repair_allowed && <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={repairOnce} onChange={(event) => setRepairOnce(event.target.checked)} disabled={starting} />{t("production_repair_once")}</label>}
           {actionError && <p role="alert" className="text-destructive">{actionError}</p>}
         </div></AlertDialogBody>
         <AlertDialogFooter><AlertDialogCancel disabled={starting}>{t("common:cancel")}</AlertDialogCancel><AlertDialogAction disabled={active || !replanReason.trim()} onClick={() => void plan()}>{starting ? t("production_breakdown_running") : t("production_breakdown_retry")}</AlertDialogAction></AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
   </div>;
+}
+
+function ProductionPromptDraftRecovery({
+  projectName,
+  episode,
+  onSettled,
+}: {
+  projectName: string;
+  episode: number;
+  onSettled: () => void;
+}) {
+  const task = useLatestTasksByResource(projectName, "text_episode_script").get(promptAuthoringResourceId(episode));
+  // 任务失败先落草稿，任务状态事件也应刷新恢复入口，不能只依赖独立的草稿事件。
+  const { view, refresh } = usePromptAuthoringDraft(projectName, episode, `${task?.task_id ?? ""}:${task?.status ?? ""}`);
+  if (!view) return null;
+  return <PromptAuthoringDraftPanel allowAgentActions={false} projectName={projectName} episode={episode} view={view} onSettled={() => { refresh(); onSettled(); }} />;
 }

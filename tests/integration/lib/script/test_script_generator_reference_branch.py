@@ -26,7 +26,7 @@ from lib.script.draft_quarantine import (
     quarantine_path,
     write_quarantine,
 )
-from lib.script.reference_video.draft_validation import DraftViolation
+from lib.script.reference_video.draft_validation import DraftViolation, DraftViolations
 from lib.script.reference_video.request_projection import configured_reference_request_facts
 from lib.script.reference_video.text_parser import extract_mentions
 from lib.script.reference_video.unit_capabilities import evaluate_reference_unit_capabilities
@@ -47,6 +47,10 @@ def _prompt_authoring_response(*texts: str, title: str = "t") -> str:
 def _fake_prompt_authoring_generator(*texts: str) -> MagicMock:
     generator = MagicMock()
     generator.model = "mock"
+    generator.backend.name = "mock-backend"
+    generator.configuration_fingerprint = "mock-configuration"
+    generator.max_output_tokens = 64000
+    generator.provider_id = "mock"
     generator.generate = AsyncMock(return_value=MagicMock(text=_prompt_authoring_response(*texts)))
     return generator
 
@@ -55,6 +59,10 @@ def _idle_generator() -> MagicMock:
     """被调用即可断言出来的文本生成替身：用例据此判断拦截发生在付费调用之前。"""
     generator = MagicMock()
     generator.model = "mock"
+    generator.backend.name = "mock-backend"
+    generator.configuration_fingerprint = "mock-configuration"
+    generator.max_output_tokens = 64000
+    generator.provider_id = "mock"
     generator.generate = AsyncMock()
     return generator
 
@@ -206,6 +214,167 @@ async def test_build_prompt_renders_pending_formal_units(reference_project: Path
     assert "（时长 4s）" in prompt
     assert "输入定位 ID：E1U01" in prompt
     assert "输出序号：1" in prompt
+
+
+@pytest.mark.asyncio
+async def test_build_prompt_dry_run_uses_the_selected_drama_detail_policy(tmp_path: Path, monkeypatch):
+    project_dir = _write_reference_project(
+        tmp_path, video_backend="vidu/vidu2.0", content_mode="drama"
+    )
+    _write_formal_units(project_dir, [SCRIPT_PLAN_UNIT])
+    generator = ScriptGenerator(project_dir)
+
+    async def request_facts():
+        return PlanningVideoFacts(
+            by_bucket={
+                "r2v": make_video_request_facts(route="reference_video", generation_type="r2v"),
+                "i2v": make_video_request_facts(route="reference_video", generation_type="i2v"),
+            }
+        )
+
+    monkeypatch.setattr(generator, "_fetch_video_request_facts", request_facts)
+    prompt = await generator.build_prompt(1, prompt_policy_version="drama_detail_v1")
+
+    assert "短剧详细策略补充" in prompt
+    assert "本组设定" in prompt
+
+
+@pytest.mark.parametrize("opening", ["<主角> 位于画面左侧。", "<主角> 位于画面右侧。"])
+def test_drama_detail_policy_tags_units_and_checks_adjacent_handoff(tmp_path: Path, opening: str):
+    project_dir = _write_reference_project(tmp_path, video_backend="vidu/vidu2.0", content_mode="drama")
+    units = [
+        {"unit_id": "E1U01", "text": "@[主角] 在 @[酒馆] 等待。", "duration_seconds": 4},
+        {"unit_id": "E1U02", "text": "@[主角] 听见声音。", "duration_seconds": 4},
+    ]
+    generator = ScriptGenerator(project_dir)
+    response = _prompt_authoring_response(
+        "【本组设定】\n叙事关系：首组\n场景：@[酒馆]。\n【开场承接】\n场景初始状态。\n【分段时间轴】\n【0-4s】\n@[主角] 在 @[酒馆] 等待。\n【组尾交接】\n<主角> 位于画面左侧。\n【必要限制】\n无。",
+        f"【本组设定】\n叙事关系：连续\n场景：@[酒馆]。\n【开场承接】\n{opening}\n【分段时间轴】\n【0-4s】\n@[主角] 听见声音。\n【组尾交接】\n<主角> 站定。\n【必要限制】\n无。",
+    )
+
+    if opening == "<主角> 位于画面左侧。":
+        result = generator._merge_reference_visual(
+            units,
+            response,
+            1,
+            max_refs=4,
+            prompt_policy_version="drama_detail_v1",
+            context_units=units,
+        )
+        assert [unit["prompt_policy_version"] for unit in result] == ["drama_detail_v1", "drama_detail_v1"]
+    else:
+        with pytest.raises(DraftViolation, match="交接不一致"):
+            generator._merge_reference_visual(
+                units,
+                response,
+                1,
+                max_refs=4,
+                prompt_policy_version="drama_detail_v1",
+                context_units=units,
+            )
+
+
+@pytest.mark.asyncio
+async def test_drama_detail_non_contiguous_targets_keep_full_episode_handoff_context(tmp_path: Path):
+    project_dir = _write_reference_project(tmp_path, video_backend="vidu/vidu2.0", content_mode="drama")
+    units = [
+        {"unit_id": f"E1U0{i}", "text": f"@[主角] 完成第{i}个动作。", "duration_seconds": 4}
+        for i in range(1, 5)
+    ]
+    _write_formal_units(project_dir, units)
+    texts = [
+        "【本组设定】\n叙事关系：连续\n地点：@[酒馆]。\n【开场承接】\n<主角> 位于画面左侧。\n"
+        "【分段时间轴】\n【0-4s】\n@[主角] 在 @[酒馆] 内原地站定。\n【组尾交接】\n<主角> 位于画面左侧。\n【必要限制】\n无。",
+        "【本组设定】\n叙事关系：连续\n地点：@[酒馆]。\n【开场承接】\n<主角> 位于画面右侧。\n"
+        "【分段时间轴】\n【0-4s】\n@[主角] 在 @[酒馆] 内转头。\n【组尾交接】\n<主角> 位于画面右侧。\n【必要限制】\n无。",
+    ]
+    generator = _fake_prompt_authoring_generator(*texts)
+    await ScriptGenerator(project_dir, generator=generator).generate(
+        episode=1,
+        entry_ids=["E1U02", "E1U04"],
+        rewrite=True,
+        overwrite_revision=script_review.content_fingerprint(_script_path(project_dir)),
+        prompt_policy_version="drama_detail_v1",
+    )
+
+    result = _formal_units(project_dir)
+    assert result["E1U02"]["prompt_policy_version"] == "drama_detail_v1"
+    assert result["E1U04"]["prompt_policy_version"] == "drama_detail_v1"
+
+
+@pytest.mark.asyncio
+async def test_drama_detail_rejects_confirmed_asset_mentions_omitted_by_authoring_model(tmp_path: Path):
+    project_dir = _write_reference_project(tmp_path, video_backend="vidu/vidu2.0", content_mode="drama")
+    unit = {
+        "unit_id": "E1U01",
+        "text": "@[酒馆] 内 @[主角] 等待。",
+        "duration_seconds": 4,
+    }
+    generator = ScriptGenerator(project_dir)
+    with pytest.raises(DraftViolations, match="遗漏已确认资产引用") as caught:
+        generator._merge_reference_visual(
+            [unit],
+            _prompt_authoring_response(
+                "【本组设定】\n叙事关系：首组\n酒馆内主角站定。\n【开场承接】\n<主角> 位于门边。\n"
+                "【分段时间轴】\n【0-4s】\n<主角>站定。\n【组尾交接】\n<主角> 仍在门边。\n【必要限制】\n无。"
+            ),
+            1,
+            max_refs=4,
+            prompt_policy_version="drama_detail_v1",
+            context_units=[unit],
+        )
+    assert all(issue.item_index == 0 and issue.item_id == "E1U01" for issue in caught.value.items)
+
+
+@pytest.mark.asyncio
+async def test_model_action_names_bind_visuals_without_rewriting_speech_or_manual_text(tmp_path: Path):
+    project_dir = _write_reference_project(tmp_path, video_backend="vidu/vidu2.0", content_mode="drama")
+    unit = {"unit_id": "E1U10", "text": "@[酒馆] 内 @[主角] 转头。@[主角]{过来。}", "duration_seconds": 4}
+    _write_formal_units(project_dir, [unit])
+    text = (
+        "【本组设定】\n叙事关系：首组\n场景：@[酒馆]。\n【开场承接】\n主角位于门边。\n"
+        "【分段时间轴】\n【0-4s】\n主角转头。@[主角]{过来。}\n"
+        "【组尾交接】\n主角仍在门边。\n【必要限制】\n无。"
+    )
+    generator = _fake_prompt_authoring_generator(text)
+    script_generator = ScriptGenerator(project_dir, generator=generator)
+    # Manual/promotion merges stay strict; a speech speaker never counts as a picture.
+    with pytest.raises(DraftViolations, match="遗漏已确认资产引用"):
+        script_generator._merge_reference_visual(
+            [unit], _prompt_authoring_response(text), 1, max_refs=4,
+            prompt_policy_version="drama_detail_v1", context_units=[unit],
+        )
+    await script_generator.generate(episode=1, prompt_policy_version="drama_detail_v1")
+    result = _formal_units(project_dir)["E1U10"]
+    assert result["text"] == text.replace("\n主角转头。", "\n@[主角]转头。")
+    assert extract_mentions(result["text"]) == ["酒馆", "主角"]
+    assert result["duration_seconds"] == 4
+    assert not result.get("pending_authoring")
+    assert generator.generate.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_model_mention_closer_repaired_but_manual_merge_rejected(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("ARCREEL_PROMPT_CONTENT_VALIDATION", "false")
+    project_dir = _write_reference_project(tmp_path, video_backend="vidu/vidu2.0", content_mode="drama")
+    unit = {"unit_id": "E1U10", "text": "@[酒馆] 内 @[主角] 转头。", "duration_seconds": 4}
+    _write_formal_units(project_dir, [unit])
+    text = (
+        "【本组设定】\n场景：@[酒馆]。\n【开场承接】\n主角位于门边。\n"
+        "【分段时间轴】\n【0-4s】\n@[主角>转头。\n"
+        "【组尾交接】\n主角仍在门边。\n【必要限制】\n无。"
+    )
+    generator = _fake_prompt_authoring_generator(text)
+    script_generator = ScriptGenerator(project_dir, generator=generator)
+    with pytest.raises(DraftViolations, match="第 7 行的资产引用格式错误"):
+        script_generator._merge_reference_visual(
+            [unit], _prompt_authoring_response(text), 1, max_refs=4,
+            prompt_policy_version="drama_detail_v1", context_units=[unit],
+        )
+    await script_generator.generate(episode=1, prompt_policy_version="drama_detail_v1")
+    assert _formal_units(project_dir)["E1U10"]["text"] == text.replace("@[主角>", "@[主角]")
+    assert extract_mentions(_formal_units(project_dir)["E1U10"]["text"]) == ["酒馆", "主角"]
+    assert generator.generate.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -605,9 +774,7 @@ async def test_conversion_requires_i2v_facts_for_a_registered_reference_without_
 async def test_prompt_authoring_reads_the_r2v_tier_for_a_unit_with_a_usable_reference(
     reference_project: Path, set_video_request_facts
 ):
-    """带可用参考图的单元按 r2v 桶的事实取档：r2v 收窄到 [4]、i2v 仍是 [4, 8] 时，8 秒在付费调用前不拦
-    （去掉引用就能合法落地），编写输出保留引用后按 r2v 档位判越档，产出落待修复草稿而非按 i2v 档位放行。
-    """
+    """按现有参考图的实际档位预检，必然失败时供应商调用数为零。"""
     set_video_request_facts(
         {
             "r2v": make_video_request_facts(
@@ -623,13 +790,12 @@ async def test_prompt_authoring_reads_the_r2v_tier_for_a_unit_with_a_usable_refe
     generator = _fake_prompt_authoring_generator(PROMPT_AUTHORING_UNIT_TEXT)
 
     gen = ScriptGenerator(reference_project, generator=generator)
-    with pytest.raises(DraftViolation, match="不在当前生效档位"):
+    with pytest.raises(PromptAuthoringUnitRejected, match="不在当前生效档位"):
         await gen.generate(episode=1)
 
-    generator.generate.assert_awaited_once()
+    generator.generate.assert_not_awaited()
     assert _formal_units(reference_project)["E1U01"]["duration_seconds"] == 8
-    envelope = _json.loads(_prompt_authoring_quarantine(reference_project).read_text(encoding="utf-8"))
-    assert [v["code"] for v in envelope["violations"]] == ["duration_off_tier"]
+    assert not _prompt_authoring_quarantine(reference_project).exists()
 
 
 @pytest.mark.asyncio
@@ -889,6 +1055,16 @@ async def test_reference_script_plan_rejects_duplicate_unit_ids(plan_only_refere
         await _materialize(gen)
 
 
+def test_model_response_parsers_reject_duplicate_json_fields():
+    duplicated = '{"title":"demo","units":[{"text":"first","text":"second"}]}'
+    generator = object.__new__(ScriptGenerator)
+
+    with pytest.raises(ValueError, match="重复字段: text"):
+        generator._parse_response(duplicated, episode=1)
+    with pytest.raises(ValueError, match="重复字段: text"):
+        generator._parse_unit_texts(duplicated, episode=1)
+
+
 def test_reference_script_plan_migration_carries_confirmation_forward(plan_only_reference_project: Path):
     """迁移回写让 script_plan 内容指纹漂移；若该集已确认（指纹恰是迁移前内容），须把确认指纹
     平移到迁移后的值，否则仅加载一次规划就会让已确认分集重新等待确认。
@@ -1116,6 +1292,10 @@ async def test_prompt_authoring_missing_title_does_not_fail_the_paid_call(refere
     """非约束解码通道漏写 title 不让已付费的展开失败：title 不参与写回，正式剧本标题原样保留。"""
     generator = MagicMock()
     generator.model = "mock"
+    generator.backend.name = "mock-backend"
+    generator.configuration_fingerprint = "mock-configuration"
+    generator.max_output_tokens = 64000
+    generator.provider_id = "mock"
     generator.generate = AsyncMock(
         return_value=MagicMock(text=_json.dumps({"units": [{"text": PROMPT_AUTHORING_UNIT_TEXT}]}, ensure_ascii=False))
     )
@@ -1160,7 +1340,6 @@ def _prompt_authoring_quarantine(project: Path):
 async def test_prompt_authoring_violation_quarantines_instead_of_discarding(reference_project: Path):
     """prompt_authoring 违约不丢弃这次已付费的展开：产物落待修复草稿、正式剧本不被改写、报告带处置指引。"""
     formal_before = _script_path(reference_project).read_bytes()
-    baseline = script_review.content_fingerprint(_script_path(reference_project))
     gen = ScriptGenerator(reference_project, generator=_fake_prompt_authoring_generator(BAD_PROMPT_AUTHORING_UNIT_TEXT))
 
     with pytest.raises(DraftViolation) as excinfo:
@@ -1171,13 +1350,63 @@ async def test_prompt_authoring_violation_quarantines_instead_of_discarding(refe
     assert "promote_draft" in report
     assert _script_path(reference_project).read_bytes() == formal_before
 
+
+@pytest.mark.asyncio
+async def test_malformed_prompt_authoring_response_is_saved_as_repairable_draft(reference_project: Path):
+    """Bad JSON preserves target units and diagnostics without mutating the formal script or auto-retrying."""
+    _write_formal_units(reference_project, [SCRIPT_PLAN_UNIT])
+    formal_before = _script_path(reference_project).read_bytes()
+    baseline = script_review.content_fingerprint(_script_path(reference_project))
+    generator = _fake_prompt_authoring_generator()
+    generator.generate.return_value = MagicMock(text='{"title":"第1集","units":[{"text":"不完整')
+
+    with pytest.raises(DraftViolation) as excinfo:
+        await ScriptGenerator(reference_project, generator=generator).generate(episode=1)
+
+    assert excinfo.value.code == "quarantined"
+    assert generator.generate.await_count == 1
+    assert _script_path(reference_project).read_bytes() == formal_before
     envelope = _json.loads(_prompt_authoring_quarantine(reference_project).read_text(encoding="utf-8"))
-    assert envelope["kind"] == QUARANTINE_KIND_PROMPT_AUTHORING
+    assert envelope["content"]["units"] == [{"text": SCRIPT_PLAN_UNIT["text"]}]
+    assert envelope["violations"][0]["code"] == "prompt_authoring_response_invalid"
     assert envelope["meta"]["base_fingerprint"] == baseline
     assert envelope["meta"]["unit_ids"] == ["E1U01"]
-    assert [v["code"] for v in envelope["violations"]] == ["unregistered_asset"]
-    # 草稿装的是扁平草稿结构（Agent 要改的是其中的正文）
-    assert envelope["content"]["units"][0]["text"] == BAD_PROMPT_AUTHORING_UNIT_TEXT
+    diagnostic = envelope["meta"]["response_diagnostic"]
+    assert diagnostic["kind"] == "invalid_json_or_schema"
+    assert diagnostic["response_chars"] > 0
+    assert len(diagnostic["response_sha256"]) == 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same", [True, False])
+async def test_backend_duplicate_text_is_recovered_or_preserved(reference_project: Path, same: bool):
+    from lib.infra.text_utils import DuplicateJSONKeyError, strict_json_loads
+
+    _write_formal_units(reference_project, [SCRIPT_PLAN_UNIT])
+    before = _script_path(reference_project).read_bytes()
+    first = PROMPT_AUTHORING_UNIT_TEXT
+    second = first if same else "不同的正文"
+    response = '{"title":"第1集","units":[{"text":' + _json.dumps(first, ensure_ascii=False) + ',"text":' + _json.dumps(second, ensure_ascii=False) + '}]}'
+    try:
+        strict_json_loads(response)
+    except DuplicateJSONKeyError as error:
+        duplicate_error = error
+    generator = _fake_prompt_authoring_generator()
+    generator.generate.side_effect = duplicate_error
+    script_generator = ScriptGenerator(reference_project, generator=generator)
+
+    if same:
+        await script_generator.generate(episode=1)
+        assert _formal_units(reference_project)["E1U01"]["text"] == first
+    else:
+        with pytest.raises(DraftViolation) as excinfo:
+            await script_generator.generate(episode=1)
+        assert excinfo.value.code == "quarantined"
+        assert _script_path(reference_project).read_bytes() == before
+        envelope = _json.loads(_prompt_authoring_quarantine(reference_project).read_text(encoding="utf-8"))
+        assert envelope["meta"]["response_diagnostic"]["raw_response"] == response
+        assert envelope["meta"]["unit_ids"] == ["E1U01"]
+    assert generator.generate.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -1220,6 +1449,10 @@ async def test_prompt_authoring_generation_preserves_draft_edited_during_model_c
     release = asyncio.Event()
     generator = MagicMock()
     generator.model = "mock"
+    generator.backend.name = "mock-backend"
+    generator.configuration_fingerprint = "mock-configuration"
+    generator.max_output_tokens = 64000
+    generator.provider_id = "mock"
 
     async def generate(_request, **_kwargs):
         started.set()
@@ -1253,6 +1486,10 @@ async def test_successful_prompt_authoring_generation_rejects_draft_created_duri
     release = asyncio.Event()
     generator = MagicMock()
     generator.model = "mock"
+    generator.backend.name = "mock-backend"
+    generator.configuration_fingerprint = "mock-configuration"
+    generator.max_output_tokens = 64000
+    generator.provider_id = "mock"
 
     async def generate(_request, **_kwargs):
         started.set()
@@ -1320,6 +1557,10 @@ async def test_prompt_authoring_preserves_output_when_formal_script_changes_duri
         concurrent["video_units"][1]["generation_prompt"] = "并发修改邻组末态"
     generator = MagicMock()
     generator.model = "mock"
+    generator.backend.name = "mock-backend"
+    generator.configuration_fingerprint = "mock-configuration"
+    generator.max_output_tokens = 64000
+    generator.provider_id = "mock"
 
     async def generate(_request, **_kwargs):
         # 并发写方不在生成所在的事件循环上，改写放进工作线程。
@@ -1347,6 +1588,10 @@ async def test_prompt_authoring_violation_keeps_generation_start_formal_baseline
     concurrent["title"] = "并发正式标题"
     generator = MagicMock()
     generator.model = "mock"
+    generator.backend.name = "mock-backend"
+    generator.configuration_fingerprint = "mock-configuration"
+    generator.max_output_tokens = 64000
+    generator.provider_id = "mock"
 
     async def generate(_request, **_kwargs):
         # 并发写方不在生成所在的事件循环上，改写放进工作线程。
@@ -1769,3 +2014,444 @@ async def test_drama_authoring_enforces_timeline_and_preserves_non_targets(tmp_p
         )
     assert "timeline_missing" in str(rejected.value)
     assert _formal_units(project_dir)["E1U01"]["text"] == text
+
+
+@pytest.mark.asyncio
+async def test_drama_authoring_recovers_bare_n_timeline_separators(tmp_path: Path):
+    project_dir = _write_reference_project(tmp_path, video_backend="vidu/vidu2.0", content_mode="drama")
+    _write_formal_units(project_dir, [SCRIPT_PLAN_UNIT])
+    text = "【本组设定】n总时长：4 秒。Tonight 保持原样。【分段时间轴】n【0-4s】n中景，@[主角]推开@[酒馆]的门。"
+
+    out = await ScriptGenerator(project_dir, generator=_fake_prompt_authoring_generator(text)).generate(episode=1)
+
+    saved = _json.loads(out.read_text(encoding="utf-8"))["video_units"][0]
+    assert saved["prompt_format_version"] == "timeline_v1"
+    assert "【分段时间轴】\n【0-4s】\n中景" in saved["text"]
+    assert "Tonight 保持原样" in saved["text"]
+
+
+@pytest.mark.parametrize("change", [None, "instructions", "formal", "provider", "model", "output_limit", "endpoint"])
+async def test_prompt_batches_resume_only_validated_unchanged_inputs(reference_project, db_factory, change):
+    """真实 SDK + 账本：后批超时不写正式剧本，显式重试只复用同依据的合法前批。"""
+    import httpx
+    from openai import APITimeoutError
+
+    from lib.backends.providers import CallPurpose
+    from lib.backends.text_backends.openai import OpenAITextBackend
+    from lib.backends.text_generator import TextGenerator
+    from lib.billing.ledger import Ledger
+    from tests.http_capture import capture_http, request_json
+    from tests.unit.lib.backends.text_backends.test_openai_long_thinking import _sse
+
+    units = [
+        {"unit_id": f"E1U0{i}", "text": f"@[主角] 在 @[酒馆] 中完成动作{i}", "duration_seconds": 4} for i in range(1, 5)
+    ]
+    manual = {
+        "unit_id": "E1U05",
+        "text": "人工确定的结尾：@[主角] 在 @[酒馆] 停下",
+        "duration_seconds": 4,
+        "pending_authoring": False,
+    }
+    _write_formal_units(reference_project, [*units, manual])
+    baseline = _script_path(reference_project).read_bytes()
+    texts = [f"中景平视，@[主角] 在 @[酒馆] 完成动作{i}，保留衔接细节。" for i in range(1, 5)]
+
+    def response(*selected):
+        return _sse(
+            [
+                {
+                    "id": "c1",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "any-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": _prompt_authoring_response(*selected)},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ]
+        )
+
+    backend = OpenAITextBackend(api_key="test", model="any-model", base_url="https://relay.test/v1")
+
+    def generator(provider="openai", *, output_limit=None):
+        return TextGenerator(
+            backend,
+            Ledger(session_factory=db_factory),
+            provider,
+            purpose=CallPurpose.SCRIPT_GENERATION,
+            registered_max_output_tokens=output_limit,
+        )
+
+    try:
+        preview = await ScriptGenerator(reference_project).build_prompt(episode=1)
+        with capture_http() as router:
+            route = router.post("https://relay.test/v1/chat/completions").mock(
+                side_effect=[response(*texts[:3]), httpx.ReadTimeout("upstream timeout")]
+            )
+            with pytest.raises(APITimeoutError):
+                await ScriptGenerator(reference_project, generator=generator()).generate(episode=1)
+            assert route.call_count == 2
+            assert request_json(route.calls[0].request)["messages"][0]["content"].startswith(preview)
+            assert _script_path(reference_project).read_bytes() == baseline
+            saved = _json.loads((reference_project / "drafts/episode_1/prompt_authoring_progress.json").read_text())
+            assert len(saved["batches"]) == 1
+            second_prompt = request_json(route.calls[1].request)["messages"][0]["content"]
+            assert all(text in second_prompt for text in texts[:3])
+            assert manual["text"] in second_prompt
+            assert units[3]["text"] in second_prompt
+
+        if change == "formal":
+            units[0]["text"] += "，新增输入细节"
+            _write_formal_units(reference_project, [*units, manual])
+        kwargs = {"instructions": "保留动作细节"} if change == "instructions" else {}
+        provider = "custom-9" if change == "provider" else "openai"
+        if change == "model":
+            await backend._client.close()
+            backend = OpenAITextBackend(api_key="test", model="another-model", base_url="https://relay.test/v1")
+        if change == "endpoint":
+            await backend._client.close()
+            backend = OpenAITextBackend(api_key="test", model="any-model", base_url="https://second-relay.test/v1")
+        output_limit = 4096 if change == "output_limit" else None
+        with capture_http() as router:
+            replies = [response(texts[3])] if change is None else [response(*texts[:3]), response(texts[3])]
+            endpoint = "https://second-relay.test" if change == "endpoint" else "https://relay.test"
+            route = router.post(endpoint + "/v1/chat/completions").mock(side_effect=replies)
+            await ScriptGenerator(reference_project, generator=generator(provider, output_limit=output_limit)).generate(
+                episode=1, **kwargs
+            )
+            assert route.call_count == (1 if change is None else 2)
+        formal = _formal_units(reference_project)
+        assert [formal[unit["unit_id"]]["text"] for unit in units] == texts
+        assert formal["E1U05"]["text"] == manual["text"]
+        assert all(not formal[unit["unit_id"]].get("pending_authoring", False) for unit in units)
+    finally:
+        await backend._client.close()
+
+
+async def test_prompt_batch_stops_before_next_call_if_formal_changes(reference_project, db_factory):
+    import httpx
+
+    from lib.backends.providers import CallPurpose
+    from lib.backends.text_backends.openai import OpenAITextBackend
+    from lib.backends.text_generator import TextGenerator
+    from lib.billing.ledger import Ledger
+    from tests.http_capture import capture_http
+    from tests.unit.lib.backends.text_backends.test_openai_long_thinking import _sse
+
+    units = [{"unit_id": f"E1U0{i}", "text": f"@[主角] 在 @[酒馆] 动作{i}", "duration_seconds": 4} for i in range(1, 5)]
+    _write_formal_units(reference_project, units)
+    backend = OpenAITextBackend(api_key="test", model="any-model", base_url="https://relay.test/v1")
+    generator = TextGenerator(
+        backend, Ledger(session_factory=db_factory), "openai", purpose=CallPurpose.SCRIPT_GENERATION
+    )
+    changed = None
+
+    async def reply(_request: httpx.Request):
+        nonlocal changed
+        units[3]["text"] += "，人工修订"
+        await asyncio.to_thread(_write_formal_units, reference_project, units)
+        changed = await asyncio.to_thread(_script_path(reference_project).read_bytes)
+        return _sse(
+            [
+                {
+                    "id": "c1",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "any-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": _prompt_authoring_response(*[f"镜头：{unit['text']}" for unit in units[:3]]),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ]
+        )
+
+    try:
+        with capture_http() as router:
+            route = router.post("https://relay.test/v1/chat/completions").mock(side_effect=reply)
+            with pytest.raises(ScriptWriteConflict):
+                await ScriptGenerator(reference_project, generator=generator).generate(episode=1)
+            assert route.call_count == 1
+        assert _script_path(reference_project).read_bytes() == changed
+        saved = _json.loads((reference_project / "drafts/episode_1/prompt_authoring_progress.json").read_text())
+        assert len(saved["batches"]) == 1
+    finally:
+        await backend._client.close()
+
+
+@pytest.mark.parametrize("bad", [None, "dialogue", "timeline", "reference"])
+async def test_packed_authoring_documents_keep_content_guards(tmp_path: Path, bad):
+    project = _write_reference_project(tmp_path, video_backend="vidu/vidu2.0", content_mode="drama")
+    units = [{"unit_id": f"E1U0{i}", "text": "@[主角] 在 @[酒馆] 等待。@[主角]{好。}", "duration_seconds": 4} for i in range(1, 4)]
+    _write_formal_units(project, units)
+    original = _script_path(project).read_bytes()
+    texts = [
+        "【本组设定】\n叙事关系：" + ("首组。" if i == 0 else "连续。") + "\n@[酒馆]。\n【开场承接】\n" + ("<主角> 位于画面左侧。" if i == 0 else "（由系统填入上一组尾态）") + "\n【分段时间轴】\n【0-4s】\n@[主角] 等待，说：@[主角]{好。}\n【组尾交接】\n<主角> 位于画面左侧。\n【必要限制】\n无。"
+        for i in range(3)
+    ]
+    if bad == "dialogue":
+        texts[1] = texts[1].replace("{好。}", "{不好。}")
+    elif bad == "timeline":
+        texts[1] = texts[1].replace("【0-4s】", "【0-9s】")
+    elif bad == "reference":
+        texts[1] = texts[1].replace("@[酒馆]", "@[不存在的场景]")
+    fake = _fake_prompt_authoring_generator("\n".join(texts))
+    generator = ScriptGenerator(project, generator=fake)
+    if bad:
+        with pytest.raises(DraftViolation) as exc:
+            await generator.generate(episode=1, prompt_policy_version="drama_detail_v1")
+        assert exc.value.code == "quarantined"
+        assert _script_path(project).read_bytes() == original
+        draft = _json.loads(_prompt_authoring_quarantine(project).read_text())
+        assert [u["text"] for u in draft["content"]["units"]] == [
+            text.replace("（由系统填入上一组尾态）", "<主角> 位于画面左侧。") for text in texts
+        ]
+        assert draft["meta"]["response_diagnostic"]["raw_response"] == _prompt_authoring_response("\n".join(texts))
+        assert all(v["code"] != "unit_count_changed" for v in draft["violations"])
+    else:
+        out = await generator.generate(episode=1, prompt_policy_version="drama_detail_v1")
+        saved = _json.loads(out.read_text())["video_units"]
+        assert len(saved) == 3
+        assert all(not u.get("pending_authoring") for u in saved)
+        assert "（由系统填入上一组尾态）" not in saved[1]["text"]
+    assert fake.generate.await_count == 1
+    request = fake.generate.call_args.args[0]
+    assert "本批必须返回 **3 个独立数组元素**" in request.prompt
+    assert '"text": "输出序号 3 的完整正文"' in request.prompt
+
+
+async def test_later_batch_repair_preserves_completed_batches_without_reauthoring(reference_project):
+    units = [{**SCRIPT_PLAN_UNIT, "unit_id": f"E1U0{i}"} for i in range(1, 5)]
+    _write_formal_units(reference_project, units)
+    original = _script_path(reference_project).read_bytes()
+    good = [PROMPT_AUTHORING_UNIT_TEXT + f"停顿{i}。" for i in range(4)]
+    fake = _fake_prompt_authoring_generator()
+    fake.generate.side_effect = [
+        MagicMock(text=_prompt_authoring_response(*good[:3])),
+        MagicMock(text=_prompt_authoring_response("@[不存在的角色] 走进 @[酒馆]。")),
+    ]
+    g = ScriptGenerator(reference_project, generator=fake)
+    with pytest.raises(DraftViolation):
+        await g.generate(episode=1)
+    assert _script_path(reference_project).read_bytes() == original
+    envelope = _json.loads(_prompt_authoring_quarantine(reference_project).read_text())
+    assert envelope["meta"]["unit_ids"] == [u["unit_id"] for u in units]
+    assert [u["text"] for u in envelope["content"]["units"][:3]] == good[:3]
+    assert envelope["violations"][0]["item_id"] == "E1U04"
+    assert envelope["violations"][0]["item_index"] == 3
+    envelope["content"]["units"][3]["text"] = good[3]
+    write_quarantine(reference_project, 1, QUARANTINE_KIND_PROMPT_AUTHORING,
+                     content=envelope["content"], violations=[], meta=envelope["meta"])
+    await g.promote_reference_prompt_authoring_draft(episode=1)
+    saved = _formal_units(reference_project)
+    assert [u["text"] for u in saved.values()] == good
+    assert all(not u.get("pending_authoring") for u in saved.values())
+    assert fake.generate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_candidate_quarantine_keeps_automatic_fixes_and_matching_report(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv('ARCREEL_PROMPT_CONTENT_VALIDATION', 'false')
+    project = _write_reference_project(tmp_path, video_backend='vidu/vidu2.0', content_mode='drama')
+    units = [{'unit_id': f'E1U0{i}', 'text': '@[主角] 在 @[酒馆] 等待。', 'duration_seconds': 4} for i in (1, 2)]
+    _write_formal_units(project, units)
+    original = _script_path(project).read_bytes()
+    texts = ['@[主角> 在 @[酒馆] 等待。', '@[未知> 在 @[酒馆] 等待。']
+    model = _fake_prompt_authoring_generator(*texts)
+    with pytest.raises(DraftViolation):
+        await ScriptGenerator(project, generator=model).generate(episode=1, prompt_policy_version='drama_detail_v1')
+    draft = _json.loads(_prompt_authoring_quarantine(project).read_text())
+    assert draft['content']['units'][0]['text'] == '@[主角] 在 @[酒馆] 等待。'
+    assert draft['content']['units'][1]['text'] == texts[1]
+    assert {v['item_index'] for v in draft['violations']} == {1}
+    assert draft['meta']['response_diagnostic']['raw_response'] == _prompt_authoring_response(*texts)
+    assert _script_path(project).read_bytes() == original
+    assert model.generate.await_count == 1
+    request = model.generate.await_args.args[0]
+    assert request.preserve_raw_response
+    assert request.response_schema.model_json_schema()['properties']['units']['maxItems'] == 2
+
+
+@pytest.mark.asyncio
+async def test_duplicate_text_documents_recover_once_and_commit_all_units(tmp_path: Path, monkeypatch):
+    def document(action):
+        return f"【本组设定】\n场景。\n【开场承接】\n人在左。\n【分段时间轴】\n【0-4s】\n{action}\n【组尾交接】\n人在右。\n【必要限制】\n无。"
+
+    monkeypatch.setenv('ARCREEL_PROMPT_CONTENT_VALIDATION', 'false')
+    project = _write_reference_project(tmp_path, video_backend='vidu/vidu2.0', content_mode='drama')
+    units = [{'unit_id': f'E1U0{i}', 'text': f'@[主角] 在 @[酒馆] 等待。@[主角]{{第{i}句。}}', 'duration_seconds': 4} for i in (1, 2, 3)]
+    _write_formal_units(project, units)
+    texts = [document(u['text']) for u in units]
+    raw = '{"title":"t","units":[{' + ','.join('"text":' + _json.dumps(t) for t in texts) + '}]}'
+    model = _fake_prompt_authoring_generator()
+    model.generate.return_value.text = raw
+    await ScriptGenerator(project, generator=model).generate(episode=1, prompt_policy_version='drama_detail_v1')
+    assert [u['text'] for u in _formal_units(project).values()] == texts
+    assert model.generate.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('raw', [
+    '{"title":"t","units":[{"text":"RAW_FAILED_BATCH"}',
+    '{"title":"t","units":[{"text":"RAW_FAILED_BATCH"}]}',
+])
+async def test_structural_repair_receives_raw_failed_batch_and_freezes_completed_prefix(tmp_path: Path, monkeypatch, raw):
+    from lib.script.draft_quarantine import QUARANTINE_KIND_PROMPT_AUTHORING, draft_revision, read_quarantine
+    from server.draft_repair import DraftRepair
+    from server.draft_workflow import DraftContext
+    from tests.fakes import FakeTextGenerator, use_text_generator
+
+    monkeypatch.setenv('ARCREEL_PROMPT_CONTENT_VALIDATION', 'false')
+    project = _write_reference_project(tmp_path, video_backend='vidu/vidu2.0', content_mode='drama')
+    units = [{'unit_id': f'E1U0{i}', 'text': '@[主角] 在 @[酒馆] 等待。', 'duration_seconds': 4} for i in range(1, 7)]
+    _write_formal_units(project, units)
+    texts = [f'@[主角] 在 @[酒馆] 第{i}段站定。' for i in range(1, 7)]
+    model = _fake_prompt_authoring_generator()
+    model.generate.side_effect = [MagicMock(text=_prompt_authoring_response(*texts[:3])), MagicMock(text=raw)]
+    with pytest.raises(DraftViolation):
+        await ScriptGenerator(project, generator=model).generate(episode=1, prompt_policy_version='drama_detail_v1')
+    draft = read_quarantine(project, 1, QUARANTINE_KIND_PROMPT_AUTHORING)
+    assert draft.meta['response_diagnostic']['failed_unit_ids'] == ['E1U04', 'E1U05', 'E1U06']
+    repair_model = FakeTextGenerator(_json.dumps({'units': [{'text': t} for t in texts[3:]]}))
+    use_text_generator(monkeypatch, repair_model.create)
+    pm = ProjectManager.for_project_dir(project)
+    repair = DraftRepair(DraftContext(project_name=project.name, data_root=pm.data_root, pm=pm))
+    result = await repair.repair(1, 'reference_prompt_authoring', draft_revision(draft))
+    assert result['adopted'] is True
+    request, = repair_model.requests
+    assert raw in request.prompt
+    assert '## `units[3]`' in request.prompt
+    assert '## `units[0]`' not in request.prompt
+    assert request.preserve_raw_response
+    assert request.response_schema.model_json_schema()['properties']['units']['maxItems'] == 3
+    assert [u['text'] for u in _formal_units(project).values()] == texts
+
+
+@pytest.mark.asyncio
+async def test_legacy_duplicate_batch_repairs_locally_without_touching_successful_prefix(tmp_path, monkeypatch):
+    from lib.script.draft_quarantine import draft_revision, read_quarantine
+    from server.draft_repair import DraftRepair
+    from server.draft_workflow import DraftContext
+    from tests.fakes import FakeTextGenerator, use_text_generator
+
+    monkeypatch.setenv('ARCREEL_PROMPT_CONTENT_VALIDATION', 'false')
+    project = _write_reference_project(tmp_path, video_backend='vidu/vidu2.0', content_mode='drama')
+    units = [{'unit_id': f'E1U0{i}', 'text': f'@[主角] 在 @[酒馆] 等待。@[主角]{{第{i}句。}}',
+              'duration_seconds': 4} for i in range(1, 7)]
+    _write_formal_units(project, units)
+    texts = [f'【本组设定】\n@[酒馆]。\n【开场承接】\n人在左。\n【分段时间轴】\n【0-4s】\n{u["text"]}\n【组尾交接】\n人在右。\n【必要限制】\n无。' for u in units]
+    model = _fake_prompt_authoring_generator()
+    model.generate.side_effect = [MagicMock(text=_prompt_authoring_response(*texts[:3])), MagicMock(text='{')]
+    with pytest.raises(DraftViolation):
+        await ScriptGenerator(project, generator=model).generate(episode=1, prompt_policy_version='drama_detail_v1')
+    draft = read_quarantine(project, 1, QUARANTINE_KIND_PROMPT_AUTHORING)
+    # Legacy envelopes contain the complete raw response and a source fallback.
+    draft.meta['response_diagnostic'] = {'raw_response': '{"title":"t","units":[{' +
+        ','.join('"text":' + _json.dumps(t) for t in texts[3:]) + '}]}' }
+    envelope = _json.loads(_prompt_authoring_quarantine(project).read_text())
+    envelope['meta'] = draft.meta
+    _prompt_authoring_quarantine(project).write_text(_json.dumps(envelope))
+    draft = read_quarantine(project, 1, draft.kind)
+    repair_model = FakeTextGenerator('must not be called')
+    use_text_generator(monkeypatch, repair_model.create)
+    pm = ProjectManager.for_project_dir(project)
+    result = await DraftRepair(DraftContext(project_name=project.name, data_root=pm.data_root, pm=pm)).repair(
+        1, 'reference_prompt_authoring', draft_revision(draft),
+    )
+    assert result['adopted'] is True
+    assert [u['text'] for u in _formal_units(project).values()] == texts
+    assert repair_model.requests == []
+
+
+@pytest.mark.asyncio
+async def test_reference_repair_rechecks_current_errors_and_fixes_known_syntax_without_ai(tmp_path, monkeypatch):
+    from lib.script.draft_quarantine import draft_revision, read_quarantine
+    from server.draft_repair import DraftRepair
+    from server.draft_workflow import DraftContext
+    from tests.fakes import FakeTextGenerator, use_text_generator
+
+    monkeypatch.setenv('ARCREEL_PROMPT_CONTENT_VALIDATION', 'false')
+    project = _write_reference_project(tmp_path, video_backend='vidu/vidu2.0', content_mode='drama')
+    units = [{**SCRIPT_PLAN_UNIT, 'unit_id': f'E1U0{i}'} for i in (1, 2)]
+    _write_formal_units(project, units)
+    manual = '@[主角] 在 @[酒馆] 等待。人工镜头保留。'
+    with pytest.raises(DraftViolation):
+        await ScriptGenerator(project, generator=_fake_prompt_authoring_generator(manual, '@[未知]')).generate(
+            episode=1, prompt_policy_version='drama_detail_v1',
+        )
+    draft = read_quarantine(project, 1, QUARANTINE_KIND_PROMPT_AUTHORING)
+    draft.content['units'][1]['text'] = '@[主角> 在 @[酒馆] 等待。'
+    # Stale reports must not drive an unnecessary model call or a neighbor rewrite.
+    envelope = _json.loads(_prompt_authoring_quarantine(project).read_text())
+    envelope['content'] = draft.content
+    envelope['violations'][0]['item_index'] = 0
+    _prompt_authoring_quarantine(project).write_text(_json.dumps(envelope))
+    draft = read_quarantine(project, 1, draft.kind)
+    repair_model = FakeTextGenerator('must not be called')
+    use_text_generator(monkeypatch, repair_model.create)
+    pm = ProjectManager.for_project_dir(project)
+    result = await DraftRepair(DraftContext(project_name=project.name, data_root=pm.data_root, pm=pm)).repair(
+        1, 'reference_prompt_authoring', draft_revision(draft),
+    )
+    assert result['adopted'] is True
+    assert [u['text'] for u in _formal_units(project).values()] == [manual, '@[主角] 在 @[酒馆] 等待。']
+    assert repair_model.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('with_derivatives', [False, True])
+async def test_reference_repair_receives_registered_catalog_and_freezes_valid_neighbor(tmp_path, monkeypatch, with_derivatives):
+    from lib.script.draft_quarantine import draft_revision, read_quarantine
+    from server.draft_repair import DraftRepair
+    from server.draft_workflow import DraftContext
+    from tests.fakes import FakeTextGenerator
+
+    monkeypatch.setenv('ARCREEL_PROMPT_CONTENT_VALIDATION', 'false')
+    project = _write_reference_project(tmp_path, video_backend='vidu/vidu2.0', content_mode='drama')
+    pm = ProjectManager.for_project_dir(project)
+    if with_derivatives:
+        pm.update_project(project.name, lambda p: p['characters']['主角'].update(derivatives={
+            '白衣': {'description': '白衣形态'},
+            '视角-背面全身': {'description': '背面参考'},
+        }))
+    identity = '主角/白衣' if with_derivatives else '主角'
+    source = f'@[{identity}] 在 @[酒馆] 等待。'
+    _write_formal_units(project, [{**SCRIPT_PLAN_UNIT, 'unit_id': f'E1U0{i}', 'text': source} for i in (1, 2, 3)])
+    valid = source + '已完成的人工镜头。'
+    invalid = ['@[主角/视角-正面特写] 在 @[酒馆] 等待。', '@[主角/视角-侧面全身] 在 @[酒馆] 等待。']
+    with pytest.raises(DraftViolation):
+        await ScriptGenerator(project, generator=_fake_prompt_authoring_generator(*invalid, valid)).generate(
+            episode=1, prompt_policy_version='drama_detail_v1',
+        )
+    draft = read_quarantine(project, 1, QUARANTINE_KIND_PROMPT_AUTHORING)
+    assert {v['item_index'] for v in draft.violations} == {0, 1}
+    repaired = [source + '正面近景。', source + '侧面中景。']
+    model = FakeTextGenerator(_json.dumps({'units': [{'text': t} for t in repaired]}))
+    use_text_generator(monkeypatch, model.create)
+
+    result = await DraftRepair(DraftContext(project_name=project.name, data_root=pm.data_root, pm=pm)).repair(
+        1, 'reference_prompt_authoring', draft_revision(draft),
+    )
+
+    assert result['adopted'] is True
+    request, = model.requests
+    catalog = _json.loads(request.prompt.split('<registered_asset_names>\n')[1].split('\n</registered_asset_names>')[0])
+    assert catalog == {
+        'character': ['主角', '主角/白衣', '主角/视角-背面全身'] if with_derivatives else ['主角'],
+        'scene': ['酒馆'], 'prop': [],
+    }
+    assert '## `units[0]`' in request.prompt
+    assert '## `units[1]`' in request.prompt
+    assert '## `units[2]`' not in request.prompt
+    assert request.response_schema.model_json_schema()['properties']['units']['maxItems'] == 2
+    assert [u['text'] for u in _formal_units(project).values()] == [*repaired, valid]

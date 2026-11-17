@@ -6,7 +6,9 @@ import type { TaskItem, ScriptReviewState } from "@/types";
 export function BreakdownStatus({ task, busy, review }: { task?: TaskItem; busy: boolean; review: ScriptReviewState | null }) {
   const { t } = useTranslation("dashboard");
   const failed = task?.status === "failed" || task?.status === "cancelled";
-  const ready = !busy && Boolean(review?.content);
+  const ready = !busy && Boolean(review?.content) && !review?.quarantine;
+  const violations = review?.quarantine?.violations ?? [];
+  const phase = review?.repair_progress?.task_id === task?.task_id ? review?.repair_progress?.phase : null;
   const received = busy || Boolean(task) || ready;
   const running = task?.status === "running";
   const content = ready && review?.content && "units" in review.content ? review.content : null;
@@ -20,7 +22,7 @@ export function BreakdownStatus({ task, busy, review }: { task?: TaskItem; busy:
     <div className="flex flex-wrap items-center justify-between gap-3">
       <div role="status" className="flex items-center gap-2 font-medium">
         {busy ? <Loader2 aria-hidden className="size-5 animate-spin text-primary" /> : failed && !ready ? <CircleAlert aria-hidden className="size-5 text-destructive" /> : ready ? <CheckCircle2 aria-hidden className="size-5 text-primary" /> : <Circle aria-hidden className="size-5 text-muted-foreground" />}
-        {t(title)}
+        {busy && phase === "repairing" ? t("production_repair_running") : busy && (phase === "validating" || phase === "revalidating" || phase === "committing") ? t("production_repair_validating") : t(title)}
       </div>
       {task && <span className="flex items-center gap-2 text-sm text-muted-foreground"><span>{t(busy ? running ? "production_breakdown_elapsed" : "production_breakdown_waited" : "production_breakdown_duration")}</span><TaskElapsedReadout task={task} /></span>}
     </div>
@@ -30,6 +32,9 @@ export function BreakdownStatus({ task, busy, review }: { task?: TaskItem; busy:
     </li>)}</ol>
     <p className="text-sm text-muted-foreground">{t(busy ? "production_breakdown_wait_hint" : ready ? "production_breakdown_ready_hint" : failed ? "production_breakdown_retry_hint" : "production_breakdown_empty_hint")}</p>
     {content && <p className="text-sm">{t("production_breakdown_summary", { units: content.units.length, characters: content.new_assets?.filter((asset) => asset.type === "character").length ?? 0, scenes: content.new_assets?.filter((asset) => asset.type === "scene").length ?? 0, props: content.new_assets?.filter((asset) => asset.type === "prop").length ?? 0 })}</p>}
-    {failed && !ready && task?.error_message && <p role="alert" className="whitespace-pre-wrap wrap-break-word text-sm text-destructive">{task.error_message}</p>}
+    {!busy && violations.length > 0 && <div role="alert" className="flex flex-col gap-2 text-sm text-destructive"><p>{t("production_repair_problem_count", { count: violations.length })}</p><ul className="list-disc pl-5">{violations.map((issue, index) => <li key={`${issue.code}-${index}`}>{issue.message}</li>)}</ul></div>}
+    {failed && !ready && task?.error_message && (violations.length === 0
+      ? <p role="alert" className="whitespace-pre-wrap wrap-break-word text-sm text-destructive">{task.error_message}</p>
+      : <details className="text-sm"><summary className="cursor-pointer text-muted-foreground">{t("production_repair_details")}</summary><p className="mt-2 whitespace-pre-wrap wrap-break-word text-destructive">{task.error_message}</p></details>)}
   </section>;
 }

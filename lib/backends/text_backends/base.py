@@ -269,6 +269,12 @@ class TextGenerationRequest:
     max_output_tokens: int | None = None
     # 长正文可优先流式接收；结果仍须完整聚合并校验后才返回。
     prefer_stream: bool = False
+    # A caller with durable draft recovery receives the original candidate once;
+    # format/content errors must not trigger another paid compatibility attempt.
+    preserve_raw_response: bool = False
+    # Explicit, scoped opt-in for a verified native schema endpoint. Default keeps
+    # existing provider compatibility behavior, including MiniMax prompt mode.
+    prefer_native_schema: bool = False
 
 
 @dataclass
@@ -564,6 +570,10 @@ async def prompt_json_fallback(
         fb_request = replace(request, prompt=base_prompt + feedback, response_schema=None)
         fb_result = await generate_once(fb_request)
         merge_billed_usage(billed, fb_result)
+
+        if request.preserve_raw_response:
+            billed.text = fb_result.text
+            return billed
 
         text = strip_json_code_fences(fb_result.text)
         normalized, last_reason = _validate_fallback_text(text, schema_model)

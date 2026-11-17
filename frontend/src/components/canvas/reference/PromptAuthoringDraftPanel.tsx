@@ -43,7 +43,7 @@ function narrowPromptAuthoringDraft(content: Record<string, unknown> | null): Pr
  * 本集的提示词编写草稿：随 `draft:episode_N_prompt_authoring` 事件（Agent 写入、采用、丢弃）重新拉取。
  * 无草稿时为 null。
  */
-export function usePromptAuthoringDraft(projectName: string, episode: number) {
+export function usePromptAuthoringDraft(projectName: string, episode: number, taskRevision?: string) {
   const draftRevision = useAppStore((s) => s.getEntityRevision(`draft:episode_${episode}_prompt_authoring`));
   // 按所属项目与集号记下视图：切换后新一轮拉取回来前，不把上一集的草稿当作本集的呈现。
   const [loaded, setLoaded] = useState<{ key: string; view: EpisodeDraftView | null } | null>(null);
@@ -63,7 +63,7 @@ export function usePromptAuthoringDraft(projectName: string, episode: number) {
     // 拉取失败保留现有视图：草稿面板是附加呈现，不因一次刷新失败把单元工作台换掉。
     load().catch(() => undefined);
     return () => controller.abort();
-  }, [projectName, episode, scopeKey, draftRevision, reloadNonce]);
+  }, [projectName, episode, scopeKey, draftRevision, reloadNonce, taskRevision]);
 
   const refresh = useCallback(() => setReloadNonce((n) => n + 1), []);
   return { view: loaded?.key === scopeKey ? loaded.view : null, refresh };
@@ -74,13 +74,14 @@ interface PromptAuthoringDraftPanelProps {
   episode: number;
   view: EpisodeDraftView;
   onSettled: () => void;
+  allowAgentActions?: boolean;
 }
 
 /**
  * 提示词编写草稿在视频单元页的呈现。待修复草稿：违约挂到所在单元、整集层面的违约置顶，逐单元正文
  * 可就地修改后保存并校验，违约清零即写回正式剧本。Agent 的可编辑草稿：只提示有一份未完成的修改。
  */
-export function PromptAuthoringDraftPanel({ projectName, episode, view, onSettled }: PromptAuthoringDraftPanelProps) {
+export function PromptAuthoringDraftPanel({ projectName, episode, view, onSettled, allowAgentActions = true }: PromptAuthoringDraftPanelProps) {
   const { t } = useTranslation("dashboard");
   const episodeLedger = useEpisodeLedger();
   const scripts = useProjectsStore((s) => s.currentScripts);
@@ -117,7 +118,7 @@ export function PromptAuthoringDraftPanel({ projectName, episode, view, onSettle
       <>
         <AgentDraftBar
           busy={busy}
-          onFinish={() => prefillAssistant(t("draft_agent_finish_prefill", { episodeRef, docType: DOC_TYPE }))}
+          onFinish={allowAgentActions ? () => prefillAssistant(t("draft_agent_finish_prefill", { episodeRef, docType: DOC_TYPE })) : undefined}
           onDiscard={() => setDiscardOpen(true)}
         />
         {discardDialog}
@@ -159,7 +160,7 @@ export function PromptAuthoringDraftPanel({ projectName, episode, view, onSettle
         outdated={editor.outdated}
         onSave={voidPromise(editor.save)}
         onReloadLatest={editor.reloadLatest}
-        onHandToAgent={() => prefillAssistant(draftFixRequestText(t, episodeRef, DOC_TYPE, view.violations))}
+        onHandToAgent={allowAgentActions ? () => prefillAssistant(draftFixRequestText(t, episodeRef, DOC_TYPE, view.violations)) : undefined}
         onDiscard={() => setDiscardOpen(true)}
       />
       {discardDialog}

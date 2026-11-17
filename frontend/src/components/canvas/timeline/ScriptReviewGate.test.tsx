@@ -162,7 +162,7 @@ describe("ScriptReviewGate", () => {
 
     fireEvent.click(screen.getByText("确认并继续"));
 
-    await waitFor(() => expect(confirm).toHaveBeenCalledWith("p", 1, {}));
+    await waitFor(() => expect(confirm).toHaveBeenCalledWith("p", 1, { planFingerprint: "fp1" }));
     await waitFor(() =>
       expect(screen.getByText("内容已确认，此处只读。请在时间线上修改；要整集重做，请重跑脚本规划后再确认。")).toBeInTheDocument(),
     );
@@ -199,7 +199,7 @@ describe("ScriptReviewGate", () => {
     expect(screen.queryByRole("button", { name: "去时间线修改" })).not.toBeInTheDocument();
   });
 
-  it("turns read-only when a save is refused because the episode was confirmed meanwhile", async () => {
+  it("retains local words when an external confirmation makes the editor read-only", async () => {
     vi.spyOn(API, "getScriptReview")
       .mockResolvedValueOnce(dramaState())
       .mockResolvedValue(dramaState(CONFIRMED));
@@ -212,7 +212,7 @@ describe("ScriptReviewGate", () => {
     fireEvent.click(await screen.findByText("修复后保存"));
 
     await waitFor(() => expect(screen.queryByRole("textbox")).not.toBeInTheDocument());
-    expect(screen.getByText("你终于回来了。")).toBeInTheDocument();
+    expect(screen.getByText("我的本地编辑")).toBeInTheDocument();
     expect(screen.queryByText("修复后保存")).not.toBeInTheDocument();
   });
 
@@ -245,7 +245,7 @@ describe("ScriptReviewGate", () => {
 
     fireEvent.click(button);
 
-    await waitFor(() => expect(confirm).toHaveBeenCalledWith("p", 1, {}));
+    await waitFor(() => expect(confirm).toHaveBeenCalledWith("p", 1, { planFingerprint: "fp1" }));
     expect(await screen.findByRole("button", { name: "已确认" })).toBeDisabled();
   });
 
@@ -304,7 +304,7 @@ describe("ScriptReviewGate", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "覆盖并确认" }));
 
-    await waitFor(() => expect(confirm).toHaveBeenCalledWith("p", 1, { overwriteRevision: "sha256-v1:listed" }));
+    await waitFor(() => expect(confirm).toHaveBeenCalledWith("p", 1, { overwriteRevision: "sha256-v1:listed", planFingerprint: "fp1" }));
     await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
   });
 
@@ -352,7 +352,7 @@ describe("ScriptReviewGate", () => {
     expect(screen.getByRole("alertdialog")).toHaveTextContent("现有 2 条分镜全部移除。分镜图 1 张。分镜 2（分镜图）");
 
     fireEvent.click(screen.getByRole("button", { name: "覆盖并确认" }));
-    await waitFor(() => expect(confirm).toHaveBeenLastCalledWith("p", 1, { overwriteRevision: "sha256-v1:refreshed" }));
+    await waitFor(() => expect(confirm).toHaveBeenLastCalledWith("p", 1, { overwriteRevision: "sha256-v1:refreshed", planFingerprint: "fp1" }));
     await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
   });
 
@@ -712,7 +712,7 @@ describe("ScriptReviewGate", () => {
     await waitFor(() => expect(discard).toHaveBeenCalledWith("p", 1, "narration_script_plan", "rev-1"));
   });
 
-  it("discards only the draft version on screen and loads the newer one when it changed elsewhere", async () => {
+  it("preserves local edits on a discard conflict until the user loads the newer draft", async () => {
     const newer = draftView({
       revision: "rev-2",
       content: { segments: [{ ...NARRATION_SEGMENT, novel_text: "别处更新的原文。" }] },
@@ -739,6 +739,10 @@ describe("ScriptReviewGate", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "丢弃草稿" }));
 
     await waitFor(() => expect(discard).toHaveBeenCalledWith("p", 1, "narration_script_plan", "rev-1"));
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(3));
+    expect(screen.getByDisplayValue("我的本地编辑")).toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "放弃修改并载入最新" }));
     await waitFor(() => expect(screen.getByDisplayValue("别处更新的原文。")).toBeInTheDocument());
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });

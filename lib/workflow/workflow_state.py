@@ -192,6 +192,18 @@ class WorkflowDraft(BaseModel):
     needs_repair: bool
 
 
+class WorkflowReferencedAsset(BaseModel):
+    """Canonical asset reference and image readiness for the selected episode."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset_type: str
+    name: str
+    owner: str | None = None
+    has_description: bool
+    sheet_state: Literal["current", "stale", "missing", "blocked"]
+
+
 class WorkflowContent(BaseModel):
     """内容现状：各类内容此刻是什么样，不含「该做哪一步」的判断。
 
@@ -226,6 +238,10 @@ class WorkflowContent(BaseModel):
     referenced_asset_sheets_stale: list[str] = Field(default_factory=list)
     #: 本集引用、缺描述因而不能生成资产图的资产（含衍生）。只陈述，不进建议的下一步。
     referenced_assets_without_description: list[str] = Field(default_factory=list)
+    #: 本集已登记资产明细；与批量生图共用 episode_referenced_assets 解析结果。
+    referenced_assets: list[WorkflowReferencedAsset] = Field(default_factory=list)
+    #: Counts and unused suggestions from the same plan/catalog/reference resolution.
+    asset_summary: dict[str, Any] | None = None
     episode_complete: bool = False
     project_complete: bool = False
 
@@ -1483,7 +1499,7 @@ class WorkflowStateService:
         kind: str | None,
         shared: _SharedWorkflowFacts,
         issues: list[WorkflowBlocker],
-    ) -> tuple[list[str], list[str], list[str]]:
+    ) -> tuple[list[str], list[str], list[str], list[WorkflowReferencedAsset]]:
         """本集引用的资产图现状：(待生成且可生成, 过期, 缺描述)。
 
         待生成与资产图批量的集范围同一判定：缺描述的不算；衍生的本体没有可用资产图、也不在同批时不算。
@@ -1491,6 +1507,7 @@ class WorkflowStateService:
         missing: list[str] = []
         stale: list[str] = []
         without_description: list[str] = []
+        references: list[WorkflowReferencedAsset] = []
         accepted_sheets: set[tuple[str, str]] = set()
         for asset in sorted(
             episode_referenced_assets(project, ({kind: items} if kind else None)),
@@ -1504,9 +1521,9 @@ class WorkflowStateService:
                 else owner
             )
             description = entry.get("description")
-            if not isinstance(description, str) or not description.strip():
+            has_description = isinstance(description, str) and bool(description.strip())
+            if not has_description:
                 without_description.append(asset.name)
-                continue
             path = entry.get(spec.sheet_field)
             sheet_state = (
                 self._artifact_state(
@@ -1524,8 +1541,19 @@ class WorkflowStateService:
                 if shared.currency is not None and isinstance(path, str) and path
                 else ArtifactStatus.MISSING.value
             )
+            references.append(
+                WorkflowReferencedAsset(
+                    asset_type=asset.asset_type,
+                    name=asset.name,
+                    owner=asset.owner,
+                    has_description=has_description,
+                    sheet_state=sheet_state,
+                )
+            )
             if sheet_state == ArtifactStatus.STALE.value:
                 stale.append(asset.name)
+            if not has_description:
+                continue
             if sheet_state != ArtifactStatus.MISSING.value:
                 continue
             if asset.owner is not None:
@@ -1536,7 +1564,7 @@ class WorkflowStateService:
                     continue
             missing.append(asset.name)
             accepted_sheets.add((asset.asset_type, asset.name))
-        return missing, stale, without_description
+        return missing, stale, without_description, references
 
     def _episode_status(
         self,
@@ -1647,7 +1675,12 @@ class WorkflowStateService:
             without_sheet = [name for _asset_type, name in admission.without_sheet]
             content.referenced_assets_without_sheet = without_sheet
             content.unregistered_references = list(admission.unregistered)
-            missing_sheets, content.referenced_asset_sheets_stale, content.referenced_assets_without_description = (
+            (
+                missing_sheets,
+                content.referenced_asset_sheets_stale,
+                content.referenced_assets_without_description,
+                content.referenced_assets,
+            ) = (
                 self._referenced_sheet_facts(project, items, kind, shared, issues)
             )
             artifacts["storyboards"] = (
@@ -1696,6 +1729,42 @@ class WorkflowStateService:
             )
         content.pending_authoring_ids = pending_ids
         content.needs_replan_ids = replan_ids
+        # Read-only action facts; stale sheets remain usable references under the
+        # original admission contract, while missing/blocked files never qualify.
+        gates["production_inputs"] = {
+            "references_ready": formal_present
+            and not content.unregistered_references
+            and not content.referenced_assets_without_sheet
+            and all(asset.sheet_state in {"current", "stale"} for asset in content.referenced_assets),
+            "videos_ready": formal_present and bool(items) and not replan_ids
+            and artifacts["videos"].get("state") != "blocked"
+            and len(artifacts["videos"].get("current_ids", []) + artifacts["videos"].get("stale_ids", [])) == len(items)
+            and all(get_generated_assets(item).get("video_clip") for item in items),
+        }
+        plan_path = script_review.script_plan_path(project_path, project, number)
+        if plan_path and plan_path.is_file():
+            try:
+                from lib.script.plan_new_assets import resolve_new_assets
+
+                plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                suggestions = plan.get("new_assets", [])
+                resolution = resolve_new_assets(project, suggestions)
+                used = {(asset.asset_type, asset_name_comparison_key(asset.name)) for asset in content.referenced_assets}
+                unused = list(dict.fromkeys(
+                    outcome.visual for (asset_type, _name), outcome in resolution.outcomes.items()
+                    if outcome.visual and (asset_type, asset_name_comparison_key(outcome.visual)) not in used
+                ))
+                content.asset_summary = {
+                    "suggested": len(suggestions),
+                    "registered": sum(len(project.get(ASSET_SPECS[k].bucket_key, {})) for k in ("character", "scene", "prop")),
+                    "adopted": len(content.referenced_assets),
+                    "missing": sum(a.sheet_state in {"missing", "blocked"} for a in content.referenced_assets),
+                    "stale": len(content.referenced_asset_sheets_stale),
+                    "unused_suggestions": unused,
+                }
+            except (OSError, UnicodeError, ValueError, AttributeError, TypeError):
+                # Corrupt plans retain the existing plan-artifact issue/recovery path.
+                pass
         # 剪辑时间线只陈述这一类内容：视频是否齐全不影响列出已有的几条。
         timeline_ids = self._edit_timeline_ids(project_name, number, artifacts, issues) if formal_present else []
         videos = artifacts["videos"]

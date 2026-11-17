@@ -27,11 +27,6 @@ function isScriptPlanConfirmedError(err: unknown): boolean {
   return diagnostic != null && typeof diagnostic === "object" && (diagnostic as { code?: unknown }).code === "script_plan_confirmed";
 }
 
-/** 已确认、无待修复草稿的脚本规划只读，本地未保存的编辑无处可存，外部刷新时直接采用服务端内容。 */
-function isReadOnly(state: ScriptReviewState): boolean {
-  return state.status === "confirmed" && state.quarantine == null;
-}
-
 /** 内容是否有未保存编辑：以序列化比对，draft 由 server content 克隆而来，键序稳定。 */
 function isDirty(draft: unknown, serverContent: unknown): boolean {
   if (draft == null) return false;
@@ -167,9 +162,9 @@ export function useScriptReviewDraft<TDraft extends ScriptReviewContent>({
         if (signal.aborted) return;
         setLoadError(null);
         setState(next);
-        // 外部刷新（挂载 / Agent 改 script_plan 触发的 revision）：用户无未保存编辑、或内容已确认只读时采用
+        // 外部刷新（挂载 / Agent 改 script_plan 触发的 revision）：用户无未保存编辑时采用
         // 服务端内容，否则仅更新服务端态、保留用户草稿。dirtyRef 读取在 effect 内安全（非 render 期）。
-        if (!dirtyRef.current || isReadOnly(next)) {
+        if (!dirtyRef.current) {
           setDraft(clone(selectContent(next)));
           setBaseFingerprint(next.fingerprint);
         }
@@ -211,10 +206,13 @@ export function useScriptReviewDraft<TDraft extends ScriptReviewContent>({
   const confirm = useCallback(async (options: { overwriteRevision?: string } = {}): Promise<boolean> => {
     setConfirming(true);
     try {
+      let planFingerprint = baseFingerprint;
       if (dirty && draft) {
-        adopt(await API.saveScriptReviewContent(projectName, episode, draft, baseFingerprint));
+        const saved = await API.saveScriptReviewContent(projectName, episode, draft, baseFingerprint);
+        planFingerprint = saved.fingerprint;
+        adopt(saved);
       }
-      adopt(await API.confirmScriptReview(projectName, episode, options));
+      adopt(await API.confirmScriptReview(projectName, episode, { ...options, planFingerprint: planFingerprint ?? undefined }));
       onConfirmed();
       return true;
     } catch (err) {

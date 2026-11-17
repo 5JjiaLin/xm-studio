@@ -892,6 +892,10 @@ class GenerateEpisodeScriptRequest(BaseModel):
         ),
     )
     dry_run: bool = Field(default=False, description=_DRY_RUN_DESCRIPTION)
+    prompt_policy_version: str | SkipJsonSchema[None] = Field(
+        default=None, min_length=1, max_length=64,
+        description="本次编写使用的提示词策略版本；drama_detail_v1 启用详细剧情策略，省略时沿用默认策略",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -915,6 +919,7 @@ class GenerateEpisodeScriptRequest(BaseModel):
             overwrite_revision=self.overwrite_revision,
             dry_run=self.dry_run,
             regenerate=self.regenerate,
+            prompt_policy_version=self.prompt_policy_version,
         )
 
 
@@ -930,6 +935,32 @@ class GenerateScriptPlanRequest(BaseModel):
         default=None, description="本次重新拆解的原因；提供时结合当前拆解结果针对性修订资产分类、外观与镜头引用"
     )
     dry_run: bool = Field(default=False, description=_DRY_RUN_DESCRIPTION)
+    prompt_policy_version: str | SkipJsonSchema[None] = Field(
+        default=None, min_length=1, max_length=64,
+        description="本次拆解使用的提示词策略版本；drama_detail_v1 启用详细剧情策略，省略时沿用默认策略",
+    )
+    repair_draft_revision: str | None = Field(
+        default=None, min_length=1, max_length=100,
+        description="显式修复的隔离草稿修订号；仅修复当前未确认参考拆解，不重新规划整集",
+    )
+    repair_once: bool = Field(
+        default=False, strict=True,
+        description="仅本次拆解失败后允许一次定向修复调用；默认关闭，不与显式草稿修复同时使用",
+    )
+    repair_recheck_task_id: str | None = Field(
+        default=None, min_length=1, max_length=100,
+        description="只本地复验该已结束拆解任务保存的完整响应，不请求模型；不得附带生成或改写要求",
+    )
+
+    @model_validator(mode="after")
+    def mutually_exclusive_repair_modes(self) -> GenerateScriptPlanRequest:
+        if self.repair_draft_revision and self.repair_once:
+            raise ValueError("显式修复不能再次自动修复")
+        if self.repair_recheck_task_id and (
+            self.repair_draft_revision or self.repair_once or self.replan_reason or self.instructions or self.source
+        ):
+            raise ValueError("重新检查不能附带生成或改写要求")
+        return self
 
     def text_request(self) -> TextGenerationRequest:
         return TextGenerationRequest(
@@ -937,6 +968,10 @@ class GenerateScriptPlanRequest(BaseModel):
             source=self.source,
             instructions=self.instructions,
             replan_reason=self.replan_reason,
+            prompt_policy_version=self.prompt_policy_version,
+            repair_draft_revision=self.repair_draft_revision,
+            repair_once=self.repair_once,
+            repair_recheck_task_id=self.repair_recheck_task_id,
             dry_run=self.dry_run,
         )
 
@@ -948,6 +983,15 @@ async def generate_episode_script(
     services: Services,
 ) -> ToolOutcome[Any]:
     text_request = request.value.text_request()
+    if text_request.prompt_policy_version not in {None, "drama_detail_v1"}:
+        return ToolOutcome(problem=ToolProblem("generation_refused", "未知的提示词策略版本"))
+    if text_request.prompt_policy_version is None:
+        project = await asyncio.to_thread(services.projects.load_project, scope.project_name)
+        from lib.script.prompt_policy import policy_for_new_task
+
+        selected_policy = policy_for_new_task(project)
+        if selected_policy:
+            text_request = replace(text_request, prompt_policy_version=selected_policy)
     if text_request.dry_run:
         return await _execute_text_handler(
             "generate_episode_script", generate_episode_script_handler, text_request, scope, services
@@ -1013,8 +1057,41 @@ async def generate_script_plan(
     try:
         project = await asyncio.to_thread(services.projects.load_project, scope.project_name)
         content_mode = project.get("content_mode", "narration")
+        if text_request.repair_draft_revision and not text_request.repair_recheck_task_id:
+            from server.services.project.script_plan_repair import repair_inputs_for_preflight
+
+            source, policy = await repair_inputs_for_preflight(
+                await asyncio.to_thread(services.projects.get_project_path, scope.project_name),
+                text_request.episode, text_request.repair_draft_revision, text_request.source,
+            )
+            text_request = replace(text_request, source=source, prompt_policy_version=policy)
+        elif text_request.prompt_policy_version is None and not text_request.repair_recheck_task_id:
+            from lib.script.prompt_policy import policy_for_new_task
+
+            text_request = replace(text_request, prompt_policy_version=policy_for_new_task(project))
+        if text_request.prompt_policy_version not in {None, "drama_detail_v1"}:
+            raise TextGenerationError("未知的提示词策略版本")
+        if text_request.prompt_policy_version and (content_mode != "drama" or not is_reference_video_project(project)):
+            raise TextGenerationError("该提示词策略仅适用于剧情参考生视频")
         if content_mode not in {"narration", "drama", "ad"}:
             raise TextGenerationError(f"不支持的创作类型: {content_mode}")
+        if text_request.repair_recheck_task_id:
+            from server.services.project.script_plan_repair import prepare_recheck_request
+
+            if not is_reference_video_project(project) or content_mode == "ad":
+                raise TextGenerationError("本地恢复仅适用于参考生视频拆解")
+            prior = await services.queue.get_task(text_request.repair_recheck_task_id)
+            if (
+                prior is None or prior.get("project_name") != scope.project_name
+                or prior.get("resource_id") != f"episode-{text_request.episode}"
+                or prior.get("task_type") != _TEXT_REFERENCE_SCRIPT_PLAN
+                or prior.get("user_id") not in {None, _caller.user_id}
+                or prior.get("status") not in {"failed", "cancelled", "succeeded"}
+            ):
+                raise TextGenerationError("原任务尚未结束或与当前项目、集、用户不符，请先核对原任务")
+            text_request = await prepare_recheck_request(
+                text_request, project_name=scope.project_name, projects=services.projects,
+            )
         await asyncio.to_thread(
             lambda: script_plan_preflight(
                 services.projects.get_project_path(scope.project_name),
@@ -1023,17 +1100,28 @@ async def generate_script_plan(
                 text_request.source,
             )
         )
-        if text_request.replan_reason and text_request.replan_reason.strip():
+        if not text_request.repair_recheck_task_id and text_request.replan_reason and text_request.replan_reason.strip():
             # Freeze the reviewed result when submitting, so queue recovery uses the same correction context.
             text_request = replace(
                 text_request,
                 replan_context=await asyncio.to_thread(
-                    script_plan_replan_context,
-                    services.projects.get_project_path(scope.project_name),
-                    project,
-                    text_request.episode,
+                    lambda: script_plan_replan_context(
+                        services.projects.get_project_path(scope.project_name), project, text_request.episode
+                    ),
                 ),
             )
+        if not text_request.repair_recheck_task_id and (text_request.repair_draft_revision or text_request.repair_once):
+            if not is_reference_video_project(project) or content_mode == "ad":
+                raise TextGenerationError("局部修复仅适用于未确认的参考生视频拆解")
+            from server.services.project.script_plan_repair import prepare_repair_context
+
+            source, context = await prepare_repair_context(
+                text_request,
+                project_name=scope.project_name,
+                projects=services.projects,
+                config_resolver=services.capabilities,
+            )
+            text_request = replace(text_request, source=source, repair_context=context)
         if is_reference_video_project(project):
             handler, task_type = generate_reference_script_plan, _TEXT_REFERENCE_SCRIPT_PLAN
         elif content_mode == "narration":
@@ -1044,6 +1132,12 @@ async def generate_script_plan(
         return ToolOutcome(problem=_not_admitted_problem(exc))
     except TextGenerationError as exc:
         return ToolOutcome(problem=ToolProblem("generation_refused", str(exc)))
+    except ValueError as exc:
+        from server.services.project.script_plan_repair import PlanRepairError
+
+        if isinstance(exc, PlanRepairError):
+            return ToolOutcome(problem=ToolProblem("generation_refused", str(exc)))
+        return ToolOutcome(problem=ToolProblem("internal_error", f"generate_script_plan 失败: {exc}"))
     except Exception as exc:
         return ToolOutcome(problem=ToolProblem("internal_error", f"generate_script_plan 失败: {exc}"))
     if text_request.dry_run:
@@ -1060,6 +1154,7 @@ async def generate_script_plan(
 
 
 class ConfirmScriptReviewRequest(BaseModel):
+    plan_fingerprint: str | None = Field(default=None, description="已审阅规划的 fingerprint，读取内容后原样提交")
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     episode_id: PositiveEpisode = Field(description=EPISODE_ID_DESCRIPTION)
@@ -1079,6 +1174,7 @@ async def confirm_script_review(
         "confirm_script_review",
         confirm_script_review_handler(
             request.value.episode_id,
+            plan_fingerprint=request.value.plan_fingerprint,
             overwrite_revision=request.value.overwrite_revision,
             project_name=scope.project_name,
             projects=services.projects,
@@ -3295,7 +3391,13 @@ async def execute_queued_text_task(
         services = services or Services.defaults(await asyncio.to_thread(ProjectManager, scope.data_root))
     task_type = task["task_type"]
     if task_type == TEXT_DRAFT_REPAIR_TASK_TYPE:
-        outcome = await _execute_draft_repair(RepairDraftRequest.model_validate(payload), scope, services)
+        # GenerationQueue attaches these private journal fields to every eligible
+        # task payload. They belong to worker-side audit, not the strict domain request.
+        repair_payload = {
+            key: value for key, value in payload.items()
+            if key not in {"_production_feedback", "_production_feedback_replan"}
+        }
+        outcome = await _execute_draft_repair(RepairDraftRequest.model_validate(repair_payload), scope, services)
     elif task_type == _TEXT_EPISODE_PLAN and isinstance(payload.get("replan"), str):
         outcome = await _execute_replan_window(
             str(payload["replan"]),
@@ -3329,6 +3431,11 @@ async def execute_queued_text_task(
             batch_asset_context=payload.get("batch_asset_context"),
             replan_reason=payload.get("replan_reason"),
             replan_context=payload.get("replan_context"),
+            repair_draft_revision=payload.get("repair_draft_revision"),
+            repair_once=payload.get("repair_once", False),
+            repair_context=payload.get("repair_context"),
+            repair_recheck_task_id=payload.get("repair_recheck_task_id"),
+            prompt_policy_version=payload.get("prompt_policy_version"),
         )
         handlers = {
             _TEXT_EPISODE_SCRIPT: ("generate_episode_script", generate_episode_script_handler),

@@ -8,7 +8,7 @@ import httpx
 import pytest
 from pydantic import BaseModel
 
-from lib.backends.text_backends.base import TextGenerationRequest, TextOutputTruncatedError
+from lib.backends.text_backends.base import TextCapability, TextGenerationRequest, TextOutputTruncatedError
 from lib.backends.text_backends.openai import OpenAITextBackend
 from lib.backends.text_backends.openai_responses import OpenAIResponsesTextBackend
 from tests.http_capture import PathPrefixRewrite, capture_http, only_request, request_json
@@ -106,19 +106,25 @@ def _responses_events(*, status: str = "completed") -> list[dict]:
     ]
 
 
+@pytest.mark.parametrize(
+    ("model", "prefer_stream"),
+    [("gpt-6-astra", False), ("gpt-6.1-sol", False), ("any-compatible-model", True)],
+)
 @pytest.mark.parametrize("protocol", ["chat", "responses"])
 @pytest.mark.parametrize("with_transport", [False, True])
-async def test_astra_stream_preserves_schema_usage_and_long_timeout(protocol, with_transport):
+async def test_astra_stream_preserves_schema_usage_and_long_timeout(protocol, with_transport, model, prefer_stream):
     backend_type = OpenAITextBackend if protocol == "chat" else OpenAIResponsesTextBackend
     path = "/chat/completions" if protocol == "chat" else "/responses"
     events = _chat_events() if protocol == "chat" else _responses_events()
     layer = PathPrefixRewrite("/v1", "/proxy/v1") if with_transport else None
     prefix = "/proxy/v1" if with_transport else "/v1"
-    backend = backend_type(api_key="test", model="gpt-6-astra", base_url="https://relay.test/v1", transport_layer=layer)
+    backend = backend_type(api_key="test", model=model, base_url="https://relay.test/v1", transport_layer=layer)
     try:
         with capture_http() as router:
             route = router.post(f"https://relay.test{prefix}{path}").mock(return_value=_sse(events))
-            result = await backend.generate(TextGenerationRequest(prompt="编写提示词", response_schema=_Script))
+            result = await backend.generate(
+                TextGenerationRequest(prompt="编写提示词", response_schema=_Script, prefer_stream=prefer_stream)
+            )
         request = only_request(route)
         body = request_json(request)
         assert body["stream"] is True
@@ -131,40 +137,53 @@ async def test_astra_stream_preserves_schema_usage_and_long_timeout(protocol, wi
         await backend._client.close()
 
 
+@pytest.mark.parametrize(
+    ("model", "prefer_stream"),
+    [("gpt-6-astra", False), ("gpt-6.1-sol", False), ("any-compatible-model", True)],
+)
 @pytest.mark.parametrize("protocol", ["chat", "responses"])
-async def test_stream_without_final_signal_is_not_saved_or_replayed(protocol):
+async def test_stream_without_final_signal_is_not_saved_or_replayed(protocol, model, prefer_stream):
     backend_type = OpenAITextBackend if protocol == "chat" else OpenAIResponsesTextBackend
     path = "/chat/completions" if protocol == "chat" else "/responses"
     events = _chat_events(finish_reason=None) if protocol == "chat" else _responses_events()[:-1]
-    backend = backend_type(api_key="test", model="gpt-6-astra", base_url="https://relay.test/v1")
+    backend = backend_type(api_key="test", model=model, base_url="https://relay.test/v1")
     try:
         with capture_http() as router:
             route = router.post(f"https://relay.test/v1{path}").mock(return_value=_sse(events))
             with pytest.raises(RuntimeError, match="不完整结果"):
-                await backend.generate(TextGenerationRequest(prompt="编写提示词", response_schema=_Script))
+                await backend.generate(
+                    TextGenerationRequest(prompt="编写提示词", response_schema=_Script, prefer_stream=prefer_stream)
+                )
         assert route.call_count == 1
     finally:
         await backend._client.close()
 
 
+@pytest.mark.parametrize(
+    ("model", "prefer_stream"),
+    [("gpt-6-astra", False), ("gpt-6.1-sol", False), ("any-compatible-model", True)],
+)
 @pytest.mark.parametrize("protocol", ["chat", "responses"])
-async def test_stream_truncation_keeps_structured_output_guard(protocol):
+async def test_stream_truncation_keeps_structured_output_guard(protocol, model, prefer_stream):
     backend_type = OpenAITextBackend if protocol == "chat" else OpenAIResponsesTextBackend
     path = "/chat/completions" if protocol == "chat" else "/responses"
     events = _chat_events(finish_reason="length") if protocol == "chat" else _responses_events(status="incomplete")
-    backend = backend_type(api_key="test", model="gpt-6-astra", base_url="https://relay.test/v1")
+    backend = backend_type(api_key="test", model=model, base_url="https://relay.test/v1")
     try:
         with capture_http() as router:
             route = router.post(f"https://relay.test/v1{path}").mock(return_value=_sse(events))
             with pytest.raises(TextOutputTruncatedError):
-                await backend.generate(TextGenerationRequest(prompt="编写提示词", response_schema=_Script))
+                await backend.generate(
+                    TextGenerationRequest(prompt="编写提示词", response_schema=_Script, prefer_stream=prefer_stream)
+                )
         assert route.call_count == 1
     finally:
         await backend._client.close()
 
 
 async def test_failed_responses_stream_is_not_success():
-    backend = OpenAIResponsesTextBackend(api_key="test", model="gpt-6-astra", base_url="https://relay.test/v1")
+    model = "gpt-6-astra"
+    backend = OpenAIResponsesTextBackend(api_key="test", model=model, base_url="https://relay.test/v1")
     try:
         with capture_http() as router:
             route = router.post("https://relay.test/v1/responses").mock(
@@ -173,5 +192,76 @@ async def test_failed_responses_stream_is_not_success():
             with pytest.raises(RuntimeError, match="upstream failed"):
                 await backend.generate(TextGenerationRequest(prompt="编写提示词"))
         assert route.call_count == 1
+    finally:
+        await backend._client.close()
+
+
+@pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.1-sol"])
+@pytest.mark.parametrize("schema_rejected", [False, True])
+async def test_chat_long_thinking_schema_fallback_keeps_stream_and_validation(model, schema_rejected):
+    backend = OpenAITextBackend(api_key="test", model=model, base_url="https://relay.test/v1")
+    if not schema_rejected:
+        backend._capabilities.discard(TextCapability.STRUCTURED_OUTPUT)
+    responses = [_sse(_chat_events())]
+    if schema_rejected:
+        responses.insert(0, httpx.Response(400, json={"error": {"message": "Invalid schema for response_format"}}))
+    try:
+        with capture_http() as router:
+            route = router.post("https://relay.test/v1/chat/completions").mock(side_effect=responses)
+            result = await backend.generate(TextGenerationRequest(prompt="拆解整集剧本", response_schema=_Script))
+        assert route.call_count == len(responses)
+        body = request_json(route.calls[-1].request)
+        assert body["stream"] is True
+        assert "response_format" not in body
+        assert "tools" not in body
+        assert "拆解整集剧本" in body["messages"][0]["content"]
+        assert '"properties"' in body["messages"][0]["content"]
+        assert json.loads(result.text) == {"text": "完整提示词"}
+        assert (result.input_tokens, result.output_tokens) == (50, 20)
+    finally:
+        await backend._client.close()
+
+
+@pytest.mark.parametrize("finish_reason", [None, "length"])
+async def test_chat_long_thinking_rejected_schema_fallback_does_not_save_partial_result(finish_reason):
+    backend = OpenAITextBackend(api_key="test", model="gpt-6.1-sol", base_url="https://relay.test/v1")
+    try:
+        with capture_http() as router:
+            route = router.post("https://relay.test/v1/chat/completions").mock(
+                side_effect=[
+                    httpx.Response(400, json={"error": {"message": "Invalid schema for response_format"}}),
+                    _sse(_chat_events(finish_reason=finish_reason)),
+                ]
+            )
+            with pytest.raises((RuntimeError, TextOutputTruncatedError)):
+                await backend.generate(TextGenerationRequest(prompt="拆解整集剧本", response_schema=_Script))
+        assert route.call_count == 2
+    finally:
+        await backend._client.close()
+
+
+@pytest.mark.parametrize('native', [False, True])
+async def test_authoring_raw_response_is_not_retried_or_overwritten(native):
+    from lib.script.reference_video.authoring_response import authoring_response_model
+
+    backend = OpenAITextBackend(api_key='test', model='MiniMax-M3.1-Flash', base_url='https://relay.test/v1', provider_name='minimax')
+    events = _chat_events()
+    events[1]['choices'][0]['delta']['content'] = '{"title":"t","units":[{"text":"first","text":"second"}]}'
+    events[2]['choices'][0]['delta']['content'] = ''
+    try:
+        with capture_http() as router:
+            route = router.post('https://relay.test/v1/chat/completions').mock(return_value=_sse(events))
+            result = await backend.generate(TextGenerationRequest(
+                prompt='批量编写', response_schema=authoring_response_model(3), prefer_stream=True,
+                preserve_raw_response=True, prefer_native_schema=native,
+            ))
+        body = request_json(only_request(route))
+        assert ('response_format' in body) is native
+        if native:
+            assert body['response_format']['json_schema']['strict'] is True
+        else:
+            assert '"minItems": 3' in body['messages'][-1]['content']
+        assert result.text.count('"text"') == 2
+        assert result.output_tokens == 20
     finally:
         await backend._client.close()

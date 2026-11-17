@@ -216,3 +216,43 @@ class TestReferenceUnitsScriptPlanModel:
             self._model().model_validate({"units": [self._unit(text="")]})
         with pytest.raises(ValidationError):
             self._model().model_validate({"units": [self._unit(source_text="")]})
+
+    def test_span_generation_schema_keeps_duration_enum_and_hides_source_text(self):
+        from lib.script.script_models import build_reference_units_script_plan_model
+
+        model = build_reference_units_script_plan_model([4, 6, 8], use_source_spans=True)
+        unit_def = next(d for d in model.model_json_schema()["$defs"].values() if "text" in d.get("properties", {}))
+        assert set(unit_def["properties"]) == {"duration_seconds", "text", "source_span_start", "source_span_end"}
+        assert unit_def["properties"]["duration_seconds"]["enum"] == [4, 6, 8]
+        assert set(unit_def["required"]) == set(unit_def["properties"])
+        draft = model.model_validate(
+            {
+                "units": [
+                    {
+                        "duration_seconds": 6,
+                        "text": "@[甲] 起身",
+                        "source_span_start": "S0001",
+                        "source_span_end": "S0001",
+                    }
+                ]
+            }
+        )
+        assert draft.units[0].source_span_start == "S0001"
+
+    def test_span_generation_schema_rejects_duration_outside_model_capability(self):
+        from lib.script.script_models import build_reference_units_script_plan_model
+
+        model = build_reference_units_script_plan_model([4, 6, 8], use_source_spans=True)
+        with pytest.raises(ValidationError):
+            model.model_validate(
+                {
+                    "units": [
+                        {
+                            "duration_seconds": 5,
+                            "text": "@[甲] 起身",
+                            "source_span_start": "S0001",
+                            "source_span_end": "S0001",
+                        }
+                    ]
+                }
+            )

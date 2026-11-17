@@ -193,3 +193,33 @@ def test_writing_a_derivative_rejects_a_case_variant_registered_after_resolution
         resolution.apply_to_project(project)
 
     assert list(project["characters"]["Alice"]["derivatives"]) == ["coat"]
+
+
+def test_compound_form_references_follow_renamed_base_and_form():
+    resolution = resolve_new_assets({}, [
+        _new("小桃", asset_name="桃子"),
+        _derivative("雨衣", target="小桃", asset_name="红雨衣"),
+    ])
+    text = "@[小桃/雨衣]进门。@[小桃/雨衣]{保留@[小桃/雨衣]原词。}"
+    assert resolution.rewrite_entries([{"text": text}])[0]["text"] == "@[桃子/红雨衣]进门。@[桃子/红雨衣]{保留@[小桃/雨衣]原词。}"
+
+
+def test_conflicting_temporary_names_are_preserved_and_reported():
+    from lib.script.plan_new_assets import dedupe_new_assets
+
+    items = [_derivative("雨衣", target="Alice"), _derivative("雨衣", target="Bob")]
+    assert len(dedupe_new_assets(items)) == 2
+    assert ("new_asset_duplicate_conflict", 1) in _problem_codes({}, items)
+
+
+def test_manual_complete_prompt_is_valid_without_inventing_description():
+    project = {}
+    resolution = resolve_new_assets(project, [_new("小桃", description="", generation_prompt="完整四视图提示词")])
+    resolution.apply_to_project(project)
+    assert project["characters"]["小桃"]["description"] == ""
+    assert project["characters"]["小桃"]["generation_prompt"] == "完整四视图提示词"
+
+
+def test_new_derivative_needs_edit_instruction_before_registration():
+    item = _new("雨衣", decision="derivative", target="Alice", description="")
+    assert _problem_codes({"characters": {"Alice": {"description": "人"}}}, [item]) == [("new_asset_invalid", 0)]

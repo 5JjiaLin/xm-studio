@@ -374,6 +374,10 @@ async def lifespan(app: FastAPI):
     warn_if_log_dir_env_set()
     warn_if_env_diverges_from_file()
 
+    from lib.script.prompt_policy import prompt_content_validation_enabled
+
+    logger.info("Prompt content validation: enabled=%s", prompt_content_validation_enabled())
+
     ensure_auth_password()
     warn_if_auth_disabled()
 
@@ -692,6 +696,9 @@ app.middleware("http")(feedback_middleware)
 
 app.include_router(
     production.source_router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["Production"]
+)
+app.include_router(
+    production.settings_router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["Production"]
 )
 app.include_router(
     production.router,

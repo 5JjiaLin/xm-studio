@@ -19,6 +19,8 @@ from lib.project.project_manager import ProjectManager
 from server.error_handlers import register_error_handlers
 from server.routers import production
 from server.services.project.production import ProductionService
+from tests.auth_deps import override_auth
+from tests.fakes import use_production_generation_queue
 
 
 @pytest.fixture
@@ -29,14 +31,30 @@ def management(tmp_path, monkeypatch):
     first = create_episode(pm, "demo", title="First", source_text="第一集对白", source_kind="screenplay")
     second = create_episode(pm, "demo", title="Second", source_text="第二集对白", source_kind="screenplay")
     queue = SimpleNamespace(list_tasks=AsyncMock(return_value={"items": []}))
-    monkeypatch.setattr(production, "get_generation_queue", lambda: queue)
+    use_production_generation_queue(monkeypatch, queue)
     app = FastAPI()
     app.state.production_service = ProductionService(pm)
     register_error_handlers(app)
     # Archive routes are protected by the app-level authentication boundary in server.app.
     app.include_router(production.router, prefix="/api/v1")
     app.include_router(production.source_router, prefix="/api/v1")
+    app.include_router(production.settings_router, prefix="/api/v1")
     return TestClient(app), pm, queue, first, second
+
+
+def test_feedback_settings_do_not_require_a_project_and_preserve_project_content(management):
+    client, pm, _, _, _ = management
+    before = pm.load_project("demo")
+    body = {"tester_id": "tester", "test_batch_id": "batch", "test_case_id": "case"}
+    with client:
+        assert client.put("/api/v1/production/feedback/settings", json=body).status_code == 401
+        override_auth(client.app)
+        saved = client.put("/api/v1/production/feedback/settings", json=body)
+        assert saved.status_code == 200
+        loaded = client.get("/api/v1/production/feedback/settings")
+    assert loaded.status_code == 200
+    assert all(loaded.json()[key] == value for key, value in body.items())
+    assert pm.load_project("demo") == before
 
 
 def test_archive_restore_preserves_scripts_media_identity_and_order(management):
@@ -347,9 +365,7 @@ def test_first_source_save_accepts_empty_previous_text_and_keeps_other_episodes(
     original = _screenplay_docx()
     upload = {"file": ("单集.docx", original)} if with_file else None
     with client:
-        saved = client.post(
-            f"/api/v1/projects/demo/episodes/{episode}/production/source", data=data, files=upload
-        )
+        saved = client.post(f"/api/v1/projects/demo/episodes/{episode}/production/source", data=data, files=upload)
         assert saved.status_code == 200, saved.text
         assert saved.json()["applied"]
         # An omitted/empty baseline must still refuse overwriting an existing source.

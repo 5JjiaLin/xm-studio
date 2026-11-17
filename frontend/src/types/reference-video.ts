@@ -58,6 +58,7 @@ export interface UnitGeneratedAssets {
 
 export interface ReferenceVideoUnit {
   prompt_format_version?: "timeline_v1";
+  prompt_policy_version?: string;
   generation_prompt?: string;
   /** Format: "E{episode}U{index}" */
   unit_id: string;
@@ -309,6 +310,7 @@ export interface ScriptReviewQuarantine {
   soft_violations: DraftSoftViolation[];
   /** 丢弃后是否有正式内容可回。 */
   formal_exists: boolean;
+  repair?: { available: boolean; target_count: number; reason: string | null };
 }
 
 /** 草稿端点返回的视图：`item_ids` 为提示词编写草稿各条目对应的正式剧本单元 ID。 */
@@ -336,6 +338,7 @@ export interface SaveEpisodeDraftResult {
 export interface ReferenceUnitPromptPreview extends RenderedPromptPreview {
   prompt_source?: "manual" | "default";
   prompt_format_version?: "timeline_v1" | null;
+  prompt_policy_version?: string | null;
   generation_allowed?: boolean;
   problems?: { code: string; message: string; blocking: boolean; params: { line?: number; source?: string; expected?: string; actual?: string } }[];
   used_assets?: { type: AssetKind; name: string; paths: string[]; request_indices: number[]; status: "sent" | "excluded" | "missing" }[];

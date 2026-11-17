@@ -85,6 +85,21 @@ def test_native_tier_binds_audio_in_speaker_first_appearance_order():
     )
 
 
+def test_drama_detail_policy_renders_fixed_style_and_avoid_only_for_default_prompt():
+    rendered = render_unit_prompt(
+        "@[酒馆] 内无人。", _project(), [], _SOFT, prompt_policy_version="drama_detail_v1"
+    )
+
+    assert "Style: 真人电视剧风格，精品短剧画风，大师级构图" in rendered.prompt
+    assert "Avoid: BGM、文字字幕、水印、Logo、外形着装完全一致的分身或双胞胎" in rendered.prompt
+    assert "写实电影感" not in rendered.prompt
+
+
+def test_unknown_prompt_policy_fails_closed():
+    with pytest.raises(ValueError, match="不支持的视频提示词策略版本"):
+        render_unit_prompt("镜头", _project(), [], _SOFT, prompt_policy_version="future")
+
+
 def test_silent_episode_sends_dialogue_without_any_audio_binding():
     """本集无声：不组装参考音频、prompt 里不出现 @音频N，台词照常下发作口型参考。"""
     rendered = render_unit_prompt(
@@ -739,7 +754,8 @@ def test_creative_override_replaces_framework_but_keeps_attachment_bindings():
     unit = {"text": "@[张三]走进@[酒馆]。@[张三]{你好。}", "generation_prompt": "我的完整创作正文。\nStyle: ink\nAvoid: blur"}
     rendered = render_video_unit_prompt(unit, project, _SOFT, request_references=references)
     assert rendered.prompt == rendered.declarations + "\n\n" + unit["generation_prompt"]
-    assert "<张三>@图片1" in rendered.declarations and "<酒馆>@图片2" in rendered.declarations
+    assert "<张三>@图片1" in rendered.declarations
+    assert "<酒馆>@图片2" in rendered.declarations
     assert "写实电影感" not in rendered.prompt
     with pytest.raises(ValueError, match="编号"):
         render_video_unit_prompt({**unit, "generation_prompt": "改成@图片9"}, project, _SOFT, request_references=references)

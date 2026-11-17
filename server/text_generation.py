@@ -34,7 +34,7 @@ from lib.episode.episode_paths import (
     episode_source_relpath,
 )
 from lib.episode.episode_sources import episode_entry
-from lib.episode.source_kinds import DEFAULT_SOURCE_KIND
+from lib.episode.source_kinds import DEFAULT_SOURCE_KIND, episode_source_kind
 from lib.generation.video_request_facts import (
     VideoRequestFacts,
     VideoRequestFactsError,
@@ -95,7 +95,6 @@ from lib.script.reference_video.script_preview import (
     unit_lacks_scene_reference,
 )
 from lib.script.reference_video.text_parser import extract_mentions
-from lib.script.reference_video.unit_capabilities import hydrate_reference_units
 from lib.script.reference_video.voice_settings import VoiceRenderSettings
 from lib.script.script_generator import (
     AdScriptOverwriteRequired,
@@ -158,6 +157,11 @@ class TextGenerationRequest:
     batch_asset_context: str | None = None
     replan_reason: str | None = None
     replan_context: str | None = None
+    repair_draft_revision: str | None = None
+    repair_once: bool = False
+    repair_context: str | None = None
+    repair_recheck_task_id: str | None = None
+    prompt_policy_version: str | None = None
 
     def __post_init__(self) -> None:
         if not is_int(self.episode, minimum=1):
@@ -168,6 +172,8 @@ class TextGenerationRequest:
         if any(not is_str(entry_id) or not entry_id for entry_id in entry_ids):
             raise ValueError("entry_ids must be non-empty strings")
         object.__setattr__(self, "entry_ids", entry_ids)
+        if self.repair_draft_revision and self.repair_once:
+            raise ValueError("显式修复不能再次自动修复")
 
     def to_payload(self) -> dict[str, object]:
         """队列任务 payload：只用 JSON 原生类型。
@@ -184,9 +190,15 @@ class TextGenerationRequest:
             "batch_asset_context",
             "replan_reason",
             "replan_context",
+            "repair_draft_revision",
+            "repair_context",
+            "repair_recheck_task_id",
+            "prompt_policy_version",
         ):
             if payload[key] is None:
                 payload.pop(key)
+        if not self.repair_once:
+            payload.pop("repair_once")
         return payload
 
 
@@ -431,7 +443,21 @@ def _quarantine_invalid_script_plan_generation(
     violations: list[DraftViolation],
     source: str | None,
     base_fingerprint: str | None,
+    *,
+    prompt_policy_version: str | None = None,
+    raw_response: str | None = None,
 ) -> str:
+    from lib.project.task_project_claim import current_task_project_claim
+
+    claim = current_task_project_claim()
+    meta = {"source": source or None, "base_fingerprint": base_fingerprint}
+    if raw_response is not None:
+        meta["raw_response"] = raw_response
+        meta["generated_content_fingerprint"] = script_review.content_fingerprint_of_data(content)
+    if prompt_policy_version is not None:
+        meta["prompt_policy_version"] = prompt_policy_version
+    if claim is not None:
+        meta["origin_task_id"] = claim.task_id
     with formal_write_transaction(quarantine_path(project_path, episode, kind)):
         return quarantine_and_report(
             project_path,
@@ -439,7 +465,7 @@ def _quarantine_invalid_script_plan_generation(
             kind,
             content=content,
             violations=violations,
-            meta={"source": source or None, "base_fingerprint": base_fingerprint},
+            meta=meta,
         )
 
 
@@ -460,7 +486,17 @@ def script_plan_replan_context(project_path: Path, project: dict[str, Any], epis
     kind = script_review.script_plan_quarantine_kind(project)
     draft = read_quarantine(project_path, episode, kind) if kind else None
     if draft is not None:
-        return json.dumps({"status": "awaiting_repair", "content": draft.content}, ensure_ascii=False)
+        from lib.script.draft_quarantine import draft_revision
+
+        return json.dumps(
+            {
+                "status": "awaiting_repair",
+                "content": draft.content,
+                "violations": draft.violations,
+                "revision": draft_revision(draft),
+            },
+            ensure_ascii=False,
+        )
     path = script_review.script_plan_path(project_path, project, episode)
     content = load_json_or_none(path) if path is not None else None
     if isinstance(content, dict):
@@ -536,12 +572,21 @@ async def fetch_storyboard_durations(
     return (default if default in durations else None), durations
 
 
-def _parse_script_plan_json(response_text: str, model: type[BaseModel], *, label: str, top_shape: str) -> dict:
+class ScriptPlanParseError(ValueError):
+    """结构失败的隔离候选；原始响应只用于诊断，绝不作为正式稿。"""
+
+    def __init__(self, message: str, content: dict, violations: list[DraftViolation]):
+        super().__init__(message)
+        self.content = content
+        self.violations = violations
+
+
+def _parse_script_plan_json(response_text: str, model: type[BaseModel], *, label: str, top_shape: str, manual: bool = False) -> dict:
     """解析并校验 script_plan 结构化响应为 dict；校验失败 fail-loud 抛 ValueError，不返回未校验内容。
 
     ``model`` 取自调用处用 ``supported_durations`` 构造的同一份动态 schema（即 response_schema），
     令本地校验与 response_schema 同口径：即使 backend 未严格执行 schema，超出 supported_durations
-    的时长、缺字段也在此被拦截。校验失败抛错而非降级保留原始 JSON——否则未校验内容会被当成正式
+    的时长、缺字段也在此被拦截。校验失败携带原始候选抛错，仅供隔离修复；否则未校验内容会被当成正式
     script_plan 文件落盘（下游读取仅守最外层形状、放行），把非法时长 / 缺字段拖到 prompt_authoring 或最终
     save_script 才暴露。与 narration 的 _load_narration_script_plan 严格读取同口径：只有经 schema
     校验的内容才成为持久化的 script_plan 真值源。
@@ -550,19 +595,27 @@ def _parse_script_plan_json(response_text: str, model: type[BaseModel], *, label
     try:
         data = strict_json_loads(text)
     except (json.JSONDecodeError, DuplicateJSONKeyError) as e:
-        raise ValueError(f"{label} JSON 解析失败: {e}") from e
+        raise ScriptPlanParseError(f"{label} JSON 解析失败: {e}", {"raw_response": response_text}, [DraftViolation(str(e), code="json_invalid")]) from e
     if not isinstance(data, dict):
-        raise ValueError(f"{label}结构异常：顶层应为对象 {top_shape}")
+        raise ScriptPlanParseError(f"{label}结构异常：顶层应为对象 {top_shape}", {"raw_response": response_text}, [DraftViolation("顶层必须是对象", code="schema_invalid")])
     try:
-        return model.model_validate(data).model_dump()
+        validated = model.model_validate(data).model_dump()
+        if not manual:
+            missing = [DraftViolation(f"new_assets[{index}] 模型新建资产必须提供 description", code="new_asset_description_required", item_index=index)
+                       for index, asset in enumerate(validated.get("new_assets") or [])
+                       if asset.get("decision") == "register" and not str(asset.get("description") or "").strip()]
+            if missing:
+                raise ScriptPlanParseError("模型新建资产缺少描述", data, missing)
+        return validated
     except ValidationError as e:
-        raise ValueError(f"{label}结构校验失败: {e}") from e
+        from lib.script.draft_violation import schema_violations
+        raise ScriptPlanParseError(f"{label}结构校验失败: {e}", data, schema_violations(e, data, "units")) from e
 
 
-def _parse_reference_script_plan_json(
-    response_text: str, schema: type[BaseModel], supported_durations: list[int], novel_text: str
+def parse_reference_script_plan_candidate(
+    response_text: str, schema: type[BaseModel], supported_durations: list[int], novel_text: str, *, manual: bool = False
 ) -> dict:
-    """仅在生成边界解析跨度响应，交给草稿/晋升流程前还原既有三字段单元。
+    """在生成与草稿重判边界统一解析跨度响应，交给草稿/晋升流程前还原既有三字段单元。
 
     纯旧响应继续使用逐字原文锚校验。出现任一跨度字段就必须满足完整跨度 schema，
     不能用 source_text 或响应内的兼容标记绕过跨度校验。
@@ -576,20 +629,25 @@ def _parse_reference_script_plan_json(
         isinstance(unit, dict) and ("source_span_start" in unit or "source_span_end" in unit) for unit in units
     )
     model = schema if uses_spans else build_reference_units_script_plan_model(supported_durations)
-    flat = _parse_script_plan_json(response_text, model, label="script_plan 拆分内容", top_shape="{units}")
+    flat = _parse_script_plan_json(response_text, model, label="script_plan 拆分内容", top_shape="{units}", manual=manual)
     if not uses_spans:
         return flat
     span_offsets = {span_id: (start, end) for span_id, start, end, _text in reference_source_spans(novel_text)}
     canonical_units = []
-    for unit in flat["units"]:
+    violations = []
+    for index, unit in enumerate(flat["units"]):
         start_range = span_offsets.get(unit["source_span_start"])
         end_range = span_offsets.get(unit["source_span_end"])
-        valid = start_range is not None and end_range is not None and start_range[0] <= end_range[0]
-        # 无效跨度保留正文，交既有内容校验落入可修复草稿；不采信模型附带的 source_text。
-        source_text = novel_text[start_range[0] : end_range[1]] if valid else ""
-        canonical_units.append(
-            {"duration_seconds": unit["duration_seconds"], "source_text": source_text, "text": unit["text"]}
-        )
+        if start_range is None or end_range is None or start_range[0] > end_range[0]:
+            violations.append(DraftViolation(
+                f"units[{index}] 原文跨度 {unit['source_span_start']} → {unit['source_span_end']} 无法解引用或顺序反向；请修正编号",
+                code="source_span_invalid", item_index=index,
+                params={"source_span_start": unit["source_span_start"], "source_span_end": unit["source_span_end"]},
+            ))
+            continue
+        canonical_units.append({"duration_seconds": unit["duration_seconds"], "source_text": novel_text[start_range[0]:end_range[1]], "text": unit["text"]})
+    if violations:
+        raise ScriptPlanParseError("原文跨度无效", flat, violations)
     flat["units"] = canonical_units
     return flat
 
@@ -847,7 +905,11 @@ async def generate_episode_script(
                 config_resolver=config_resolver,
             )
             prompt = await generator.build_prompt(
-                episode, instructions=instructions, entry_ids=request.entry_ids, rewrite=request.rewrite
+                episode,
+                instructions=instructions,
+                entry_ids=request.entry_ids,
+                rewrite=request.rewrite,
+                prompt_policy_version=request.prompt_policy_version,
             )
             return TextGenerationResult(f"DRY RUN — 以下是将发送给文本模型的 Prompt:\n\n{prompt}")
 
@@ -869,6 +931,7 @@ async def generate_episode_script(
             rewritten_entry_ids=rewritten,
             skipped_entry_ids=skipped,
             regenerate=request.regenerate,
+            prompt_policy_version=request.prompt_policy_version,
             registered_assets=registered,
         )
     except AdScriptRejected as exc:
@@ -954,6 +1017,7 @@ async def _describe(projects: ProjectManager, project_name: str, episode: int) -
 async def confirm_script_review(
     episode: int,
     *,
+    plan_fingerprint: str | None = None,
     overwrite_revision: str | None = None,
     project_name: str,
     projects: ProjectManager,
@@ -963,7 +1027,7 @@ async def confirm_script_review(
 
     try:
         state = await ScriptReviewService(projects, config_resolver=config_resolver).confirm(
-            project_name, episode, overwrite_revision=overwrite_revision
+            project_name, episode, overwrite_revision=overwrite_revision, plan_fingerprint=plan_fingerprint
         )
     except ScriptReviewError as exc:
         if exc.code == "overwrite_required":
@@ -1293,6 +1357,7 @@ def _validate_unit_duration_tier(label: str, duration: int, *, has_references: b
         f"{label} 时长 {duration}s 不在{state}的 unit 的生效档位 {tiers} 内{remedy}",
         code="duration_off_tier",
         label=label,
+        params={"duration_seconds": duration, "allowed_durations": tiers, "has_references": has_references},
     )
 
 
@@ -1323,6 +1388,7 @@ def collect_reference_flat_violations(
     caps: ReferenceSplitCaps,
     source_language: str | None,
     new_assets: object,
+    prompt_policy_version: str | None = None,
 ) -> list[DraftViolation]:
     """逐 unit 收齐 script_plan 扁平产出的全部违约（不在首个违约处中断）。
 
@@ -1341,28 +1407,23 @@ def collect_reference_flat_violations(
     # 台词口播量的语速与 prompt 侧同源：项目级覆盖优先，否则按语言默认。
     speech_rate_override = project_speech_rate_override(project)
     validation = plan_reference_validation(project, new_assets, flat_units)
-    hydrations = (
-        hydrate_reference_units(validation.project, project_path, validation.entries)
-        if not validation.asset_problems
-        else [None] * len(validation.entries)
-    )
     violations: list[DraftViolation] = []
-    for index, (flat, hydration) in enumerate(zip(validation.entries, hydrations, strict=True), start=1):
+    for index, flat in enumerate(validation.entries, start=1):
         label = _reference_unit_label(episode, index)
         duration = flat["duration_seconds"]
         source_text = flat["source_text"]
         text = flat["text"]
-        with_reference_images = hydration is not None and hydration.hydrated_generation_type == "r2v"
 
         def _check_text_and_tier(
-            la: str = label, tx: str = text, d: int = duration, with_images: bool = with_reference_images
+            la: str = label, tx: str = text, d: int = duration
         ) -> None:
             if validation.asset_problems:
                 return
-            validate_unit_text(
-                la, tx, validation.project, max_refs=caps.max_refs, tolerated_speakers=validation.tolerated_speakers
+            refs = validate_unit_text(
+                la, tx, validation.project, max_refs=caps.max_refs, tolerated_speakers=validation.tolerated_speakers,
+                check_mention_syntax=True,
             )
-            _validate_unit_duration_tier(la, d, has_references=with_images, caps=caps)
+            _validate_unit_duration_tier(la, d, has_references=bool(refs), caps=caps)
 
         violations.extend(
             collect_violations(
@@ -1389,6 +1450,25 @@ def collect_reference_flat_violations(
             )
         )
     violations.extend(asset_problem_violations(validation.asset_problems))
+    if episode_source_kind(project, episode) == "screenplay":
+        from lib.script.reference_video.screenplay_coverage import (
+            screenplay_speaker_aliases,
+            validate_screenplay_coverage,
+        )
+
+        violations.extend(
+            validate_screenplay_coverage(
+                validation.entries,
+                novel_text,
+                speaker_aliases=screenplay_speaker_aliases(project, new_assets)
+                if not validation.asset_problems
+                else screenplay_speaker_aliases(project),
+            )
+        )
+    if prompt_policy_version == "drama_detail_v1":
+        from lib.script.reference_video.prompt_policy_validation import validate_policy_asset_descriptions
+
+        violations.extend(validate_policy_asset_descriptions(new_assets))
     return violations
 
 
@@ -1870,7 +1950,24 @@ async def generate_reference_script_plan(
             episode_outline=cast(dict[str, Any] | None, prompt_inputs["episode_outline"]),
             next_episode_outline=cast(dict[str, Any] | None, prompt_inputs["next_episode_outline"]),
             instructions=instructions,
+            drama_detail_enabled=request.prompt_policy_version == "drama_detail_v1",
         )
+
+        if request.repair_draft_revision or request.repair_once or request.repair_recheck_task_id:
+            from server.services.project.script_plan_repair import execute_reference_repair_plan
+
+            return await execute_reference_repair_plan(
+                request,
+                project_name=project_name,
+                projects=projects,
+                config_resolver=config_resolver,
+                novel=novel_text,
+                prompt_inputs=prompt_inputs,
+                basis=script_plan_basis,
+                caps=split_caps,
+                initial_prompt=prompt,
+                before_commit=before_commit,
+            )
 
         if request.dry_run:
             return TextGenerationResult(
@@ -1899,9 +1996,19 @@ async def generate_reference_script_plan(
             ),
             project_name=project_name,
         )
-        flat = await asyncio.to_thread(
-            _parse_reference_script_plan_json, result.text, schema, split_caps.durations, novel_text
-        )
+        try:
+            flat = await asyncio.to_thread(
+                parse_reference_script_plan_candidate, result.text, schema, split_caps.durations, novel_text
+            )
+        except ScriptPlanParseError as exc:
+            async with draft_locks.async_file_lock(draft_path):
+                report = await run_sync_transaction(
+                    _after_draft_revision_check, draft_path, draft_baseline,
+                    _quarantine_invalid_script_plan_generation, project_path, episode, QUARANTINE_KIND_SCRIPT_PLAN,
+                    exc.content, exc.violations, request.source, formal_baseline,
+                    prompt_policy_version=request.prompt_policy_version, raw_response=result.text,
+                )
+            raise TextGenerationError(report) from exc
         flat_units = flat.get("units")
         if not isinstance(flat_units, list) or not flat_units:
             raise ValueError("script_plan 拆分内容结构异常：units 必须是非空的 unit 对象数组")
@@ -1917,6 +2024,7 @@ async def generate_reference_script_plan(
             caps=split_caps,
             source_language=project.get("source_language"),
             new_assets=new_assets,
+            prompt_policy_version=request.prompt_policy_version,
         )
         unit_texts = [flat_unit["text"] for flat_unit in flat_units]
         soft_violations = _reference_soft_violation_lines(
@@ -1936,6 +2044,7 @@ async def generate_reference_script_plan(
                     violations,
                     request.source,
                     formal_baseline,
+                    prompt_policy_version=request.prompt_policy_version,
                 )
             # 产出即违约这条路同样带上软违约段：草稿在场、Agent 这一轮就在改它，降级提示留到晋升
             # 那一刻才第一次出现的话，它已经按不完整的信息改过一遍了。处置说明与晋升被挡下时同口径。
@@ -1967,7 +2076,9 @@ async def generate_reference_script_plan(
                     _commit_generated_reference_script_plan,
                     project_path,
                     episode,
-                    with_new_assets({"units": raw_units}, new_assets),
+                    with_new_assets({"units": raw_units, **(
+                        {"prompt_policy_version": request.prompt_policy_version} if request.prompt_policy_version else {}
+                    )}, new_assets),
                     formal_baseline,
                     script_plan_basis,
                     before_commit,

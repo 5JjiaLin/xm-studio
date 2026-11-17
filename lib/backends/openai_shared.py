@@ -26,9 +26,10 @@ logger = logging.getLogger(__name__)
 OPENAI_RETRYABLE_ERRORS: tuple[type[Exception], ...] = ()
 
 # 长思考文本请求允许连续 30 分钟无数据；连接建立仍需在 30 秒内完成。
+# 匹配到的长思考模型强制使用流式响应，以便思考期间的内容/心跳经过中间代理并刷新空闲计时。
 # 这是本机读取等待，不能覆盖供应商/代理自身的超时。
 OPENAI_TEXT_TIMEOUT = httpx.Timeout(1800.0, connect=30.0)
-LONG_THINKING_TEXT_MODELS = frozenset({"gpt-6-astra"})
+LONG_THINKING_TEXT_MODELS = frozenset({"gpt-6-astra", "gpt-6.1-sol"})
 
 OPENAI_IMAGE_QUALITY_MAP: dict[str, str] = {
     "512px": "low",

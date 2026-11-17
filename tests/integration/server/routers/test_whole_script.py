@@ -16,6 +16,7 @@ from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from server.routers import production
 from server.services.project.production import ProductionService
+from tests.fakes import use_production_generation_queue
 
 TEXT = "第一集 开始\n甲说：你好。🙂\n第二集 继续\n甲换上盔甲。"
 BASE = "/api/v1/projects/demo/production"
@@ -27,7 +28,7 @@ def whole_client(tmp_path, monkeypatch):
     pm.create_project("demo", content_mode="drama")
     pm.create_project_metadata("demo", content_mode="drama")
     queue = SimpleNamespace(list_tasks=AsyncMock(return_value={"items": []}))
-    monkeypatch.setattr(production, "get_generation_queue", lambda: queue)
+    use_production_generation_queue(monkeypatch, queue)
     app = FastAPI()
     app.state.production_service = ProductionService(pm, SimpleNamespace(queue=queue))
     app.dependency_overrides[get_current_user] = lambda: CurrentUserInfo(id="u1", sub="test")

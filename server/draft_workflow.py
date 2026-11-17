@@ -59,6 +59,7 @@ from lib.speech.speech_composition import admit_script_unit
 from server.text_generation import (
     SOFT_VIOLATION_NOTE_QUARANTINED,
     ReferenceSplitCaps,
+    ScriptPlanParseError,
     SoftViolation,
     build_reference_units_from_flat,
     collect_drama_violations,
@@ -73,6 +74,7 @@ from server.text_generation import (
     load_script_plan_source_with_basis,
     narration_script_plan_path,
     narration_script_plan_result_text,
+    parse_reference_script_plan_candidate,
     plan_item_ids,
     reference_result_text,
     reference_soft_violations,
@@ -272,29 +274,23 @@ async def revalidate_reference_script_plan_draft(
     #
     # 外层形状（units 缺失 / 不是数组 / 空数组）与逐 unit 的字段违约走同一条报告路径：两者都是
     # Agent 编辑草稿时会犯的错，只有后者刷新报告的话，前者就把它甩出了「改完再晋升」的循环。
-    raw_units = draft.content.get("units")
-    schema = build_reference_units_script_plan_model(split_caps.durations)
     violations: list[DraftViolation] = []
     flat_units: list[dict[str, Any]] = []
     new_assets: list[dict[str, Any]] = []
-    if not isinstance(raw_units, list) or not raw_units:
-        logger.debug("草稿 content.units 形状非法: %s", type(raw_units).__name__)
-        violations = [
-            DraftViolation(
-                "草稿的 content.units 必须是非空的 unit 对象数组",
-                code="schema_invalid",
-            )
-        ]
+    try:
+        flat = parse_reference_script_plan_candidate(
+            (draft.content["raw_response"] if isinstance(draft.content.get("raw_response"), str) and "units" not in draft.content else json.dumps({"units": draft.content.get("units"), NEW_ASSETS_FIELD: draft.content.get(NEW_ASSETS_FIELD, [])}, ensure_ascii=False)),
+            build_reference_units_script_plan_model(split_caps.durations, use_source_spans=True),
+            split_caps.durations, novel_text,
+            manual=draft.meta.get("generated_content_fingerprint") != script_review.content_fingerprint_of_data(draft.content),
+        )
+        if not flat.get("units"):
+            raise ScriptPlanParseError("units 为空", draft.content, [DraftViolation("content.units 必须是非空数组", code="schema_invalid")])
+    except ScriptPlanParseError as exc:
+        violations = exc.violations
     else:
-        try:
-            flat = schema.model_validate(
-                {"units": raw_units, NEW_ASSETS_FIELD: draft.content.get(NEW_ASSETS_FIELD, [])}
-            ).model_dump()
-        except ValidationError as exc:
-            violations = schema_violations(exc, draft.content, "units")
-        else:
-            flat_units = flat["units"]
-            new_assets = dedupe_new_assets(flat[NEW_ASSETS_FIELD])
+        flat_units = flat["units"]
+        new_assets = dedupe_new_assets(flat[NEW_ASSETS_FIELD])
     if violations:
         return ReferenceDraftRevalidation(
             violations, [], split_caps, schema_failed=True, basis=script_plan_basis, soft_violations=[], new_assets=[]
@@ -311,6 +307,7 @@ async def revalidate_reference_script_plan_draft(
         caps=split_caps,
         source_language=source_language,
         new_assets=new_assets,
+        prompt_policy_version=draft.meta.get("prompt_policy_version"),
     )
     # 软违约与硬违约在同一次重判里一并产出：有硬违约时也要算，晋升被挡下时的报告同样带着它们，
     # 否则 Agent 修草稿的每一轮都看不见降级提示，直到最后一轮晋升成功才第一次读到。
@@ -512,7 +509,10 @@ async def _promote_reference_script_plan(
             _commit_reference_script_plan,
             project_path,
             episode,
-            with_new_assets({"units": units}, revalidation.new_assets),
+            with_new_assets({"units": units, **(
+                {"prompt_policy_version": draft.meta["prompt_policy_version"]}
+                if draft.meta.get("prompt_policy_version") else {}
+            )}, revalidation.new_assets),
             expected,
             revalidation.basis,
             before_commit,
@@ -1460,7 +1460,8 @@ class DraftWorkflow:
                     )
                 else:
                     # 提示词编写只读正式剧本：脚本规划重跑后尚未确认不阻塞晋升，与编写入口同口径。
-                    generator = await ScriptGenerator.create(
+                    generator = await asyncio.to_thread(
+                        ScriptGenerator,
                         project_path,
                         config_resolver=self.ctx.config_resolver,
                     )
@@ -1478,6 +1479,8 @@ class DraftWorkflow:
             except (DraftWorkflowError, ModelNotInCatalogError):
                 # ModelNotInCatalogError 原样上抛：调用方据此给出「重新选择模型」指引
                 raise
+            except VideoRequestFactsError as exc:
+                raise DraftWorkflowError.video_facts(exc.failure) from exc
             except ScriptWriteConflict as exc:
                 raise DraftWorkflowError(
                     "formal_revision_conflict", _render_prompt_authoring_conflict_report(episode, draft, exc)

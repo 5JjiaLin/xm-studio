@@ -90,6 +90,11 @@ def _client(
     return TestClient(app), pm
 
 
+def _confirm_review(client, base, **body):
+    fingerprint = client.get(base).json().get("fingerprint")
+    return client.post(f"{base}/confirm", json={"plan_fingerprint": fingerprint, **body})
+
+
 def _register_script_plan(pm: ProjectManager) -> None:
     """确认转换读的是已登记的正式脚本规划：补上源文并激活产物清单。"""
     from lib.artifacts.artifact_activation import activate_artifact_target_state
@@ -149,7 +154,7 @@ class TestScriptReviewRouter:
             )
 
             # 确认 → confirmed，prompt_authoring 放行
-            confirmed = client.post(f"{base}/confirm")
+            confirmed = _confirm_review(client, base)
             assert confirmed.status_code == 200
             assert confirmed.json()["status"] == "confirmed"
             # 正式脚本由确认直接转出：状态只描述内容确认，确认之外没有预演或转换入口。
@@ -165,7 +170,7 @@ class TestScriptReviewRouter:
         with client:
             base = "/api/v1/projects/demo/episodes/1/script-review"
             _write_script_plan(pm, _admitted_drama_script_plan())
-            confirmed = client.post(f"{base}/confirm")
+            confirmed = _confirm_review(client, base)
             assert confirmed.status_code == 200, confirmed.text
             plan_path = pm.get_project_path("demo") / "drafts" / "episode_1" / "script_plan_normalized_script.json"
             before = plan_path.read_bytes()
@@ -187,7 +192,7 @@ class TestScriptReviewRouter:
         with client:
             base = "/api/v1/projects/demo/episodes/1/script-review"
             _write_script_plan(pm, _admitted_drama_script_plan())
-            assert client.post(f"{base}/confirm").status_code == 200
+            assert _confirm_review(client, base).status_code == 200
             script_path = pm.get_project_path("demo") / "scripts" / "episode_1.json"
             produced = json.loads(script_path.read_text(encoding="utf-8"))
             produced["scenes"][0]["end_frame_image"] = "end_frames/scene_E1S01.png"
@@ -235,7 +240,7 @@ class TestScriptReviewRouter:
             assert state["status"] == "pending_review"
             assert state["script_overwrite"] == expected_overwrite
 
-            refused = client.post(f"{base}/confirm")
+            refused = _confirm_review(client, base)
             assert refused.status_code == 409
             assert refused.json()["detail"] == i18n_message("script_review_overwrite_required")
             displayed_overwrite = refused.json()["diagnostic"]["script_overwrite"]
@@ -249,7 +254,7 @@ class TestScriptReviewRouter:
             assert client.get(base).json()["status"] == "pending_review"
 
             assert client.post(f"{base}/confirm", json={"unexpected": True}).status_code == 422
-            confirmed = client.post(f"{base}/confirm", json={"overwrite_revision": expected_overwrite["revision"]})
+            confirmed = _confirm_review(client, base, overwrite_revision=expected_overwrite["revision"])
             assert confirmed.status_code == 200, confirmed.text
             assert confirmed.json()["status"] == "confirmed"
             assert pm.load_script("demo", "episode_1.json")["scenes"][0]["pending_authoring"] is True
@@ -264,7 +269,7 @@ class TestScriptReviewRouter:
             base = "/api/v1/projects/demo/episodes/1/script-review"
             _write_script_plan(pm, _admitted_drama_script_plan())
 
-            refused = client.post(f"{base}/confirm")
+            refused = _confirm_review(client, base)
 
             assert refused.status_code == 422
             assert refused.json()["detail"] == i18n_message("video_capability_unavailable", capability="i2v")
@@ -276,7 +281,7 @@ class TestScriptReviewRouter:
         with client:
             base = "/api/v1/projects/demo/episodes/1/script-review"
             _write_script_plan(pm, _drama_script_plan())
-            client.post(f"{base}/confirm")
+            _confirm_review(client, base)
 
             edited = _drama_script_plan()
             edited["scenes"][0]["scene_description"] = "雨势渐急，阿离仍站在屋檐下"
@@ -332,7 +337,7 @@ class TestScriptReviewRouter:
         client, _ = _client(monkeypatch, tmp_path)
         with client:
             base = "/api/v1/projects/demo/episodes/1/script-review"
-            confirmed = client.post(f"{base}/confirm")
+            confirmed = _confirm_review(client, base)
             assert confirmed.status_code == 409
 
     def test_get_unregistered_episode_404(self, tmp_path, monkeypatch):
@@ -372,7 +377,7 @@ class TestReferenceVideoRouter:
             assert put.status_code == 200
             assert put.json()["status"] == "pending_review"
 
-            confirmed = client.post(f"{base}/confirm")
+            confirmed = _confirm_review(client, base)
             assert confirmed.status_code == 200
             assert confirmed.json()["status"] == "confirmed"
             assert script_review.review_status(pm.get_project_path("demo"), pm.load_project("demo"), 1) == "confirmed"
@@ -402,7 +407,7 @@ class TestReferenceVideoRouter:
                 edited = _rv_script_plan()
                 edited["units"][0]["text"] = "@[阿离] 转身离去。"
                 assert client.put(f"{base}/content", json=edited).status_code == 200
-                assert client.post(f"{base}/confirm").status_code == 200
+                assert _confirm_review(client, base).status_code == 200
         finally:
             unregister_hint()
             unregister_batch()
@@ -446,7 +451,7 @@ class TestReferenceVideoRouter:
             assert violations[0]["message"] != "stale"
 
             # 草稿在场时确认被拒：正式 script_plan 还没有一份可放行的内容。
-            confirmed = client.post(f"{base}/confirm")
+            confirmed = _confirm_review(client, base)
             assert confirmed.status_code == 409
 
     def test_quarantine_schema_invalid_keeps_raw_content(self, tmp_path, monkeypatch, video_request_facts):
@@ -542,7 +547,7 @@ class TestReferenceVideoRouter:
             assert violations[0]["label"] == "segment E1S01"
             assert body["quarantine"]["content"]["segments"][0]["segment_id"] == "E1S01"
 
-            assert client.post(f"{base}/confirm").status_code == 409
+            assert _confirm_review(client, base).status_code == 409
 
     def test_quarantine_surfaced_for_drama_variant(self, tmp_path, monkeypatch, video_request_facts):
         """drama 的待修复草稿（取回编辑工位）同样进 GET 响应：内容重判通过则违约为空、
@@ -582,7 +587,7 @@ class TestReferenceVideoRouter:
             assert body["quarantine"]["violations"] == []
             assert body["quarantine"]["content"]["scenes"][0]["scene_id"] == "E1S01"
 
-            assert client.post(f"{base}/confirm").status_code == 409
+            assert _confirm_review(client, base).status_code == 409
 
     def test_supported_durations_exposed_for_reference_video_only(self, tmp_path, monkeypatch, video_request_facts):
         """rv 变体的 GET 带出档位表供 web 渲染时长选择；drama 变体下为 None。"""
@@ -628,7 +633,7 @@ class TestReferenceVideoRouter:
             assert quarantine["content"] is None
             assert [v["code"] for v in quarantine["violations"]] == ["quarantine_unreadable"]
 
-            confirmed = client.post(f"{base}/confirm")
+            confirmed = _confirm_review(client, base)
             assert confirmed.status_code == 409
 
     def test_quarantine_cleared_between_existence_check_and_read_is_not_reported_as_corrupted(
@@ -735,7 +740,7 @@ class TestReferenceVideoRouter:
             put_body = client.put(f"{base}/content", json=_rv_script_plan()).json()
             assert "duration_tiers" in put_body
 
-            confirm_body = client.post(f"{base}/confirm").json()
+            confirm_body = _confirm_review(client, base).json()
             assert "duration_tiers" in confirm_body
 
     def test_duration_tiers_and_supported_durations_resolved_for_custom_provider(
@@ -876,3 +881,30 @@ class TestReferenceVideoRouter:
             resp = client.put(f"{base}/content", params={"base_fingerprint": fresh}, json=mine)
             assert resp.status_code == 200
             assert resp.json()["content"]["units"][0]["text"] == "@[阿离] 立于屋檐下。"
+
+
+def test_confirmation_rejects_missing_or_stale_review_and_revision_reuses_candidate(monkeypatch, tmp_path, video_request_facts):
+    client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
+    path = pm.get_project_path("demo") / "drafts/episode_1/script_plan_reference_units.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, _rv_script_plan())
+    _register_script_plan(pm)
+    base = "/api/v1/projects/demo/episodes/1/script-review"
+    with client:
+        reviewed = client.get(base).json()["fingerprint"]
+        before = pm.load_project("demo")
+        assert client.post(f"{base}/confirm").status_code == 409
+        changed = _rv_script_plan()
+        changed["units"][0]["text"] = "@[阿离] 转身。"
+        assert client.put(f"{base}/content", params={"base_fingerprint": reviewed}, json=changed).status_code == 200
+        assert client.post(f"{base}/confirm", json={"plan_fingerprint": reviewed}).status_code == 409
+        assert pm.load_project("demo") == before
+        assert not (pm.get_project_path("demo") / "scripts/episode_1.json").exists()
+        confirmed = _confirm_review(client, base)
+        assert confirmed.status_code == 200, confirmed.text
+        fingerprint = confirmed.json()["fingerprint"]
+        formal = (pm.get_project_path("demo") / "scripts/episode_1.json").read_bytes()
+        revision = client.post(f"{base}/revise", json={"plan_fingerprint": fingerprint})
+        assert revision.status_code == 200, revision.text
+        assert revision.json()["quarantine"]["content"]["units"][0]["text"] == changed["units"][0]["text"]
+        assert (pm.get_project_path("demo") / "scripts/episode_1.json").read_bytes() == formal

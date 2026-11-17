@@ -612,15 +612,15 @@ class ReferenceUnitRequestProjector:
     ) -> ReferenceUnitRequestProjection:
         """投影调用瞬间状态；``script`` 显式入参锁定公共缝的完整上下文契约。"""
 
-        del script
         # 资产可用性要读产物清单、对设计图算摘要，整段水合放进工作线程。
         hydration = await asyncio.to_thread(hydrate_unit_references, project, unit, resolved_assets, self._assets)
-        return await self.project_hydrated(project=project, unit=unit, hydration=hydration, options=options)
+        return await self.project_hydrated(project=project, script=script, unit=unit, hydration=hydration, options=options)
 
     async def project_hydrated(
         self,
         *,
         project: dict,
+        script: dict,
         unit: dict,
         hydration: ReferenceUnitHydration,
         options: ReferenceRequestOptions | None = None,
@@ -764,6 +764,24 @@ class ReferenceUnitRequestProjector:
                 locations=(("video_units", str(unit.get("unit_id") or ""), issue.source),),
             )
             for issue in temporal_issues
+        )
+        # Use the effective creative text, including manual overrides. This is
+        # read-only: changing one tail never silently rewrites its neighbour.
+        from lib.script.reference_video.prompt_policy_validation import validate_policy_handoffs
+
+        context = [
+            {**item, "text": str(item.get("generation_prompt") or item.get("text") or "")}
+            for item in script.get("video_units", []) if isinstance(item, dict)
+        ]
+        effective_unit = {**unit, "text": str(unit.get("generation_prompt") or unit.get("text") or "")}
+        problems.extend(
+            ProjectionProblem(
+                code=issue.code, blocking=True, action="fix_input",
+                params=(("detail", str(issue)),),
+                locations=(("video_units", str(unit.get("unit_id") or ""),
+                            "generation_prompt" if unit.get("generation_prompt") else "text"),),
+            )
+            for issue in validate_policy_handoffs([effective_unit], context)
         )
 
         return ReferenceUnitRequestProjection(

@@ -50,7 +50,7 @@ TEXT_TASK_TYPES = frozenset(
     }
 )
 
-UNIT_TASK_TYPES = frozenset({"storyboard", "grid", "tts", "video", "reference_video"})
+UNIT_TASK_TYPES = frozenset({"storyboard", "grid", "tts", "video", "reference_video", "music"})
 
 #: 本地渲染车道的任务（``server/services/tasks/render_tasks.py``）。
 RENDER_TASK_TYPES = frozenset({"render_final_cut", "render_jianying_draft"})

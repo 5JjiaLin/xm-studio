@@ -151,6 +151,24 @@ async def test_mechanical_timeline_renders_to_a_current_final_cut_with_aligned_s
 
 
 @pytest.mark.usefixtures("media")
+async def test_failed_acceptance_preserves_previous_final_cut(render_project: ProjectManager, monkeypatch) -> None:
+    timeline_id = await _create_timeline(render_project)
+    renderer = FinalCutService(render_project)
+    previous = await renderer.render("demo", timeline_id, **PLAIN)
+    output = render_project.get_project_path("demo") / previous.artifact_path
+    original = output.read_bytes()
+
+    async def reject(*args, **kwargs):
+        raise FinalCutError("final_cut_acceptance_failed", "test rejection")
+
+    monkeypatch.setattr("lib.final_cut.service.accept_final_cut", reject)
+    with pytest.raises(FinalCutError, match="test rejection"):
+        await renderer.render("demo", timeline_id, **PLAIN)
+    assert output.read_bytes() == original
+    assert _status(render_project, timeline_id, previous.artifact_path) is ArtifactStatus.CURRENT
+
+
+@pytest.mark.usefixtures("media")
 async def test_trim_and_hold_shape_the_rendered_duration(render_project: ProjectManager) -> None:
     timeline_id = await _create_timeline(render_project)
     _append_revision(

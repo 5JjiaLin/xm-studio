@@ -5,10 +5,29 @@ from copy import deepcopy
 import pytest
 
 from lib.script.reference_video.prompt_render import render_video_unit_prompt, temporal_unit_issues
-from lib.script.reference_video.temporal_validation import has_timeline, validate_timeline
+from lib.script.reference_video.temporal_validation import (
+    has_timeline,
+    normalize_model_timeline_newlines,
+    validate_effective_timeline,
+    validate_timeline,
+)
 from lib.script.reference_video.voice_settings import VoiceRenderSettings
 from lib.script.script_editor import ScriptEditError, patch_field
 from lib.script.script_models import ReferenceVideoUnit
+
+
+def test_template_only_mode_disables_timeline_gates_in_authoring_and_submission(monkeypatch):
+    monkeypatch.setenv("ARCREEL_PROMPT_CONTENT_VALIDATION", "false")
+    text = "【0-30s】\n@[甲]等待。"
+    unit = {"unit_id": "1", "text": text, "duration_seconds": 8,
+            "prompt_policy_version": "drama_detail_v1", "generation_prompt": "人工创作段"}
+    assert validate_timeline(text, 8, required=True) == ((), ())
+    assert validate_effective_timeline(unit=unit, project={}, default_creative="原创作段",
+                                       effective_creative="人工创作段", request_duration_seconds=8) == ()
+    assert temporal_unit_issues(
+        unit, {"content_mode": "drama", "generation_mode": "reference_video"},
+        VoiceRenderSettings(), request_references=[], request_duration_seconds=8,
+    ) == ()
 
 
 def test_legacy_prose_is_not_a_timeline_and_upgrade_cannot_remove_all_titles():
@@ -46,6 +65,39 @@ def test_exact_decimal_ranges_and_multilingual_dialogue():
     segments, issues = validate_timeline(text, 8, language="en")
     assert len(segments) == 2
     assert not issues
+
+
+def test_recovers_bare_n_structural_separators_without_changing_dialogue():
+    text = (
+        "【本组设定】n总时长：8 秒。Tonight 保留原样。n"
+        "【分段时间轴】n【0-3s】n中景，@[甲]转身。"
+        "n【3-8s】n@[甲]{Tonight, stay here.}"
+    )
+
+    normalized = normalize_model_timeline_newlines(text)
+
+    assert "Tonight 保留原样" in normalized
+    assert "Tonight, stay here." in normalized
+    assert "【分段时间轴】\n【0-3s】\n中景" in normalized
+    segments, issues = validate_timeline(normalized, 8, required=True, language="en")
+    assert len(segments) == 2
+    assert not issues
+
+
+def test_does_not_normalize_mixed_or_legacy_text():
+    mixed = "【分段时间轴】\n【0-8s】\n等待。n【组尾交接】"
+    legacy = "Tonight, the knight waits."
+    assert normalize_model_timeline_newlines(mixed) == mixed
+    assert normalize_model_timeline_newlines(legacy) == legacy
+
+
+def test_normalization_does_not_edit_titles_inside_speech_or_hide_invalid_ranges():
+    speech = "@[甲]{n【0-8s】n}"
+    text = "【分段时间轴】n【1-8s】n" + speech
+    normalized = normalize_model_timeline_newlines(text)
+    assert speech in normalized
+    _, issues = validate_timeline(normalized, 8, required=True)
+    assert "timeline_gap_or_overlap" in {issue.code for issue in issues}
 
 
 def test_segment_overload_even_when_whole_unit_has_room():

@@ -5,24 +5,33 @@ import { useTaskRefresh } from "@/hooks/useTaskRefresh";
 import { useTasksStore } from "@/stores/tasks-store";
 import type { ReferenceVideoUnit } from "@/types/reference-video";
 import type { ProductionState } from "@/types/production";
-import type { ScriptReviewState } from "@/types";
+import type { EpisodeScript, ProjectData, ScriptReviewState } from "@/types";
 import type { WorkflowStatus } from "@/types/workflow";
 import { errMsg } from "@/utils/async";
+import i18n from "@/i18n";
 
-/** Single project stream; refreshes content without platform navigation or Agent sessions. */
+interface ProductionSnapshot {
+  projectName: string;
+  requestedEpisode: number | null;
+  revision: number;
+  project: ProjectData;
+  scripts: Record<string, EpisodeScript>;
+  episode: number | null;
+  production: ProductionState | null;
+  review: ScriptReviewState | null;
+  workflow: WorkflowStatus | null;
+  units: ReferenceVideoUnit[];
+  source: string;
+}
+
+/** One scoped read, committed together; polling never replaces the user's edit buffers. */
 export function useProductionProject(projectName: string | null, requestedEpisode: number | null = null) {
-  const project = useProjectsStore((s) => s.currentProjectData);
-  const scripts = useProjectsStore((s) => s.currentScripts);
-  const [episode, setEpisode] = useState<number | null>(null);
-  const [production, setProduction] = useState<ProductionState | null>(null);
-  const [review, setReview] = useState<ScriptReviewState | null>(null);
+  const storeName = useProjectsStore((s) => s.currentProjectName);
+  const storeRevision = useProjectsStore((s) => projectName ? s.projectSnapshotRevisions[projectName] : undefined);
+  const [snapshot, setSnapshot] = useState<ProductionSnapshot | null>(null);
+  const [failure, setFailure] = useState<{ projectName: string; requestedEpisode: number | null; message: string } | null>(null);
   const refreshRef = useRef<() => void>(() => {});
   const reload = useCallback(() => refreshRef.current(), []);
-  const [workflow, setWorkflow] = useState<WorkflowStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(!!projectName);
-  const [units, setUnits] = useState<ReferenceVideoUnit[]>([]);
-  const [source, setSource] = useState("");
   useTaskRefresh(projectName, !!projectName);
   useEffect(() => {
     const controller = new AbortController();
@@ -31,62 +40,111 @@ export function useProductionProject(projectName: string | null, requestedEpisod
     if (!projectName) return () => controller.abort();
     let running = false;
     let again = false;
+    let changes = 0;
+    const isCurrent = () => !controller.signal.aborted && useProjectsStore.getState().currentProjectName === projectName;
     const refresh = async () => {
+      if (!isCurrent()) return;
       if (running) { again = true; return; }
       running = true;
-      do {
-        again = false;
-        try {
-          const result = await store.refreshProject(projectName, { onError: (e) => { if (!controller.signal.aborted) setError(errMsg(e)); } });
-          if (result !== "success" || controller.signal.aborted) { running = false; return; }
-          const current = useProjectsStore.getState().currentProjectData;
-          const episodes = current?.episodes ?? [];
-          // Legacy links resolve only when there is exactly one episode. Never guess.
-          const selected = requestedEpisode ?? (episodes.length === 1 ? episodes[0].episode : null);
-          const entry = episodes.find((item) => item.episode === selected);
-          if (!entry || current?.production_management?.archived || current?.production_management?.archived_episodes?.includes(entry.episode)) {
-            setEpisode(null); setLoading(false); running = false; return;
+      try {
+        do {
+          again = false;
+          try {
+            const changeBasis = changes;
+            const result = await store.refreshProject(projectName, { onError: (cause) => {
+              if (isCurrent()) setFailure({ projectName, requestedEpisode, message: errMsg(cause) });
+            } });
+            if (result !== "success" || !isCurrent()) return;
+            const basis = useProjectsStore.getState();
+            const current = basis.currentProjectData;
+            if (!current) return;
+            const revision = basis.projectSnapshotRevisions[projectName];
+            const episodes = current.episodes ?? [];
+            // Legacy links resolve only when there is exactly one episode. Never guess.
+            const selected = requestedEpisode ?? (episodes.length === 1 ? episodes[0].episode : null);
+            const entry = episodes.find((item) => item.episode === selected);
+            let episode: number | null = null;
+            let workflow: WorkflowStatus | null = null;
+            let production: ProductionState | null = null;
+            let review: ScriptReviewState | null = null;
+            let units: ReferenceVideoUnit[] = [];
+            let source = "";
+            if (entry && !current.production_management?.archived && !current.production_management?.archived_episodes?.includes(entry.episode)) {
+              episode = entry.episode;
+              workflow = await API.getWorkflowStatus(projectName, { signal: controller.signal, episode });
+              if (!isCurrent()) return;
+              const path = workflow.content?.episode_source === "absent" ? null : workflow.target?.source;
+              const [progress, content, unitData, text] = await Promise.all([
+                API.getProduction(projectName, episode, { signal: controller.signal }),
+                API.getScriptReview(projectName, episode, { signal: controller.signal }),
+                workflow.content?.formal_script === "present" && current.generation_mode === "reference_video"
+                  ? API.listReferenceVideoUnits(projectName, episode, { signal: controller.signal })
+                  : Promise.resolve({ units: [] }),
+                path ? API.getSourceContent(projectName, path.replace(/^source\//, ""), { signal: controller.signal }) : Promise.resolve(""),
+              ]);
+              if (!isCurrent()) return;
+              production = progress; review = content; units = unitData.units; source = text;
+            }
+            if (!isCurrent()) return;
+            // A refresh or event during these reads invalidates the entire combination.
+            if (revision !== useProjectsStore.getState().projectSnapshotRevisions[projectName] || changeBasis !== changes) {
+              again = true;
+              continue;
+            }
+            setSnapshot({ projectName, requestedEpisode, revision, project: current, scripts: basis.currentScripts, episode, workflow, production, review, units, source });
+            setFailure(null);
+          } catch (cause) {
+            if (isCurrent()) setFailure({ projectName, requestedEpisode, message: errMsg(cause) });
           }
-          const episode = entry.episode;
-          setEpisode(episode);
-          const status = await API.getWorkflowStatus(projectName, { signal: controller.signal, episode });
-          if (controller.signal.aborted) { running = false; return; }
-          setWorkflow(status); setError(null);
-          if (episode) {
-            const [progress, content] = await Promise.all([API.getProduction(projectName, episode, { signal: controller.signal }), API.getScriptReview(projectName, episode, { signal: controller.signal })]);
-            if (controller.signal.aborted) { running = false; return; }
-            setProduction(progress); setReview(content);
-          }
-          if (episode && status.content?.formal_script === "present" && useProjectsStore.getState().currentProjectData?.generation_mode === "reference_video") {
-            const data = await API.listReferenceVideoUnits(projectName, episode, { signal: controller.signal });
-            if (!controller.signal.aborted) setUnits(data.units);
-          } else setUnits([]);
-          const path = status.content?.episode_source === "absent" ? null : status.target?.source;
-          if (path) {
-            const text = await API.getSourceContent(projectName, path.replace(/^source\//, ""), { signal: controller.signal });
-            if (!controller.signal.aborted) setSource(text);
-          } else setSource("");
-        } catch (e) {
-          if (!controller.signal.aborted) setError(errMsg(e));
-        } finally {
-          if (!controller.signal.aborted) setLoading(false);
-        }
-      } while (again && !controller.signal.aborted);
-      running = false;
+        } while (again && isCurrent());
+      } finally {
+        running = false;
+      }
     };
-    refreshRef.current = () => { void refresh(); };
-    void refresh();
+    const requestRefresh = () => { void refresh(); };
+    refreshRef.current = requestRefresh;
+    requestRefresh();
     const stream = API.openProjectEventStream({
       projectName,
-      onSnapshot: () => { void refresh(); },
+      onSnapshot: () => { if (isCurrent()) { changes += 1; requestRefresh(); } },
       onChanges: () => {
-        void refresh();
+        if (!isCurrent()) return;
+        changes += 1;
+        requestRefresh();
         void useTasksStore.getState().refreshTasks();
       },
-      onProjectDeleted: () => { controller.abort(); store.setCurrentProject(null, null); setError("Project deleted"); setLoading(false); },
+      onProjectDeleted: () => {
+        if (!isCurrent()) return;
+        controller.abort();
+        stream.close();
+        clearInterval(timer);
+        refreshRef.current = () => {};
+        store.setCurrentProject(null, null);
+        setFailure({ projectName, requestedEpisode, message: i18n.t("dashboard:production_project_deleted") });
+      },
     });
-    const timer = setInterval(() => { void refresh(); }, 3000);
-    return () => { clearInterval(timer); controller.abort(); stream.close(); store.setCurrentProject(null, null); };
+    const timer = setInterval(requestRefresh, 3000);
+    return () => {
+      clearInterval(timer); controller.abort(); stream.close();
+      if (refreshRef.current === requestRefresh) refreshRef.current = () => {};
+      if (useProjectsStore.getState().currentProjectName === projectName) store.setCurrentProject(null, null);
+    };
   }, [projectName, requestedEpisode]);
-  return { episode, project: useProjectsStore.getState().currentProjectName === projectName ? project : null, scripts, units, source, workflow, production, review, refresh: reload, loading, error };
+  // Scope is checked during render, before the effect cancels the previous requests.
+  const visible = storeName === projectName && snapshot?.projectName === projectName && snapshot.requestedEpisode === requestedEpisode ? snapshot : null;
+  const error = failure?.projectName === projectName && failure.requestedEpisode === requestedEpisode ? failure.message : null;
+  return {
+    episode: visible?.episode ?? null,
+    project: visible?.project ?? null,
+    scripts: visible?.scripts ?? {},
+    units: visible?.units ?? [],
+    source: visible?.source ?? "",
+    workflow: visible?.workflow ?? null,
+    production: visible?.production ?? null,
+    review: visible?.review ?? null,
+    refresh: reload,
+    loading: !!projectName && !visible && !error,
+    refreshing: !!visible && (visible.revision !== storeRevision || error !== null),
+    error,
+  };
 }

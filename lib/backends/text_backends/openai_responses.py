@@ -102,7 +102,7 @@ class OpenAIResponsesTextBackend:
             logger.warning("原生 text.format 被拒收 (%s)，降级到 prompt 注入路径", exc)
             return await self._prompt_json_fallback(request)
 
-        if structured:
+        if structured and not request.preserve_raw_response:
             # 原生请求不声明 strict（见 _generate_once），复验同样用 strict=False，容忍可强转值。
             fallback_reason = structured_fallback_reason(native.text, request.response_schema, strict=False)
             if fallback_reason:

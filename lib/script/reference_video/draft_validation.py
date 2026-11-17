@@ -32,6 +32,7 @@ from lib.script.draft_violation import (
     render_violation_report,
     violation_items,
 )
+from lib.script.prompt_policy import prompt_content_validation_enabled
 from lib.script.reference_video.text_parser import (
     SpeechMark,
     derive_references_from_text,
@@ -78,6 +79,8 @@ def validate_source_text_anchor(label: str, source_text: str, novel_text: str) -
     层的根本违约，比任何下游画面问题都更早需要被拦下。只判子串、不判顺序与完整覆盖：unit
     是画面单元不是朗读单元，允许原文中的对话提示语、转述段落不进任何 unit 的锚。
     """
+    if not prompt_content_validation_enabled():
+        return
     anchor = _normalize_for_anchor(source_text)
     if not anchor:
         raise DraftViolation(
@@ -101,6 +104,8 @@ def out_of_order_source_anchor_indices(source_texts: Sequence[str], novel_text: 
     sentence, and multiple shots may share one source passage. The check only rejects a
     provable reversal in the narrative order.
     """
+    if not prompt_content_validation_enabled():
+        return []
     source = _normalize_for_anchor(novel_text)
     previous_start = 0
     out_of_order: list[int] = []
@@ -229,6 +234,7 @@ def validate_unit_text(
     unit_id: str | None = None,
     max_refs: int | None,
     tolerated_speakers: Collection[str] = (),
+    check_mention_syntax: bool = False,
 ) -> list[ReferenceResource]:
     """校验一个 unit 的正文并机械派生参考图引用。
 
@@ -245,10 +251,25 @@ def validate_unit_text(
     # 已登记名字一律取自引用目录：目录的名字已在比对坐标系中，正文一侧由解析器入口归一，
     # 两侧同形才判得准。
     catalog = build_reference_catalog(project)
-    _assert_line_syntax(label, text, catalog.reference_names("character"))
+    if prompt_content_validation_enabled():
+        _assert_line_syntax(label, text, catalog.reference_names("character"))
+
+    # 引用语法关乎参考图绑定，内容质量校验关闭时仍需明确指出错误。
+    if check_mention_syntax and not prompt_content_validation_enabled():
+        for line_index, line in enumerate(text.splitlines()):
+            description = speech_line_description(split_speech_line(line))
+            # A missing ] can make the legacy scanner consume the next valid mention.
+            # Locate the malformed opener itself before asking that scanner.
+            wrong_closer = re.search(r"(?<![A-Za-z0-9_])@\[[^\[\]<>@{}\n]+>", description)
+            malformed = wrong_closer.group(0) if wrong_closer else find_malformed_mention(description)
+            if malformed is not None:
+                raise DraftViolation(
+                    f"{label} 第 {line_index + 1} 行的资产引用格式错误：{malformed!r}；请使用 @[资产名]",
+                    code="malformed_mention", label=label, line=line_index,
+                )
 
     # 只有台词与画外音的正文没有可生成的画面：整段非空时上面的空正文检查放不住它。
-    if not _has_description_line(text):
+    if prompt_content_validation_enabled() and not _has_description_line(text):
         raise DraftViolation(
             f"{label} 没有画面描述；只有台词与画外音的单元没有可生成的画面",
             code="blank_description",
@@ -347,15 +368,23 @@ def validate_dialogue_load(
     ``speech_rate_override`` 是项目级语速覆盖，None 即回退语言默认——与 prompt 构造侧同源，
     prompt 给的下界与此处判的上界始终是同一把尺。
     """
+    if not prompt_content_validation_enabled():
+        return
     spoken = dialogue_spoken_seconds(text, language, speech_rate_override)
     budget = duration_seconds * (1 + SPEECH_OVERFLOW_TOLERANCE)
     if spoken > budget:
         raise DraftViolation(
             f"{label} 的台词念完约需 {spoken:.1f} 秒，超过该 unit 的 {duration_seconds} 秒"
             f"（宽容 {SPEECH_OVERFLOW_TOLERANCE:.0%} 后上限 {budget:.1f} 秒）；"
-            "请改取更长的时长档、把该 unit 拆开，或精简台词",
+            "请改取更长的时长档或把该 unit 拆开，保留台词原词、说话人与顺序",
             code="dialogue_overload",
             label=label,
+            params={
+                "estimated_spoken_seconds": spoken,
+                "duration_seconds": duration_seconds,
+                "tolerance_ratio": SPEECH_OVERFLOW_TOLERANCE,
+                "allowed_budget_seconds": budget,
+            },
         )
 
 
@@ -366,6 +395,8 @@ def assert_dialogue_preserved(label: str, script_plan_text: str, prompt_authorin
     重排一律响亮失败，不静默接受——台词不配画面时正确的出路是报错回到 script_plan，而不是让 prompt_authoring
     自行把台词改成好配的样子。
     """
+    if not prompt_content_validation_enabled():
+        return
     before = normative_lines(script_plan_text)
     after = normative_lines(prompt_authoring_text)
     if before == after:

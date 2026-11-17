@@ -7,6 +7,7 @@ import pytest
 from lib.infra.json_io import atomic_write_json, load_json
 from lib.jianying_draft import local_delivery as local
 from lib.jianying_draft.archive import portable_name
+from tests.fakes import use_jianying_compatibility_ready, use_jianying_process_state
 
 
 def prepared(tmp_path, monkeypatch):
@@ -22,8 +23,8 @@ def prepared(tmp_path, monkeypatch):
         },
     )
     store = local.LocalDeliveryStore(tmp_path / "data")
-    monkeypatch.setattr(local, "compatibility", lambda _: {"ready": True})
-    monkeypatch.setattr(local, "process_state", lambda: "stopped")
+    use_jianying_compatibility_ready(monkeypatch)
+    use_jianying_process_state(monkeypatch, "stopped")
     store.save_settings(local.LocalSettings(enabled=True, app_path=str(tmp_path), draft_root=str(root)))
     args = {
         "project": "demo",
@@ -77,7 +78,7 @@ def test_registration_preserves_unknown_fields_and_retries_keep_manual_edits(tmp
 def test_does_not_write_when_process_is_running_or_unknown(tmp_path, monkeypatch, state, expected):
     store, record, _, root, index = prepared(tmp_path, monkeypatch)
     before = index.read_bytes()
-    monkeypatch.setattr(local, "process_state", lambda: state)
+    use_jianying_process_state(monkeypatch, state)
     assert store.register(record["delivery_id"])["state"] == expected
     assert index.read_bytes() == before
     assert not (root / record["folder"]).exists()
@@ -120,7 +121,7 @@ def test_external_index_change_is_not_overwritten(tmp_path, monkeypatch):
             atomic_write_json(index, value)
         return "stopped"
 
-    monkeypatch.setattr(local, "process_state", process)
+    use_jianying_process_state(monkeypatch, process)
     with pytest.raises(local.DeliveryError, match="索引已变化"):
         store.register(record["delivery_id"])
     assert load_json(index)["external"] == "keep me"
@@ -188,5 +189,7 @@ def test_mac_tray_after_normal_exit_does_not_block_registration(monkeypatch):
         "/Applications/VideoFusion-macOS.app/Contents/MacOS/VideoFusion-macOS",
         "/Applications/VideoFusion-macOS.app/Contents/Frameworks/VideoFusion-macOS Helper",
     ):
-        monkeypatch.setattr(local.subprocess, "run", lambda *a, current=process, **k: SimpleNamespace(stdout=tray + current))
+        monkeypatch.setattr(
+            local.subprocess, "run", lambda *a, current=process, **k: SimpleNamespace(stdout=tray + current)
+        )
         assert local.process_state() == "running"
