@@ -277,12 +277,33 @@ async def revalidate_reference_script_plan_draft(
     violations: list[DraftViolation] = []
     flat_units: list[dict[str, Any]] = []
     new_assets: list[dict[str, Any]] = []
+    manual = draft.meta.get("generated_content_fingerprint") != script_review.content_fingerprint_of_data(draft.content)
     try:
+        dialogue = None
+        if revision := draft.meta.get("dialogue_source_revision"):
+            from lib.infra.content_digest import prefixed_canonical_json_digest
+            from lib.script.reference_video.dialogue_binding import resolve_dialogue_fragments
+
+            if revision != prefixed_canonical_json_digest(novel_text):
+                raise ScriptPlanParseError("原文版本已变", draft.content, [DraftViolation(
+                    "当前草稿的对白编号来自旧版原文，请重新拆解。", code="source_binding_conflict",
+                )])
+            ids = draft.meta.get("dialogue_fragment_ids")
+            if not isinstance(ids, list) or any(not isinstance(key, str) for key in ids):
+                raise ScriptPlanParseError("对白清单不可读取", draft.content, [DraftViolation(
+                    "当前草稿缺少生成时的对白清单，请重新拆解。", code="dialogue_binding_invalid",
+                )])
+            fragments = resolve_dialogue_fragments(novel_text, ids)
+            if list(fragments) != ids:
+                raise ScriptPlanParseError("对白清单无法定位", draft.content, [DraftViolation(
+                    "草稿的对白清单与当前原文位置不符，请重新拆解。", code="dialogue_binding_invalid",
+                )])
+            dialogue = list(fragments.values())
         flat = parse_reference_script_plan_candidate(
             (draft.content["raw_response"] if isinstance(draft.content.get("raw_response"), str) and "units" not in draft.content else json.dumps({"units": draft.content.get("units"), NEW_ASSETS_FIELD: draft.content.get(NEW_ASSETS_FIELD, [])}, ensure_ascii=False)),
-            build_reference_units_script_plan_model(split_caps.durations, use_source_spans=True),
+            build_reference_units_script_plan_model(split_caps.durations, use_source_spans=True, bind_dialogue=dialogue is not None),
             split_caps.durations, novel_text,
-            manual=draft.meta.get("generated_content_fingerprint") != script_review.content_fingerprint_of_data(draft.content),
+            manual=manual, dialogue=dialogue, project=project,
         )
         if not flat.get("units"):
             raise ScriptPlanParseError("units 为空", draft.content, [DraftViolation("content.units 必须是非空数组", code="schema_invalid")])
@@ -308,6 +329,7 @@ async def revalidate_reference_script_plan_draft(
         source_language=source_language,
         new_assets=new_assets,
         prompt_policy_version=draft.meta.get("prompt_policy_version"),
+        record_manual_dialogue_edits=manual and dialogue is None,
     )
     # 软违约与硬违约在同一次重判里一并产出：有硬违约时也要算，晋升被挡下时的报告同样带着它们，
     # 否则 Agent 修草稿的每一轮都看不见降级提示，直到最后一轮晋升成功才第一次读到。
@@ -470,6 +492,7 @@ async def _promote_reference_script_plan(
         )
         raise DraftWorkflowError("draft_invalid", report + _soft_violation_section(revalidation), draft_refreshed=True)
     if violations:
+        meta = {key: value for key, value in draft.meta.items() if key not in {"dialogue_source_revision", "dialogue_fragment_ids"}}
         report = await run_sync_transaction(
             _rewrite_invalid_draft,
             project_path,
@@ -477,7 +500,7 @@ async def _promote_reference_script_plan(
             QUARANTINE_KIND_SCRIPT_PLAN,
             revalidation.flat_content(),
             violations,
-            draft.meta,
+            meta,
         )
         raise DraftWorkflowError("draft_invalid", report + _soft_violation_section(revalidation), draft_refreshed=True)
 
@@ -1351,6 +1374,16 @@ class DraftWorkflow:
                 f"draft revision changed: expected {base_revision}, actual {actual_revision}",
             )
         self._reject_confirmed_script_plan_edit(episode, resolved, draft)
+        if resolved == QUARANTINE_KIND_SCRIPT_PLAN:
+            from lib.script.reference_video.dialogue_binding import has_dialogue_bindings, retain_dialogue_sources
+
+            old_units = draft.content.get("units")
+            new_units = content.get("units")
+            if isinstance(old_units, list) and has_dialogue_bindings(old_units):
+                try:
+                    retain_dialogue_sources(old_units, new_units if isinstance(new_units, list) else [])
+                except ValueError as exc:
+                    raise DraftWorkflowError("draft_invalid", str(exc)) from exc
         meta = draft.meta
         if updates_source:
             if resolved == QUARANTINE_KIND_PROMPT_AUTHORING:

@@ -2074,14 +2074,16 @@ class API {
     return API.postFileUpload("/production/source-preview", file);
   }
 
-  static async saveProductionSource(project: string, episode: number, text: string, expectedText: string, file: File | null, confirm = false): Promise<{ applied: boolean; needs_confirmation: boolean }> {
+  static async saveProductionSource(project: string, episode: number, text: string, expectedText: string, file: File | null, confirm = false): Promise<{ applied: boolean; needs_confirmation: boolean; source_revision: string | null }> {
     const url = `/projects/${encodeURIComponent(project)}/episodes/${episode}/production/source`;
     const body = new FormData();
-    body.append("text", text); body.append("expected_text", expectedText); body.append("confirm", String(confirm));
+    body.append("text_file", new Blob([text], { type: "text/plain;charset=utf-8" }), "source.txt");
+    body.append("expected_text_file", new Blob([expectedText], { type: "text/plain;charset=utf-8" }), "baseline.txt");
+    body.append("confirm", String(confirm));
     if (file) body.append("file", file);
     const response = await fetch(`${API_BASE}${url}`, withAuth(url, { method: "POST", body }));
     await throwIfNotOk(response, i18n.t("errors:upload_failed"));
-    return (await response.json()) as { applied: boolean; needs_confirmation: boolean };
+    return await response.json();
   }
 
   /** 单文件 multipart 上传 POST，返回 JSON 响应体。 */
@@ -2276,7 +2278,7 @@ class API {
   static async getSourceContent(
     projectName: string,
     filename: string,
-    options: { signal?: AbortSignal } = {}
+    options: { signal?: AbortSignal; onRevision?: (revision: string | null) => void } = {}
   ): Promise<string> {
     const url = `/projects/${encodeURIComponent(projectName)}/source/${encodeURIComponent(filename)}`;
     const response = await fetch(
@@ -2284,6 +2286,7 @@ class API {
       withAuth(url, { signal: options.signal })
     );
     await throwIfNotOk(response, i18n.t("errors:file_content_load_failed"));
+    options.onRevision?.(response.headers.get("X-Episode-Source-Revision"));
     return response.text();
   }
 

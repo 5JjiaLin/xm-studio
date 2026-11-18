@@ -229,6 +229,58 @@ def test_docx_preview_then_edited_save_retains_original_and_episode_identity(man
     assert raw[0].read_bytes() == original
 
 
+def test_single_episode_accepts_new_and_previous_text_over_one_mib(management, monkeypatch):
+    from lib.episode.episode_ledger import episode_source_text_revision
+    from server.routers import files
+
+    client, pm, _, first, _ = management
+    monkeypatch.setattr(files, "get_project_manager", lambda: pm)
+    client.app.include_router(files.router, prefix="/api/v1")
+    url = f"/api/v1/projects/demo/episodes/{first}/production/source"
+    original = "阿明：保留原句。\n" * 60_000
+    revised = original + "阿明：结尾。"
+    assert len(original.encode()) > 1024 * 1024
+    with client:
+        preview = client.post("/api/v1/production/source-preview", files={"file": ("单集.txt", original.encode())})
+        assert preview.status_code == 200
+        saved = client.post(url, files={
+            "text_file": ("source.txt", original.encode()),
+            "expected_text_file": ("baseline.txt", "第一集对白".encode()),
+        })
+        assert saved.status_code == 200, saved.text
+        revised_save = client.post(url, files={
+            "text_file": ("source.txt", revised.encode()),
+            "expected_text_file": ("baseline.txt", original.encode()),
+        })
+        assert revised_save.status_code == 200, revised_save.text
+        revision = episode_source_text_revision(revised)
+        assert revised_save.json()["source_revision"] == revision
+        loaded = client.get(f"/api/v1/projects/demo/source/episode_{first}.txt")
+        assert loaded.status_code == 200
+        assert loaded.text == revised
+        assert loaded.headers["X-Episode-Source-Revision"] == revision
+    assert (pm.get_project_path("demo") / "source" / f"episode_{first}.txt").read_text() == revised
+
+
+def test_single_episode_rejects_lossy_txt_on_preview_and_save(management, monkeypatch):
+    from lib.script.source_loader import txt
+
+    monkeypatch.setattr(txt.charset_normalizer, "from_bytes", lambda _: SimpleNamespace(best=lambda: None))
+    client, pm, _, first, _ = management
+    damaged = b"A long screenplay line with one invalid byte: \xff"
+    assert txt.decode_txt(damaged)[1] == "gb18030-lossy"
+    with client:
+        preview = client.post("/api/v1/production/source-preview", files={"file": ("单集.txt", damaged)})
+        assert preview.status_code == 422, preview.text
+        saved = client.post(
+            f"/api/v1/projects/demo/episodes/{first}/production/source",
+            data={"text": "新正文", "expected_text": "第一集对白"},
+            files={"file": ("单集.txt", damaged)},
+        )
+        assert saved.status_code == 422, saved.text
+    assert (pm.get_project_path("demo") / "source" / f"episode_{first}.txt").read_text() == "第一集对白"
+
+
 @pytest.mark.parametrize(
     ("filename", "body"), [("broken.docx", b"invalid"), ("empty.txt", b""), ("wrong.exe", b"text")]
 )

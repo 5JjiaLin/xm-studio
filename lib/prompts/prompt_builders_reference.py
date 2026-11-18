@@ -20,6 +20,7 @@ from lib.infra.text_metrics import count_reading_units, find_reading_unit_offset
 from lib.prompts.prompt_builders_script import outline_slot, overview_slot, project_asset_appearances
 from lib.prompts.prompt_rules.asset_appearance import asset_reference_names
 from lib.prompts.prompt_templates.builtin import builtin_templates
+from lib.script.reference_video.dialogue_binding import DialogueFragment, dialogue_fragments, render_dialogue_catalogue
 from lib.speech.speech_rate import speech_rate_units_per_second
 
 
@@ -67,13 +68,14 @@ def resolve_reference_span(spans: dict[str, tuple[int, int]], span_id: str) -> t
     return None
 
 
-def _screenplay_span_lines(spans, source_text: str, language: str | None, budget: int) -> list[str]:
+def _screenplay_span_lines(spans, source_text: str, language: str | None, budget: int) -> tuple[list[str], list[int]]:
     from lib.script.reference_video.screenplay_coverage import screenplay_source_dialogue
 
     speech, _ = screenplay_source_dialogue(source_text)
     ranges = iter(fragment for line in speech for fragment in line.ranges)
     active = next(ranges, None)
     lines = []
+    cuts = []
     for span_id, start, end, text in spans:
         while active and active[1] <= start:
             active = next(ranges, None)
@@ -83,6 +85,7 @@ def _screenplay_span_lines(spans, source_text: str, language: str | None, budget
             while count_reading_units(text[left:right], language) > budget:
                 offset = left + find_reading_unit_offset(text[left:right], budget, language)
                 points.append(offset)
+                cuts.append(start + offset)
                 left = offset
             if active[1] > end:
                 break
@@ -92,7 +95,19 @@ def _screenplay_span_lines(spans, source_text: str, language: str | None, budget
         else:
             points.append(len(text))
             lines.extend(f"[{span_id}:{a}-{b}] {text[a:b]}" for a, b in pairwise(points))
-    return lines
+    return lines, cuts
+
+
+def reference_screenplay_inputs(
+    source: str, language: str | None, speech_rate_override: float | None, *duration_tiers: list[int] | None,
+) -> tuple[list[str], list[DialogueFragment]]:
+    spans = reference_source_spans(source)
+    longest_tier = min(max(tier) for tier in duration_tiers if tier)
+    budget = max(1, int(speech_rate_units_per_second(language, speech_rate_override) * longest_tier * 0.8))
+    lines, cuts = _screenplay_span_lines(spans, source, language, budget)
+    # Existing sentence boundaries already appear in the span list. Expose them
+    # as possible dialogue cuts too, so every advertised segment can fit a unit.
+    return lines, dialogue_fragments(source, [*cuts, *(end for _, _, end, _ in spans)])
 
 
 def build_reference_units_split_prompt(
@@ -118,6 +133,7 @@ def build_reference_units_split_prompt(
     next_episode_outline: dict | None = None,
     instructions: str | None = None,
     drama_detail_enabled: bool = False,
+    screenplay_inputs: tuple[list[str], list[DialogueFragment]] | None = None,
 ) -> str:
     """Step-1 video_unit 拆分 prompt：源文 → 扁平 unit 表（时长 + 原文锚 + 引用语法正文）。
 
@@ -189,14 +205,16 @@ def build_reference_units_split_prompt(
     source_language = source_language if isinstance(source_language, str) else None
     speech_rate = speech_rate_units_per_second(source_language, speech_rate_override)
 
-    source_spans = reference_source_spans(novel_text)
+    dialogue_lines = None
     if source_kind == "screenplay":
-        longest_tier = min(max(tiers) for tiers in (normalized_reference_durations, normalized_text_durations, normalized_durations) if tiers)
-        rendered_source_spans = "\n".join(_screenplay_span_lines(
-            source_spans, novel_text, source_language, max(1, int(speech_rate * longest_tier * 0.8)),
-        ))
+        span_lines, fragments = screenplay_inputs if screenplay_inputs is not None else reference_screenplay_inputs(
+            novel_text, source_language, speech_rate_override,
+            normalized_reference_durations, normalized_text_durations, normalized_durations,
+        )
+        rendered_source_spans = "\n".join(span_lines)
+        dialogue_lines = render_dialogue_catalogue(fragments)
     else:
-        rendered_source_spans = "\n".join(f"[{span_id}] {text}" for span_id, _start, _end, text in source_spans)
+        rendered_source_spans = "\n".join(f"[{span_id}] {text}" for span_id, _, _, text in reference_source_spans(novel_text))
     return builtin_templates.render(
         "text/reference_video_script_plan",
         source_kind="screenplay" if source_kind == "screenplay" else "novel",
@@ -205,6 +223,7 @@ def build_reference_units_split_prompt(
         assets=project_asset_appearances(characters, scenes, props, include_creation_text=True),
         **_candidate_names(characters, scenes, props),
         source_spans=rendered_source_spans,
+        dialogue_lines=dialogue_lines,
         episode_outline=outline_slot(episode_outline),
         next_episode_outline=outline_slot(next_episode_outline),
         episode=episode,
@@ -240,6 +259,8 @@ def render_reference_units_for_prompt_authoring(
         if output_targets:
             lines.append(f"输出序号：{output_index}（只输出本项的 text，不输出 ID 或时长）")
         lines.extend(["正文（内容契约、图片与发声的依据）：", body])
+        if "（画外发声）" in body and (unit.get("source_binding") or {}).get("dialogue_ids") is not None:
+            lines.append("保留具名画外台词前的 `（画外发声）` 标记，与对应的发声记号写在同一行。")
         if custom := str(unit.get("generation_prompt") or "").strip():
             lines.extend(["人工创作段（实际覆盖默认正文、风格与限制；只读，需与正文核对）：", custom])
         blocks.append("\n".join(lines))

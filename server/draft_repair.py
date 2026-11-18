@@ -25,7 +25,7 @@ from lib.backends.text_backends.base import TextGenerationRequest as BackendText
 from lib.backends.text_generator import TextGenerator
 from lib.catalog.errors import ModelNotInCatalogError
 from lib.generation.video_request_facts import VideoRequestFactsError
-from lib.infra.content_digest import canonical_json_digest, unprefixed
+from lib.infra.content_digest import canonical_json_digest, prefixed_canonical_json_digest, unprefixed
 from lib.infra.text_utils import strip_json_code_fences
 from lib.prompts.prompt_templates.builtin import builtin_templates
 from lib.references.reference_catalog import build_reference_catalog
@@ -49,6 +49,7 @@ from lib.script.reference_video.authoring_response import (
     parse_authoring_json,
     recover_repeated_unit_fields,
 )
+from lib.script.reference_video.dialogue_binding import render_dialogue_catalogue, resolve_dialogue_fragments
 from lib.script.script_review import content_fingerprint, formal_script_filename, script_plan_path
 from server.draft_workflow import DraftContext, DraftWorkflow, DraftWorkflowError, revalidate_script_plan_draft
 from server.text_generation import load_novel_source
@@ -230,6 +231,7 @@ def build_repair_prompt(
     *,
     source_text: str | None,
     instructions: str | None,
+    dialogue_catalogue: str | None = None,
 ) -> str:
     targets: list[dict[str, Any]] | None = None
     messages: list[str] | None = None
@@ -276,6 +278,13 @@ def build_repair_prompt(
     )
     if scope.indices is not None:
         prompt += "\n\n# 完整结构化诊断（数据）\n<diagnostics>\n" + _dumps(list(violations)) + "\n</diagnostics>"
+    if dialogue_catalogue is not None:
+        prompt += (
+            "\n\n# 本次拆解的对白清单\n"
+            "修复 `text` 时逐字复制清单中的 `[[Q…]]`。行号不是编号。每个片段按原文顺序出现一次，"
+            "放在覆盖该片段的单元内。不要手写台词或修改正确的原文跨度。"
+            "未要求修改的条目原样保留。\n<dialogue_fragments>\n" + dialogue_catalogue + "\n</dialogue_fragments>"
+        )
     return prompt
 
 
@@ -356,13 +365,25 @@ class DraftRepair:
             return draft.content
 
         scope = repair_scope(kind, draft.content, violations)
+        source_text = await self._source_text(episode, kind, draft)
+        dialogue_catalogue = None
+        if kind == QUARANTINE_KIND_SCRIPT_PLAN and scope.root == "units" and source_text is not None:
+            ids = draft.meta.get("dialogue_fragment_ids")
+            if (
+                isinstance(ids, list) and all(isinstance(key, str) for key in ids)
+                and draft.meta.get("dialogue_source_revision") == prefixed_canonical_json_digest(source_text)
+            ):
+                fragments = resolve_dialogue_fragments(source_text, ids)
+                if list(fragments) == ids:
+                    dialogue_catalogue = render_dialogue_catalogue(list(fragments.values()))
         prompt = build_repair_prompt(
             kind,
             draft.content,
             scope,
             violations,
-            source_text=await self._source_text(episode, kind, draft),
+            source_text=source_text,
             instructions=(instructions or "").strip() or None,
+            dialogue_catalogue=dialogue_catalogue,
         )
         generator = await TextGenerator.create(
             TextTaskType.SCRIPT, self.ctx.project_name, purpose=CallPurpose.SCRIPT_GENERATION

@@ -35,24 +35,40 @@ def _paragraph_text(paragraph: ElementTree.Element) -> str:
     )
 
 
+def _speaker_cell(cue: str) -> bool:
+    return bool(_SPEAKER_CELL.fullmatch(cue)) and cue.rstrip(":：") not in _TABLE_LABELS
+
+
 def _table_text(table: ElementTree.Element) -> list[str]:
+    cells_by_row = [
+        ["\n".join(_paragraph_text(p) for p in cell.iter(_W + "p")).strip() for cell in row.findall(_W + "tc")]
+        for row in table.findall(_W + "tr")
+    ]
+    # Infer only a consistent two-column layout. Keep mixed or unknown layouts as text.
+    populated = [cells for cells in cells_by_row if any(cells)]
+    headerless = bool(populated) and all(
+        len(cells) == 2 and _speaker_cell(cells[0]) and cells[1]
+        and re.search(r"[。！？!?.…]\s*$", cells[1])
+        for cells in populated
+    )
+    columns = (0, 1) if headerless else None
     rows = []
-    dialogue_table = False
-    for row in table.findall(_W + "tr"):
-        cells = ["\n".join(_paragraph_text(p) for p in cell.iter(_W + "p")).strip() for cell in row.findall(_W + "tc")]
-        if len(cells) == 2:
-            cue, dialogue = cells
-            if cue.casefold() in _SPEAKER_HEADERS and dialogue.casefold() in _DIALOGUE_HEADERS:
-                dialogue_table = True
-                continue
-            if (
-                dialogue and (dialogue_table or cue.endswith((":", "：")))
-                and _SPEAKER_CELL.fullmatch(cue) and cue.rstrip(":：") not in _TABLE_LABELS
-                and not re.match(r"^[^\s:：]{1,16}[:：]", dialogue)
-            ):
-                # Keep line breaks within the utterance as explicit continuations.
-                rows.append(cue.rstrip(":：") + "：" + dialogue.replace("\n", "\n\t"))
-                continue
+    for cells in cells_by_row:
+        speaker_headers = [i for i, cell in enumerate(cells) if cell.casefold() in _SPEAKER_HEADERS]
+        dialogue_headers = [i for i, cell in enumerate(cells) if cell.casefold() in _DIALOGUE_HEADERS]
+        if len(speaker_headers) == len(dialogue_headers) == 1:
+            columns = (speaker_headers[0], dialogue_headers[0])
+            continue
+        pair = columns
+        if pair is None and len(cells) == 2 and cells[0].endswith((":", "：")):
+            pair = (0, 1)
+        if pair is not None and max(pair) < len(cells):
+            speaker_index, dialogue_index = pair
+            cue, dialogue = cells[speaker_index], cells[dialogue_index]
+            if dialogue and _speaker_cell(cue) and not re.match(r"^[^\s:：]{1,16}[:：]", dialogue):
+                # Keep paragraphs inside the same utterance as explicit continuations.
+                cells[dialogue_index] = cue.rstrip(":：") + "：" + dialogue.replace("\n", "\n\t")
+                cells.pop(speaker_index)
         rows.extend(cells)
     return rows
 

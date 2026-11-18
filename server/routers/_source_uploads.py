@@ -39,7 +39,7 @@ def source_loader_http_error(exc: SourceLoaderError, _t: Translator) -> HTTPExce
     return HTTPException(status_code=422, detail=_t("source_corrupt_file", filename=exc.filename, reason=exc.reason))
 
 
-def extract_uploaded_source_text(file: UploadFile, _t: Translator) -> str:
+def extract_uploaded_source_text(file: UploadFile, _t: Translator, *, require_lossless: bool = False) -> str:
     """把上传的文件规范化为 UTF-8 文本，不落到 ``source/``；格式或内容不合格时抛出对应的 ``HTTPException``。
 
     同步执行，经临时文件读取上传内容；路由里用 ``asyncio.to_thread`` 调用。
@@ -50,7 +50,10 @@ def extract_uploaded_source_text(file: UploadFile, _t: Translator) -> str:
     try:
         with tmp_path.open("wb") as out:
             shutil.copyfileobj(file.file, out)
-        return SourceLoader.extract(tmp_path, original_filename=original_filename).text
+        result = SourceLoader.extract(tmp_path, original_filename=original_filename)
+        if require_lossless and result.used_encoding == "gb18030-lossy":
+            raise SourceDecodeError(filename=original_filename, tried_encodings=["UTF-8", "GB18030"])
+        return result.text
     except (UnsupportedFormatError, FileSizeExceededError, SourceDecodeError, CorruptFileError) as exc:
         raise source_loader_http_error(exc, _t) from exc
     finally:

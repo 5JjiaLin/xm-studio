@@ -1546,3 +1546,40 @@ async def test_generate_episode_script_truncation_offers_the_way_out(fake_ctx: T
         GenerationAction.CONFIGURE_PROVIDER,
         _TRUNCATION_PARAMS,
     )
+
+
+async def test_script_plan_source_revision_blocks_changed_input_before_and_after_queue(fake_ctx, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from lib.episode.episode_ledger import episode_source_text_revision
+    from server import tool_runtime
+
+    rv_source(fake_ctx)
+    path = fake_ctx.project_path / "source" / "episode_1.txt"
+    revision = episode_source_text_revision(path.read_text(encoding="utf-8"))
+    submit = AsyncMock(return_value=tool_runtime.ToolOutcome(value={}))
+    monkeypatch.setattr(tool_runtime, "_submit_text_task", submit)
+    model = AsyncMock(side_effect=AssertionError("stale source must not use a model"))
+    use_text_generator(monkeypatch, model)
+    request = ToolRequest(GenerateScriptPlanRequest(episode_id=1))
+    accepted = await generate_script_plan(
+        request, fake_ctx.scope, fake_ctx.caller, fake_ctx.services, expected_source_revision=revision
+    )
+    assert accepted.problem is None, accepted
+    queued = submit.await_args.kwargs
+    assert queued["payload"]["expected_source_revision"] == revision
+
+    path.write_text("另一窗口保存的版本", encoding="utf-8")
+    rejected = await generate_script_plan(
+        request, fake_ctx.scope, fake_ctx.caller, fake_ctx.services, expected_source_revision=revision
+    )
+    assert rejected.problem is not None
+    assert "原文已变化" in rejected.problem.detail
+    submit.assert_awaited_once()
+    with pytest.raises(RuntimeError, match="原文已变化"):
+        await tool_runtime.execute_queued_text_task(
+            {"task_id": "old-source", "project_name": fake_ctx.project_name,
+             "task_type": queued["task_type"], "payload": queued["payload"]},
+            services=fake_ctx.services,
+        )
+    model.assert_not_awaited()

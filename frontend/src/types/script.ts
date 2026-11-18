@@ -427,6 +427,7 @@ export interface AuthorPromptsResponse {
 
 /** AI 规划脚本的请求：附加指令（随请求按集保存）。 */
 export interface PlanScriptRequest {
+  expected_source_revision?: string;
   instructions?: string | null;
   replan_reason?: string | null;
   repair_draft_revision?: string;

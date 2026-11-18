@@ -29,13 +29,15 @@ _METADATA = re.compile(
 )
 # Inline character cues (including performance directions) are unambiguous.
 # Unlabeled prose is never guessed to be dialogue.
-_OFFSCREEN = r"(?i:O\.?\s*S\.?|V\.?\s*O\.?)|旁白|画外音|心声|内心独白|内心|画外"
+_OFFSCREEN = r"(?<![A-Za-z])(?i:O\.?\s*S|V\.?\s*O)(?![A-Za-z])\.?|旁白|画外音|心声|内心独白|内心|画外"
 _NAME = r"[A-Z][A-Z \d_.-]{0,60}?|[\u4e00-\u9fff·]{1,16}?"
 _CUE = re.compile(
     rf"(?P<speaker>{_NAME})(?P<delivery>\s*(?:[（(][^()（）]*[）)]|{_OFFSCREEN}))?\s*"
 )
 _INLINE_SPEECH = re.compile(r"(?P<cue>[^:：]+)[:：]\s*(?P<text>\S.*)")
 _NON_SPEAKERS = frozenset({"人物", "出场人物", "角色", "场景", "时间", "地点", "镜头", "动作", "画面"})
+_RECAP_HEADING = re.compile(r"(?:【前情提要】|前情提要)[:：]?")
+_EPISODE_HEADING = re.compile(r"(?:Episode\s+\d+|第[\d一二三四五六七八九十百]+集)", re.IGNORECASE)
 _ACTION = re.compile(r"^(?:[△▲【#]|\s*(?:动作|画面)\s*[:：])")
 
 
@@ -64,12 +66,20 @@ def _cue(raw: str) -> tuple[str, Literal["onscreen", "offscreen", "narration"]] 
     return cue["speaker"].strip(), "offscreen" if re.search(_OFFSCREEN, delivery) else "onscreen"
 
 
-def screenplay_source_dialogue(source: str) -> tuple[list[SourceDialogue], list[int]]:
+def screenplay_source_dialogue(
+    source: str, *, include_recap: bool = False
+) -> tuple[list[SourceDialogue], list[int]]:
     """Extract exact speech fragments; bare Chinese cues need cast or inline evidence."""
     lines = source.splitlines(keepends=True)
+    recap_lines = 0
+    if not include_recap:
+        headings = [line.strip().strip("#* ") for line in lines]
+        first = next((heading for heading in headings if heading), "")
+        if _RECAP_HEADING.fullmatch(first):
+            recap_lines = next((i for i, heading in enumerate(headings) if _EPISODE_HEADING.fullmatch(heading)), 0)
     inlines = [_INLINE_SPEECH.fullmatch(line.strip().lstrip("# ")) for line in lines]
     known = set()
-    for line, match in zip(lines, inlines, strict=True):
+    for line, match in zip(lines[recap_lines:], inlines[recap_lines:], strict=True):
         bare = line.strip()
         if cast := re.fullmatch(r"(?:出场人物|人物|角色)\s*[:：]\s*(.*)", bare):
             known.update(name.strip() for name in re.split(r"[、,，/／]", cast[1]))
@@ -86,6 +96,8 @@ def screenplay_source_dialogue(source: str) -> tuple[list[SourceDialogue], list[
         start = offset + len(line) - len(line.lstrip())
         end = start + len(bare)
         offset += len(line)
+        if line_number <= recap_lines:
+            continue
         if not bare or _ACTION.match(bare) or _METADATA.fullmatch(bare):
             pending = None
         elif match and (identity := _cue(match["cue"])) is not None:
@@ -159,7 +171,7 @@ def screenplay_speaker_aliases(
 
 
 def validate_screenplay_coverage(
-    units: Sequence[dict], source: str, *, speaker_aliases: dict[str, str] | None = None
+    units: Sequence[dict], source: str, *, speaker_aliases: dict[str, str] | None = None, check_dialogue: bool = True,
 ) -> list[DraftViolation]:
     """Require narrative anchors and the original ordered dialogue across the episode."""
     from lib.script.prompt_policy import prompt_content_validation_enabled
@@ -204,6 +216,8 @@ def validate_screenplay_coverage(
             )
         )
 
+    if not check_dialogue:
+        return issues
     expected, ambiguous = screenplay_source_dialogue(source)
     actual = [
         (index, part)
@@ -254,7 +268,7 @@ def validate_screenplay_coverage(
                     asset_name_comparison_key(actual_asset).casefold() != asset_name_comparison_key(expected_asset).casefold()
                 ):
                     issues.append(DraftViolation(
-                        f"{label}：原文第 {speech.line} 行 {speech.id}「{speech.text}」应由"
+                        f"{label} 说话人归属不匹配：原文第 {speech.line} 行 {speech.id}「{speech.text}」应由"
                         f" {expected_asset or '无主旁白'} 发声，当前为 {actual_asset or '无主旁白'}。",
                         code="screenplay_speaker_attribution", item_index=index, item_id=unit_id, locations=(coordinates,),
                     ))

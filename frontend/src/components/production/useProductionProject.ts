@@ -22,6 +22,7 @@ interface ProductionSnapshot {
   workflow: WorkflowStatus | null;
   units: ReferenceVideoUnit[];
   source: string;
+  sourceRevision: string | null;
 }
 
 /** One scoped read, committed together; polling never replaces the user's edit buffers. */
@@ -69,6 +70,7 @@ export function useProductionProject(projectName: string | null, requestedEpisod
             let review: ScriptReviewState | null = null;
             let units: ReferenceVideoUnit[] = [];
             let source = "";
+            let sourceRevision: string | null = null;
             if (entry && !current.production_management?.archived && !current.production_management?.archived_episodes?.includes(entry.episode)) {
               episode = entry.episode;
               workflow = await API.getWorkflowStatus(projectName, { signal: controller.signal, episode });
@@ -80,7 +82,10 @@ export function useProductionProject(projectName: string | null, requestedEpisod
                 workflow.content?.formal_script === "present" && current.generation_mode === "reference_video"
                   ? API.listReferenceVideoUnits(projectName, episode, { signal: controller.signal })
                   : Promise.resolve({ units: [] }),
-                path ? API.getSourceContent(projectName, path.replace(/^source\//, ""), { signal: controller.signal }) : Promise.resolve(""),
+                path ? API.getSourceContent(projectName, path.replace(/^source\//, ""), {
+                  signal: controller.signal,
+                  onRevision: (value) => { sourceRevision = value; },
+                }) : Promise.resolve(""),
               ]);
               if (!isCurrent()) return;
               production = progress; review = content; units = unitData.units; source = text;
@@ -91,7 +96,7 @@ export function useProductionProject(projectName: string | null, requestedEpisod
               again = true;
               continue;
             }
-            setSnapshot({ projectName, requestedEpisode, revision, project: current, scripts: basis.currentScripts, episode, workflow, production, review, units, source });
+            setSnapshot({ projectName, requestedEpisode, revision, project: current, scripts: basis.currentScripts, episode, workflow, production, review, units, source, sourceRevision });
             setFailure(null);
           } catch (cause) {
             if (isCurrent()) setFailure({ projectName, requestedEpisode, message: errMsg(cause) });
@@ -139,6 +144,7 @@ export function useProductionProject(projectName: string | null, requestedEpisod
     scripts: visible?.scripts ?? {},
     units: visible?.units ?? [],
     source: visible?.source ?? "",
+    sourceRevision: visible?.sourceRevision ?? null,
     workflow: visible?.workflow ?? null,
     production: visible?.production ?? null,
     review: visible?.review ?? null,

@@ -618,6 +618,7 @@ app.add_middleware(
     allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Episode-Source-Revision"],
 )
 
 

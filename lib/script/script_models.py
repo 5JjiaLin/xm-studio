@@ -866,6 +866,8 @@ class ReferenceSourceBinding(BaseModel):
     end: int = Field(gt=0)
     span_start: str
     span_end: str
+    dialogue_ids: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
+    dialogue_edited: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 class ReferenceVideoUnit(BaseModel):
@@ -1029,6 +1031,10 @@ class ReferenceScriptPlanSpanUnit(ReferenceScriptPlanFlatUnit):
     source_span_start: str = Field(min_length=1, description="该单元依据源文跨度的起始 ID")
     source_span_end: str = Field(min_length=1, description="该单元依据源文跨度的结束 ID")
     source_text: SkipJsonSchema[str] = Field(default="", description="服务端从源文回填，不由模型生成")
+
+
+class ReferenceScreenplayPlanSpanUnit(ReferenceScriptPlanSpanUnit):
+    text: str = Field(min_length=1, description="画面描述和 [[对白片段编号]]，程序负责回填发声")
 
 
 class ReferenceScriptPlanFlatDraft(BaseModel):
@@ -1221,7 +1227,7 @@ def with_new_assets_field(model: type[BaseModel]) -> type[BaseModel]:
 
 
 def build_reference_units_script_plan_model(
-    supported_durations: list[int], *, use_source_spans: bool = False
+    supported_durations: list[int], *, use_source_spans: bool = False, bind_dialogue: bool = False
 ) -> type[BaseModel]:
     """构造 unit 时长被 ``supported_durations`` 枚举硬约束的参考生视频 script_plan 模型（扁平形状）。
 
@@ -1233,12 +1239,15 @@ def build_reference_units_script_plan_model(
     prompt_authoring 无对应工厂：它不产出时长，没有需要按能力收窄的枚举字段，直接用静态
     ``ReferencePromptAuthoringFlatScript``。
     """
+    unit_base = ReferenceScriptPlanSpanUnit if use_source_spans else ReferenceScriptPlanFlatUnit
+    if bind_dialogue:
+        unit_base = ReferenceScreenplayPlanSpanUnit
     unit = _constrained_duration_item(
-        ReferenceScriptPlanSpanUnit if use_source_spans else ReferenceScriptPlanFlatUnit,
+        unit_base,
         _duration_literal(supported_durations),
         "该单元时长（秒），必须取 supported_durations 中的值",
     )
-    base = ReferenceScriptPlanSpanDraft if use_source_spans else ReferenceScriptPlanFlatDraft
+    base = ReferenceScriptPlanSpanDraft if use_source_spans or bind_dialogue else ReferenceScriptPlanFlatDraft
     return create_model(
         base.__name__,
         __base__=base,

@@ -780,3 +780,68 @@ async def test_late_structural_failure_cannot_replace_newer_candidate(tmp_path, 
     assert path.read_bytes() == newer[0]
     assert len(calls) == 1
     assert json.loads((pm.get_project_path("demo") / "drafts/episode_1/script_plan_reference_units.json").read_text()) == content
+
+
+async def test_screenplay_dialogue_output_survives_reopen_edit_and_confirmation(tmp_path, monkeypatch, video_request_facts):
+    from lib.episode.episode_source_commands import set_episode_source_text
+    from lib.script.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, read_quarantine
+    from lib.script.reference_video.voice_settings import VoiceRenderSettings
+    from server.draft_repair import DraftRepair
+    from server.services.project.episode_drafts import EpisodeDraftService
+    from server.services.tasks.reference_video_tasks import _render_unit_prompt
+
+    monkeypatch.setenv("ARCREEL_PROMPT_CONTENT_VALIDATION", "false")
+    pm = _project(tmp_path, "drama", generation_mode="reference_video")
+    source = "阿离（画外音）：关门。\n旁白：天亮了。\n裴与：关门。"
+    set_episode_source_text(pm, "demo", 1, source, source_kind="screenplay")
+    resolver = cast(ConfigResolver, FakeConfigResolver())
+    ids = [f"D{line:04d}:{source.index(words, start)}-{source.index(words, start) + len(words)}"
+           for line, words, start in [(1, "关门。", 0), (2, "天亮了。", 0), (3, "关门。", source.index("裴与"))]]
+    model_ids = ["Q0001", "Q0002", "Q0003"]
+    units = [
+        {"duration_seconds": 8, "source_span_start": span, "source_span_end": span, "text": f"门口灯光渐暗。[[{key}]]"}
+        for span, key in zip(("S0001", "S0002", "S0003"), model_ids, strict=True)
+    ]
+    invalid = {"units": [{**units[0], "text": "门口灯光渐暗。"}, *units[1:]]}
+    fake = FakeTextGenerator(
+        json.dumps(invalid, ensure_ascii=False),
+        json.dumps({"units": [units[0]]}, ensure_ascii=False),
+    )
+    use_text_generator(monkeypatch, fake.create)
+    with pytest.raises(TextGenerationError, match="遗漏原文第 1 行"):
+        await generate_reference_script_plan(TextGenerationRequest(episode=1), project_name="demo", projects=pm, config_resolver=resolver)
+    assert "<dialogue_fragments>" in fake.requests[0].prompt
+    assert all(f"[[{key}]]" in fake.requests[0].prompt for key in model_ids)
+    fields = fake.requests[0].response_schema.model_fields["units"].annotation.__args__[0].model_json_schema()
+    assert "source_span_start" in fields["required"]
+    assert "[[对白片段编号]]" in fields["properties"]["text"]["description"]
+
+    root = pm.get_project_path("demo")
+    assert read_quarantine(root, 1, QUARANTINE_KIND_SCRIPT_PLAN).meta["dialogue_source_revision"]
+    drafts = EpisodeDraftService(ProjectManager(pm.data_root), config_resolver=resolver)
+    candidate = await drafts.get_draft("demo", 1, "reference_script_plan")
+    repair = DraftRepair(DraftContext("demo", pm.data_root, ProjectManager(pm.data_root), resolver))
+    adopted = await repair.repair(1, "reference_script_plan", candidate["revision"])
+    assert adopted["adopted"]
+    repair_catalogue = fake.requests[1].prompt.split("<dialogue_fragments>")[1].split("</dialogue_fragments>")[0]
+    assert all(f"[[{key}]]" in repair_catalogue for key in model_ids)
+    review = ScriptReviewService(ProjectManager(pm.data_root), config_resolver=resolver)
+    state = await review.get_state("demo", 1)
+    content = state["content"]
+    assert [unit["source_binding"]["dialogue_ids"] for unit in content["units"]] == [[key] for key in ids]
+    assert "（画外发声）@[阿离]{关门。}" in content["units"][0]["text"]
+    assert "{天亮了。}" in content["units"][1]["text"]
+    content["units"][2]["text"] = content["units"][2]["text"].replace("关门。", "请关门。")
+    content["units"][2].pop("source_binding")  # Clients may only know the original editor shape.
+    saved = await review.save_content("demo", 1, content, state["fingerprint"])
+    assert saved["content"]["units"][2]["source_binding"]["dialogue_ids"] == [ids[2]]
+    assert saved["content"]["units"][2]["source_binding"]["dialogue_edited"] is True
+    await review.confirm("demo", 1, plan_fingerprint=saved["fingerprint"])
+    formal = _formal(pm)["video_units"]
+    assert formal[2]["source_binding"]["dialogue_edited"] is True
+    assert "@[裴与]{请关门。}" in formal[2]["text"]
+    rendered = _render_unit_prompt(formal[0], pm.load_project("demo"), VoiceRenderSettings())
+    assert "（画外发声）" in rendered.prompt
+    assert "<阿离>说 {关门。}" in rendered.prompt
+    assert "天亮了。" not in _render_unit_prompt(formal[1], pm.load_project("demo"), VoiceRenderSettings()).prompt
+    assert len(fake.requests) == 2

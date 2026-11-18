@@ -1,3 +1,5 @@
+import pytest
+
 from lib.script.source_loader.docx import DocxExtractor
 
 
@@ -26,8 +28,6 @@ def test_docx_falls_back_to_mammoth(monkeypatch, docx_factory):
 
 
 def test_docx_preserves_table_and_paragraph_order(tmp_path):
-    import pytest
-
     from lib.script.source_loader.errors import CorruptFileError
 
     docx = pytest.importorskip("docx")
@@ -46,3 +46,26 @@ def test_docx_preserves_table_and_paragraph_order(tmp_path):
     path.write_bytes(b"corrupt docx")
     with pytest.raises(CorruptFileError):
         DocxExtractor().extract(path)
+
+
+@pytest.mark.parametrize("table_rows", [
+    [("动作", "人物", "对白"), ("△ 门开了。", "小明", "请进。\n慢一点。"), ("△ 灯亮了。", "小红", "谢谢！")],
+    [("小明", "请进。\n慢一点。"), ("小红", "谢谢！")],
+])
+def test_docx_dialogue_table_keeps_speaker_and_lines(tmp_path, table_rows):
+    from lib.script.reference_video.screenplay_coverage import screenplay_source_dialogue
+
+    docx = pytest.importorskip("docx")
+    document = docx.Document()
+    table = document.add_table(rows=0, cols=len(table_rows[0]))
+    for row in table_rows:
+        for cell, text in zip(table.add_row().cells, row, strict=True):
+            cell.text = text
+    path = tmp_path / "dialogue.docx"
+    document.save(path)
+
+    text = DocxExtractor().extract(path).text
+    speeches, _ = screenplay_source_dialogue(text)
+    assert [(speech.speaker, speech.text) for speech in speeches] == [("小明", "请进。\n慢一点。"), ("小红", "谢谢！")]
+    if len(table_rows[0]) == 3:
+        assert text.index("△ 门开了。") < text.index("小明：请进。") < text.index("△ 灯亮了。")

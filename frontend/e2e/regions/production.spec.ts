@@ -1113,13 +1113,19 @@ test("cost is read-only on output and includes rerolls within the known subtotal
 test("DOCX extraction is editable and a failed save retries the same target", async ({ page, api }) => {
   let createdProjects = 0, createdEpisodes = 0, saves = 0;
   const bodies: string[] = [];
+  const revision = `sha256-v1:${"a".repeat(64)}`;
+  const plans: unknown[] = [];
   api.override({ ...productionBase,
     "POST /api/v1/production/source-preview": { status: 200, body: { text: "小明：你好。", filename: "episode.docx" } },
-    "POST /api/v1/projects/demo/episodes/1/script-plan": { status: 200, body: { batch: { members: [] } } },
   });
   await page.route("**/api/v1/projects", async (route) => { if (route.request().method() === "POST") { createdProjects++; await route.fulfill({ json: { name: "demo" } }); } else await route.fallback(); });
   await page.route("**/api/v1/projects/demo/episodes", async (route) => { createdEpisodes++; await route.fulfill({ json: { episode: 1 } }); });
-  await page.route("**/api/v1/projects/demo/episodes/1/production/source", async (route) => { bodies.push(route.request().postData() || ""); saves++; await route.fulfill({ status: saves === 1 ? 500 : 200, json: saves === 1 ? { detail: "保存失败，请重试" } : { needs_confirmation: false } }); });
+  await page.route("**/api/v1/projects/demo/episodes/1/production/source", async (route) => { bodies.push(route.request().postData() || ""); saves++; await route.fulfill({ status: saves === 1 ? 500 : 200, json: saves === 1 ? { detail: "保存失败，请重试" } : { needs_confirmation: false, source_revision: revision } }); });
+  await page.route("**/api/v1/projects/demo/episodes/1/script-plan", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    plans.push(route.request().postDataJSON());
+    await route.fulfill({ json: { batch: { members: [] } } });
+  });
   await page.goto("/app/make");
   await page.getByRole("textbox", { name: "作品名" }).fill("Word 剧本");
   await page.locator("#script-upload").setInputFiles({ name: "episode.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", buffer: Buffer.from("served by actual extraction contract fixture") });
@@ -1132,6 +1138,30 @@ test("DOCX extraction is editable and a failed save retries the same target", as
   await expect(page).toHaveURL(/step=breakdown&episode=1$/);
   expect([createdProjects, createdEpisodes, saves]).toEqual([1, 1, 2]);
   expect(bodies[1]).toContain("修改后的对白");
+  expect(plans).toEqual([{ expected_source_revision: revision }]);
+});
+
+test("starting breakdown with a saved source submits its displayed revision", async ({ page, api }) => {
+  const text = "小明：保留这一句。";
+  const revision = `sha256-v1:${"b".repeat(64)}`;
+  api.override(productionBase);
+  await page.route("**/api/v1/projects/demo/workflow-status**", (route) => route.fulfill({ json: {
+    ...workflowFixture,
+    target: { ...workflowFixture.target, source: "source/episode_1.txt" },
+    content: { ...workflowFixture.content, episode_source: "present" },
+  } }));
+  await page.route("**/api/v1/projects/demo/source/episode_1.txt", (route) => route.fulfill({
+    contentType: "text/plain", headers: { "X-Episode-Source-Revision": revision }, body: text,
+  }));
+  await page.route("**/api/v1/projects/demo/episodes/1/script-plan", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    await route.fulfill({ json: { batch: { members: [] } } });
+  });
+  await page.goto("/app/make/demo?step=script&episode=1");
+  await expect(page.getByRole("textbox", { name: "单集剧本", exact: true })).toHaveValue(text);
+  const submitted = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/episodes/1/script-plan"));
+  await page.getByRole("button", { name: "开始拆解", exact: true }).click();
+  expect((await submitted).postDataJSON()).toEqual({ expected_source_revision: revision });
 });
 
 test("manual clip and caption edits persist and export locally", async ({ page, api }) => {
@@ -1351,7 +1381,7 @@ test("blank episode opens without reading a missing source and preserves the dra
   });
   await page.route("**/api/v1/projects/demo/episodes/1/production/source", async (route) => {
     const body = route.request().postData() || "";
-    expect(body).toContain('name="expected_text"');
+    expect(body).toContain('name="expected_text_file"');
     expect(body).toContain(text);
     saved = true;
     await route.fulfill({ json: { success: true, applied: true, needs_confirmation: false, affected_episodes: [] } });
@@ -1383,7 +1413,7 @@ for (const edited of [false, true]) {
     await page.route("**/api/v1/projects/demo/source/episode_1.txt", (route) => route.fulfill({ contentType: "text/plain", body: source }));
     await page.route("**/api/v1/projects/demo/episodes/1/production/source", async (route) => {
       submissions++;
-      expect(route.request().postData()).toContain('name="expected_text"\r\n\r\n小明：原稿 A。');
+      expect(route.request().postData()).toContain('name="expected_text_file"; filename="baseline.txt"\r\nContent-Type: text/plain;charset=utf-8\r\n\r\n小明：原稿 A。');
       await route.fulfill({ status: 409, json: { detail: "原稿已更新" } });
     });
     await page.goto("/app/make/demo?step=script&episode=1");

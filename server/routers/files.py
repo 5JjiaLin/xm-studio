@@ -26,7 +26,7 @@ from lib.bgm.library import BGM_DIR, BGM_EXTENSIONS, BGM_MAX_BYTES, BgmTrack
 from lib.bgm.service import BgmError, BgmLibraryService
 from lib.catalog.errors import ModelNotInCatalogError
 from lib.config.resolver import VisionCapabilityError
-from lib.episode.episode_ledger import is_derived_episode_name
+from lib.episode.episode_ledger import episode_source_text_revision, is_derived_episode_name
 from lib.episode.episode_paths import (
     REFERENCE_VIDEO_SCRIPT_PLAN_FILENAME,
     REFERENCE_VIDEO_SCRIPT_PLAN_LEGACY_FILENAME,
@@ -959,7 +959,7 @@ async def get_source_file(project_name: str, filename: str, _t: Translator):
             return source_path.read_text(encoding="utf-8")
 
         content = await asyncio.to_thread(_sync)
-        return PlainTextResponse(content)
+        return PlainTextResponse(content, headers={"X-Episode-Source-Revision": episode_source_text_revision(content)})
 
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=project_name) from exc

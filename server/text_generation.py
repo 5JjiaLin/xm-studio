@@ -28,6 +28,7 @@ from lib.backends.text_generator import TextGenerator
 from lib.catalog.errors import ModelNotInCatalogError
 from lib.config.resolver import ConfigResolver
 from lib.episode.episode_ids import describe_episode_for_agent
+from lib.episode.episode_ledger import episode_source_text_revision
 from lib.episode.episode_paths import (
     SCRIPT_PLAN_FILENAMES,
     episode_drafts_dir,
@@ -53,6 +54,7 @@ from lib.project.asset_types import ASSET_SPECS, BUCKET_KEY, asset_name_comparis
 from lib.project.project_manager import ProjectManager, is_reference_video_project
 from lib.prompts.prompt_builders_reference import (
     build_reference_units_split_prompt,
+    reference_screenplay_inputs,
     reference_source_spans,
     resolve_reference_span,
 )
@@ -82,6 +84,12 @@ from lib.script.plan_new_assets import (
     with_new_assets,
 )
 from lib.script.prompt_authoring_scope import PromptOverwriteRequired, prompt_overwrite_with_text
+from lib.script.reference_video.dialogue_binding import (
+    DialogueFragment,
+    bind_generated_dialogue,
+    has_dialogue_bindings,
+    validate_stored_dialogue,
+)
 from lib.script.reference_video.draft_validation import (
     out_of_order_source_anchor_indices,
     validate_dialogue_load,
@@ -167,6 +175,7 @@ class TextGenerationRequest:
     repair_context: str | None = None
     repair_recheck_task_id: str | None = None
     prompt_policy_version: str | None = None
+    expected_source_revision: str | None = None
 
     def __post_init__(self) -> None:
         if not is_int(self.episode, minimum=1):
@@ -199,6 +208,7 @@ class TextGenerationRequest:
             "repair_context",
             "repair_recheck_task_id",
             "prompt_policy_version",
+            "expected_source_revision",
         ):
             if payload[key] is None:
                 payload.pop(key)
@@ -451,11 +461,16 @@ def _quarantine_invalid_script_plan_generation(
     *,
     prompt_policy_version: str | None = None,
     raw_response: str | None = None,
+    dialogue_source_revision: str | None = None,
+    dialogue_fragment_ids: list[str] | None = None,
 ) -> str:
     from lib.project.task_project_claim import current_task_project_claim
 
     claim = current_task_project_claim()
     meta = {"source": source or None, "base_fingerprint": base_fingerprint}
+    if dialogue_source_revision:
+        meta["dialogue_source_revision"] = dialogue_source_revision
+        meta["dialogue_fragment_ids"] = dialogue_fragment_ids
     if raw_response is not None:
         meta["raw_response"] = raw_response
         meta["generated_content_fingerprint"] = script_review.content_fingerprint_of_data(content)
@@ -618,7 +633,8 @@ def _parse_script_plan_json(response_text: str, model: type[BaseModel], *, label
 
 
 def parse_reference_script_plan_candidate(
-    response_text: str, schema: type[BaseModel], supported_durations: list[int], novel_text: str, *, manual: bool = False
+    response_text: str, schema: type[BaseModel], supported_durations: list[int], novel_text: str, *,
+    manual: bool = False, dialogue: Sequence[DialogueFragment] | None = None, project: dict | None = None,
 ) -> dict:
     """Resolve model span IDs to exact text and retain the selected source position.
 
@@ -633,6 +649,7 @@ def parse_reference_script_plan_candidate(
     uses_spans = isinstance(units, list) and any(
         isinstance(unit, dict) and ("source_span_start" in unit or "source_span_end" in unit) for unit in units
     )
+    uses_spans = uses_spans or dialogue is not None
     model = schema if uses_spans else build_reference_units_script_plan_model(supported_durations)
     flat = _parse_script_plan_json(response_text, model, label="script_plan 拆分内容", top_shape="{units}", manual=manual)
     if not uses_spans:
@@ -665,6 +682,16 @@ def parse_reference_script_plan_candidate(
         })
     if violations:
         raise ScriptPlanParseError("原文跨度无效", flat, violations)
+    if dialogue is not None:
+        from lib.script.reference_video.screenplay_coverage import screenplay_speaker_aliases
+
+        try:
+            aliases = screenplay_speaker_aliases(project or {}, flat[NEW_ASSETS_FIELD])
+        except NewAssetsError:
+            aliases = screenplay_speaker_aliases(project or {})  # asset decisions are reported by the normal validator
+        violations = bind_generated_dialogue(canonical_units, dialogue, aliases)
+        if violations:
+            raise ScriptPlanParseError("对白片段引用无效", flat, violations)
     flat["units"] = canonical_units
     return flat
 
@@ -717,16 +744,23 @@ def load_novel_source(project_path: Path, source: str | None, *, episode: int) -
     return novel_text
 
 
+def require_script_plan_source_revision(text: str, expected: str | None) -> None:
+    if expected is not None and episode_source_text_revision(text) != expected:
+        raise TextGenerationError("剧本原文已变化，请刷新并核对后再开始拆解。")
+
+
 def load_script_plan_source_with_basis(
     project_path: Path,
     source: str | None,
     project: dict[str, Any],
     episode: int,
     expected_variant: ScriptPlanPromptVariant,
+    expected_source_revision: str | None = None,
 ) -> tuple[str, dict[str, object], ArtifactBasis]:
     """Freeze the exact source text and project semantics consumed by a script_plan request."""
 
     novel_text = load_novel_source(project_path, source, episode=episode)
+    require_script_plan_source_revision(novel_text, expected_source_revision)
     prompt_inputs, basis = build_script_plan_request(
         novel_text,
         episode=episode,
@@ -1144,6 +1178,7 @@ async def generate_drama_script_plan(
             project,
             episode,
             "drama",
+            request.expected_source_revision,
         )
     except ValueError as exc:
         raise TextGenerationError(f"❌ {exc}") from exc
@@ -1406,6 +1441,7 @@ def collect_reference_flat_violations(
     source_language: str | None,
     new_assets: object,
     prompt_policy_version: str | None = None,
+    record_manual_dialogue_edits: bool = False,
 ) -> list[DraftViolation]:
     """逐 unit 收齐 script_plan 扁平产出的全部违约（不在首个违约处中断）。
 
@@ -1474,13 +1510,16 @@ def collect_reference_flat_violations(
             validate_screenplay_coverage,
         )
 
+        aliases = screenplay_speaker_aliases(project, new_assets) if not validation.asset_problems else screenplay_speaker_aliases(project)
+        violations.extend(validate_stored_dialogue(
+            flat_units, novel_text, aliases, record_manual_edits=record_manual_dialogue_edits,
+        ))
         violations.extend(
             validate_screenplay_coverage(
                 located,
                 novel_text,
-                speaker_aliases=screenplay_speaker_aliases(project, new_assets)
-                if not validation.asset_problems
-                else screenplay_speaker_aliases(project),
+                speaker_aliases=aliases,
+                check_dialogue=not has_dialogue_bindings(flat_units),
             )
         )
     if prompt_policy_version == "drama_detail_v1":
@@ -1939,6 +1978,7 @@ async def generate_reference_script_plan(
             project,
             episode,
             "reference_video",
+            request.expected_source_revision,
         )
     except ValueError as exc:
         raise TextGenerationError(f"❌ {exc}") from exc
@@ -1948,6 +1988,14 @@ async def generate_reference_script_plan(
         scenes = cast(dict[str, Any], prompt_inputs["scenes"])
         props = cast(dict[str, Any], prompt_inputs["props"])
         split_caps = await fetch_reference_split_caps(project, config_resolver=config_resolver)
+        source_kind = cast(str | None, prompt_inputs["source_kind"]) or DEFAULT_SOURCE_KIND
+        screenplay_inputs = None
+        if source_kind == "screenplay":
+            screenplay_inputs = reference_screenplay_inputs(
+                novel_text, prompt_inputs["source_language"], prompt_inputs["speech_rate_override"],
+                split_caps.reference_durations, split_caps.text_durations, split_caps.durations,
+            )
+        dialogue = screenplay_inputs[1] if screenplay_inputs is not None else None
         prompt = build_reference_units_split_prompt(
             novel_text=novel_text,
             project_overview=cast(dict[str, Any], prompt_inputs["project_overview"]),
@@ -1961,7 +2009,7 @@ async def generate_reference_script_plan(
             max_reference_images=split_caps.max_refs,
             default_duration=split_caps.default_duration,
             episode=episode,
-            source_kind=cast(str | None, prompt_inputs["source_kind"]) or DEFAULT_SOURCE_KIND,
+            source_kind=source_kind,
             target_language=cast(str, prompt_inputs["target_language"]),
             source_language=cast(str | None, prompt_inputs["source_language"]),
             speech_rate_override=cast(float | None, prompt_inputs["speech_rate_override"]),
@@ -1970,6 +2018,7 @@ async def generate_reference_script_plan(
             next_episode_outline=cast(dict[str, Any] | None, prompt_inputs["next_episode_outline"]),
             instructions=instructions,
             drama_detail_enabled=request.prompt_policy_version == "drama_detail_v1",
+            screenplay_inputs=screenplay_inputs,
         )
 
         if request.repair_draft_revision or request.repair_once or request.repair_recheck_task_id:
@@ -1985,6 +2034,7 @@ async def generate_reference_script_plan(
                 basis=script_plan_basis,
                 caps=split_caps,
                 initial_prompt=prompt,
+                dialogue=dialogue,
                 before_commit=before_commit,
             )
 
@@ -2003,7 +2053,7 @@ async def generate_reference_script_plan(
                 draft_path,
                 formal_script_plan_path,
             )
-        schema = build_reference_units_script_plan_model(split_caps.durations, use_source_spans=True)
+        schema = build_reference_units_script_plan_model(split_caps.durations, use_source_spans=True, bind_dialogue=dialogue is not None)
         generator = await TextGenerator.create(
             TextTaskType.SCRIPT, project_name=project_name, purpose=CallPurpose.SCRIPT_GENERATION
         )
@@ -2017,7 +2067,8 @@ async def generate_reference_script_plan(
         )
         try:
             flat = await asyncio.to_thread(
-                parse_reference_script_plan_candidate, result.text, schema, split_caps.durations, novel_text
+                parse_reference_script_plan_candidate, result.text, schema, split_caps.durations, novel_text,
+                dialogue=dialogue, project=project,
             )
         except ScriptPlanParseError as exc:
             async with draft_locks.async_file_lock(draft_path):
@@ -2026,6 +2077,8 @@ async def generate_reference_script_plan(
                     _quarantine_invalid_script_plan_generation, project_path, episode, QUARANTINE_KIND_SCRIPT_PLAN,
                     exc.content, exc.violations, request.source, formal_baseline,
                     prompt_policy_version=request.prompt_policy_version, raw_response=result.text,
+                    dialogue_source_revision=prefixed_canonical_json_digest(novel_text) if dialogue is not None else None,
+                    dialogue_fragment_ids=[fragment.id for fragment in dialogue] if dialogue is not None else None,
                 )
             raise TextGenerationError(report) from exc
         flat_units = flat.get("units")
@@ -2150,6 +2203,7 @@ async def generate_narration_script_plan(
             project,
             episode,
             "narration",
+            request.expected_source_revision,
         )
     except ValueError as exc:
         raise TextGenerationError(f"❌ {exc}") from exc

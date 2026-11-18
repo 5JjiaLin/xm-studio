@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from lib.db import async_session_factory
 from lib.db.repositories.usage_repo import UsageRepository
+from lib.episode.episode_ledger import episode_source_text_revision
 from lib.episode.episode_source_commands import EpisodeSourceError, set_episode_source_text
 from lib.episode.script_batch_state import require_batch_idle
 from lib.generation.generation_admission import generation_admission_lock
@@ -18,6 +19,7 @@ from lib.infra.async_thread import run_sync_transaction
 from lib.jianying_draft.local_delivery import LocalSettings
 from lib.project.production_management import MANAGEMENT_RESOURCE, set_archive
 from lib.project.project_change_hints import project_change_source
+from lib.script.source_loader import SourceLoader
 from server.auth import CurrentUser
 from server.i18n import Translator
 from server.routers._episode_source_errors import episode_source_http_error
@@ -188,10 +190,27 @@ async def preview_source(_t: Translator, file: UploadFile = File(...)):
     """Extract only: no project, episode or model call is created by preview."""
     if (file.filename or "").lower().rsplit(".", 1)[-1] not in {"docx", "txt", "md"}:
         raise HTTPException(status_code=400, detail=_t("source_unsupported_format", ext=file.filename or ""))
-    text = await asyncio.to_thread(extract_uploaded_source_text, file, _t)
+    text = await asyncio.to_thread(extract_uploaded_source_text, file, _t, require_lossless=True)
     if not text.strip():
         raise HTTPException(status_code=422, detail=_t("episode_source_empty"))
     return {"text": text, "filename": file.filename}
+
+
+async def _read_source_form_text(upload: UploadFile | None, legacy: str | None, *, required: bool = False) -> str:
+    if upload is None:
+        if required and legacy is None:
+            raise HTTPException(status_code=422, detail="缺少剧本正文")
+        return legacy or ""
+    if legacy is not None:
+        raise HTTPException(status_code=422, detail="剧本正文参数重复")
+    limit = SourceLoader.DEFAULT_MAX_BYTES
+    raw = await upload.read(limit + 1)
+    if len(raw) > limit:
+        raise HTTPException(status_code=413, detail="剧本正文超过 50 MiB")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=422, detail="剧本正文须为 UTF-8") from exc
 
 
 @router.post("/projects/{project_name}/episodes/{episode}/production/source")
@@ -200,11 +219,15 @@ async def save_production_source(
     episode: int,
     request: Request,
     _t: Translator,
-    text: str = Form(...),
-    expected_text: str = Form(""),
+    text: str | None = Form(None),
+    expected_text: str | None = Form(None),
+    text_file: UploadFile | None = File(None),
+    expected_text_file: UploadFile | None = File(None),
     confirm: bool = Form(False),
     file: UploadFile | None = File(None),
 ):
+    body = await _read_source_form_text(text_file, text, required=True)
+    baseline = await _read_source_form_text(expected_text_file, expected_text)
     # Validate original again before any write; the edited preview is the effective source.
     if file is not None:
         await preview_source(_t, file)
@@ -219,10 +242,10 @@ async def save_production_source(
                 service(request).projects,
                 project_name,
                 episode,
-                text,
+                body,
                 source_kind="screenplay",
                 confirm=confirm,
-                expected_text=expected_text,
+                expected_text=baseline,
                 original=original,
                 protect_content=True,
             )
@@ -231,6 +254,7 @@ async def save_production_source(
             "applied": written.applied,
             "needs_confirmation": not written.applied,
             "affected_episodes": written.affected_episodes,
+            "source_revision": episode_source_text_revision(body) if written.applied else None,
         }
 
     try:

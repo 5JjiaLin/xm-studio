@@ -421,14 +421,17 @@ async def execute_reference_repair_plan(
     basis: Any,
     caps: Any,
     initial_prompt: str,
+    dialogue: Any = None,
     before_commit: Callable[[], None] | None = None,
 ) -> Any:
     """At most one initial response and one repair; success uses the original commit."""
     from lib.backends.text_backends.base import DEFAULT_MAX_OUTPUT_TOKENS
     from lib.backends.text_backends.base import TextGenerationRequest as BackendRequest
     from lib.infra.text_utils import strict_json_loads
+    from lib.script.reference_video.screenplay_coverage import screenplay_speaker_aliases
     from lib.script.script_models import build_reference_units_script_plan_model
     from server.text_generation import (
+        ScriptPlanParseError,
         TextGenerationError,
         TextGenerationResult,
         _commit_generated_reference_script_plan,
@@ -472,7 +475,7 @@ async def execute_reference_repair_plan(
     )
     draft_path = quarantine_path(project_path, request.episode, QUARANTINE_KIND_SCRIPT_PLAN)
     locks = await asyncio.to_thread(ProjectManager.for_project_dir, project_path)
-    initial_schema = build_reference_units_script_plan_model(caps.durations, use_source_spans=True)
+    initial_schema = build_reference_units_script_plan_model(caps.durations, use_source_spans=True, bind_dialogue=dialogue is not None)
     repair_schema = build_repair_schema(caps.durations)
     content = snapshot.get("content")
     calls = 0
@@ -508,7 +511,7 @@ async def execute_reference_repair_plan(
             project_name=project_name,
             require_complete=True,
         )
-        responses.append({"phase": phase, "text": response.text})
+        responses.append({"phase": phase, "text": response.text, "dialogue_binding": dialogue is not None})
         await evidence.record("validating" if phase == "generating" else "revalidating", responses=responses)
         await check()
         return response.text
@@ -527,6 +530,35 @@ async def execute_reference_repair_plan(
             new_assets=value.get("new_assets", []),
             prompt_policy_version=request.prompt_policy_version,
         )
+
+    async def parse_initial(text: str, *, bound: bool) -> dict[str, Any]:
+        try:
+            project = await asyncio.to_thread(projects.load_project, project_name)
+            return await asyncio.to_thread(
+                parse_reference_script_plan_candidate, text, initial_schema, caps.durations, novel,
+                dialogue=dialogue if bound else None, project=project,
+            )
+        except ScriptPlanParseError as exc:
+            if bound:
+                async with locks.async_file_lock(draft_path):
+                    await run_sync_transaction(assert_commit_inputs)
+                    report = await run_sync_transaction(
+                        _quarantine_invalid_script_plan_generation, project_path, request.episode,
+                        QUARANTINE_KIND_SCRIPT_PLAN, exc.content, exc.violations, request.source,
+                        snapshot["formal_fingerprint"], prompt_policy_version=request.prompt_policy_version,
+                        raw_response=text, dialogue_source_revision=prefixed_canonical_json_digest(novel),
+                        dialogue_fragment_ids=[fragment.id for fragment in dialogue],
+                    )
+                await evidence.record("failed", violations=violation_entries(exc.violations), recovery_rejected=True)
+                raise TextGenerationError(report) from exc
+            raise
+
+    async def merge_response(value: dict[str, Any], targets: list[dict[str, Any]], parsed: dict[str, Any]) -> dict[str, Any]:
+        aliases = None
+        if any("dialogue_fragments" in target for target in targets):
+            project = await asyncio.to_thread(projects.load_project, project_name)
+            aliases = await asyncio.to_thread(screenplay_speaker_aliases, project, value.get("new_assets"))
+        return await asyncio.to_thread(merge_repair, value, targets, parsed, source=novel, speaker_aliases=aliases)
 
     def assert_commit_inputs() -> None:
         assert_snapshot_files(project_path, request.episode, snapshot)
@@ -576,19 +608,15 @@ async def execute_reference_repair_plan(
             if last.get("phase") == "repairing":
                 parsed = await asyncio.to_thread(parse_repair_response, repair_schema, last["text"])
                 targets = await asyncio.to_thread(repair_targets, content, await validate(content), novel)
-                content = await asyncio.to_thread(merge_repair, content, targets, parsed)
+                content = await merge_response(content, targets, parsed)
             elif last.get("phase") == "generating":
-                content = await asyncio.to_thread(
-                    parse_reference_script_plan_candidate, last["text"], initial_schema, caps.durations, novel
-                )
+                content = await parse_initial(last["text"], bound=bool(last.get("dialogue_binding")))
             else:
                 raise PlanRepairError("repair_response_unknown: 恢复响应缺少可识别的生成阶段")
             await evidence.record("revalidating", candidate=content)
         elif not request.repair_draft_revision:
             text = await generate(initial_prompt, initial_schema, "generating")
-            content = await asyncio.to_thread(
-                parse_reference_script_plan_candidate, text, initial_schema, caps.durations, novel
-            )
+            content = await parse_initial(text, bound=dialogue is not None)
         violations = await validate(content)
         if request.repair_recheck_task_id and violations:
             if responses[-1].get("phase") == "generating" and snapshot.get("draft_file_digest") is None:
@@ -656,7 +684,7 @@ async def execute_reference_repair_plan(
             prompt = await asyncio.to_thread(build_repair_prompt, context)
             text = await generate(prompt, repair_schema, "repairing")
             parsed = await asyncio.to_thread(parse_repair_response, repair_schema, text)
-            candidate = await asyncio.to_thread(merge_repair, content, targets, parsed)
+            candidate = await merge_response(content, targets, parsed)
             await evidence.record("revalidating", candidate=candidate)
             violations = await validate(candidate)
             if violations:

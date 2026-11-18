@@ -2061,7 +2061,10 @@ class ScriptGenerator:
                     tolerated_speakers=dialogue_speakers(str(unit.get("text") or "")),
                     check_mention_syntax=prompt_policy_version == "drama_detail_v1",
                 )
-                assert_dialogue_preserved(label, str(unit.get("text") or ""), authored_text)
+                assert_dialogue_preserved(
+                    label, str(unit.get("text") or ""), authored_text,
+                    required=(unit.get("source_binding") or {}).get("dialogue_ids") is not None,
+                )
                 if self.content_mode == "drama":
                     from lib.script.reference_video.temporal_validation import validate_timeline
 

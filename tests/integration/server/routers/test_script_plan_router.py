@@ -127,3 +127,16 @@ def test_conflicting_repair_modes_are_rejected_before_any_write(planning_http):
     assert response.status_code == 422
     planning_http.command.assert_not_awaited()
     assert planning_http.pm.load_project("demo") == before
+
+
+def test_start_uses_saved_instructions_and_forwards_displayed_source_revision(planning_http):
+    before = planning_http.pm.load_project("demo")
+    revision = "sha256-v1:" + "a" * 64
+    response = planning_http.client.post(
+        "/api/v1/projects/demo/episodes/1/script-plan", json={"expected_source_revision": revision}
+    )
+    assert response.status_code == 200, response.text
+    call = planning_http.command.await_args
+    assert call.args[0].value.instructions == "保留对白原文"
+    assert call.kwargs["expected_source_revision"] == revision
+    assert planning_http.pm.load_project("demo") == before

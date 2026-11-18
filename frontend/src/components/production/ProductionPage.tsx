@@ -59,7 +59,7 @@ export function ProductionPage() {
   const requestedStep = new URLSearchParams(search).get("step");
   const episodeQuery = new URLSearchParams(search).get("episode");
   const requestedEpisode = episodeQuery && /^[1-9][0-9]*$/.test(episodeQuery) ? Number(episodeQuery) : null;
-  const { episode, project, units, source, workflow, production, review, refresh, loading, refreshing, error } = useProductionProject(projectName ?? null, episodeQuery !== null && requestedEpisode === null ? -1 : requestedEpisode);
+  const { episode, project, units, source, sourceRevision, workflow, production, review, refresh, loading, refreshing, error } = useProductionProject(projectName ?? null, episodeQuery !== null && requestedEpisode === null ? -1 : requestedEpisode);
   const mentionLookup = buildMentionLookup(project);
   const [picker, setPicker] = useState(false);
   const [confirmReplan, setConfirmReplan] = useState(false);
@@ -272,7 +272,7 @@ export function ProductionPage() {
         {production?.action === "finish" && production.status === "active" && <p role="status" className="text-sm">{t(production.stage === "draft" ? "finish_draft" : "finish_render")}</p>}
         {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
         {loading ? <LoadingState variant="pane" /> : !projectName ? <ScriptInput /> : project && episode && <>
-          {step === "script" && <ScriptInput key={`${projectName}/${episode}`} projectName={projectName} episode={episode} source={source ?? ""} disabled={active} repairEnabled={review?.repair_allowed === true} readOnly={project.episodes?.find((entry) => entry.episode === episode)?.source_origin === "whole_source"} />}
+          {step === "script" && <ScriptInput key={`${projectName}/${episode}`} projectName={projectName} episode={episode} source={source ?? ""} sourceRevision={sourceRevision} disabled={active} repairEnabled={review?.repair_allowed === true} readOnly={project.episodes?.find((entry) => entry.episode === episode)?.source_origin === "whole_source"} />}
           {step === "breakdown" && <>
             <BreakdownStatus task={planTask} busy={planning} review={review} />
             {review?.repair_progress?.can_recheck && <Button type="button" variant="outline" className="self-start" disabled={active} onClick={() => void recheckPlan()}>{t("production_recheck_saved_result")}</Button>}

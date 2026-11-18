@@ -28,6 +28,8 @@ _BOM = "﻿"
 #: 就说明这不是「``@[角色]：{台词}``」的形态，此时宁可不成记号，也不静默降级成画外音。
 _SPEAKER_SEPARATORS = "：:"
 
+OFFSCREEN_SPEECH_CUE = "（画外发声）"
+
 
 def _normalize_source(text: str) -> str:
     """引用语法文本的入口归一：去掉全部 U+FEFF，并把编码形式收敛到 Unicode NFC。

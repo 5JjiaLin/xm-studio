@@ -23,6 +23,7 @@ from typing import Any, Literal, get_args
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from lib.episode.episode_paths import episode_drafts_dir, episode_script_relpath
+from lib.infra.content_digest import prefixed_canonical_json_digest
 from lib.infra.path_safety import safe_exists
 from lib.infra.text_utils import normalize_newlines
 from lib.project.project_schema import parse_project_schema_version
@@ -169,6 +170,11 @@ def normalize_source_text(text: str) -> str:
     任何按偏移切片源文的消费方必须先对源文执行本函数。
     """
     return unicodedata.normalize("NFC", normalize_newlines(text))
+
+
+def episode_source_text_revision(text: str) -> str:
+    """Identify the normalized source text seen by the reader."""
+    return prefixed_canonical_json_digest(normalize_source_text(text))
 
 
 @dataclass

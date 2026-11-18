@@ -236,8 +236,10 @@ from server.text_generation import (
     generate_drama_script_plan,
     generate_narration_script_plan,
     generate_reference_script_plan,
+    load_novel_source,
     prompt_authoring_preflight,
     require_admitted,
+    require_script_plan_source_revision,
     script_plan_preflight,
     script_plan_replan_context,
 )
@@ -1037,8 +1039,9 @@ async def generate_script_plan(
     services: Services,
     *,
     batch_context: tuple[str, str, str] | None = None,
+    expected_source_revision: str | None = None,
 ) -> ToolOutcome[Any]:
-    text_request = request.value.text_request()
+    text_request = replace(request.value.text_request(), expected_source_revision=expected_source_revision)
     from lib.episode.script_batch_state import require_batch_idle
 
     try:
@@ -1102,6 +1105,12 @@ async def generate_script_plan(
                 text_request.source,
             )
         )
+        if expected_source_revision:
+            source_text = await asyncio.to_thread(
+                load_novel_source, services.projects.get_project_path(scope.project_name),
+                text_request.source, episode=text_request.episode,
+            )
+            require_script_plan_source_revision(source_text, expected_source_revision)
         if not text_request.repair_recheck_task_id and text_request.replan_reason and text_request.replan_reason.strip():
             # Freeze the reviewed result when submitting, so queue recovery uses the same correction context.
             text_request = replace(
@@ -3438,6 +3447,7 @@ async def execute_queued_text_task(
             repair_context=payload.get("repair_context"),
             repair_recheck_task_id=payload.get("repair_recheck_task_id"),
             prompt_policy_version=payload.get("prompt_policy_version"),
+            expected_source_revision=payload.get("expected_source_revision"),
         )
         handlers = {
             _TEXT_EPISODE_SCRIPT: ("generate_episode_script", generate_episode_script_handler),

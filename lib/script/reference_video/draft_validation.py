@@ -427,18 +427,26 @@ def validate_dialogue_load(
         )
 
 
-def assert_dialogue_preserved(label: str, script_plan_text: str, prompt_authoring_text: str) -> None:
+def assert_dialogue_preserved(label: str, script_plan_text: str, prompt_authoring_text: str, *, required: bool = False) -> None:
     """prompt_authoring 保结构 diff：发声记号的序列必须与 script_plan 逐字一致。
 
     prompt_authoring 的职责是提示词编写，台词属于 script_plan 已由用户完成内容确认的内容契约。改词、增删、
     重排一律响亮失败，不静默接受——台词不配画面时正确的出路是报错回到 script_plan，而不是让 prompt_authoring
     自行把台词改成好配的样子。
     """
-    if not prompt_content_validation_enabled():
+    if not required and not prompt_content_validation_enabled():
         return
     before = normative_lines(script_plan_text)
     after = normative_lines(prompt_authoring_text)
     if before == after:
+        if required:
+            from lib.script.reference_video.dialogue_binding import speech_signature
+
+            if speech_signature(script_plan_text, {}) != speech_signature(prompt_authoring_text, {}):
+                raise DraftViolation(
+                    f"{label} 的具名画外发声位置被改动，请保留台词前的（画外发声）标记。",
+                    code="dialogue_delivery_changed", label=label,
+                )
         return
     if len(before) != len(after):
         raise DraftViolation(

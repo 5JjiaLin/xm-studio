@@ -515,7 +515,27 @@ class ScriptReviewService:
                     script_review.script_plan_write_lock(project_path, episode),
                 ):
                     self._reject_readonly_script_plan(project_name, project_path, episode)
+                    script_review.assert_base_fingerprint(path, expected)
                     previous = _read_json(path) or {}
+                    from lib.script.reference_video.dialogue_binding import (
+                        has_dialogue_bindings,
+                        retain_dialogue_sources,
+                        validate_stored_dialogue,
+                    )
+                    from lib.script.reference_video.screenplay_coverage import screenplay_speaker_aliases
+                    from server.text_generation import load_novel_source
+
+                    previous_units = previous.get("units") or []
+                    try:
+                        retain_dialogue_sources(previous_units, validated["units"])
+                        if has_dialogue_bindings(previous_units):
+                            source = load_novel_source(project_path, None, episode=episode)
+                            aliases = screenplay_speaker_aliases(project, validated.get(NEW_ASSETS_FIELD))
+                            issues = validate_stored_dialogue(validated["units"], source, aliases, record_manual_edits=True)
+                            if issues:
+                                raise ValueError("；".join(str(issue) for issue in issues))
+                    except ValueError as exc:
+                        raise ScriptReviewError("invalid_content", str(exc)) from exc
                     validated.pop("prompt_policy_version", None)
                     if previous.get("prompt_policy_version"):
                         validated["prompt_policy_version"] = previous["prompt_policy_version"]
@@ -710,6 +730,7 @@ class ScriptReviewService:
                 # 指纹按刚写盘的这份对象直接算，确认记录与实际写入内容一致。
                 dumped = validated.model_dump()
                 from lib.episode.source_kinds import episode_source_kind
+                from lib.script.reference_video.dialogue_binding import has_dialogue_bindings, validate_stored_dialogue
                 from lib.script.reference_video.draft_validation import (
                     DraftViolation,
                     out_of_order_source_anchor_indices,
@@ -740,10 +761,13 @@ class ScriptReviewService:
                         for index in out_of_order_source_anchor_indices([unit.get("source_text", "") for unit in dumped["units"]], source)
                     )
                     if screenplay:
+                        aliases = screenplay_speaker_aliases(project, resolution=asset_resolution)
+                        coverage_issues.extend(validate_stored_dialogue(dumped["units"], source, aliases))
                         coverage_issues.extend(validate_screenplay_coverage(
                             asset_resolution.rewrite_entries(dumped["units"]),
                             source,
-                            speaker_aliases=screenplay_speaker_aliases(project, resolution=asset_resolution),
+                            speaker_aliases=aliases,
+                            check_dialogue=not has_dialogue_bindings(dumped["units"]),
                         ))
                     if coverage_issues:
                         raise ScriptReviewError("invalid_content", "；".join(str(issue) for issue in coverage_issues))

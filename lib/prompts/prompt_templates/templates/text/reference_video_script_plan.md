@@ -21,6 +21,7 @@ slots:
   scene_names: 场景候选引用名列表
   prop_names: 道具候选引用名列表
   source_spans: 逐字源文切分出的带 ID 连续跨度列表；ID 用于服务端精确回填原文锚
+  dialogue_lines: 剧本原声片段清单，按源文位置排序，小说传 null
   episode_outline: 本集大纲，键齐全的对象 {title, story_beats, hook, next_episode_teaser}；无有效内容时传 null
   next_episode_outline: 下集大纲，形状同上；无有效内容时传 null
   episode: 当前集号
@@ -60,6 +61,11 @@ protected: false
 <{{ source_kind }}>
 {{ source_spans }}
 </{{ source_kind }}>
+{% if dialogue_lines %}
+<dialogue_fragments>
+{{ dialogue_lines }}
+</dialogue_fragments>
+{% endif %}
 
 {% if episode_outline %}
 <episode_outline>
@@ -105,7 +111,11 @@ protected: false
 
 # 正文书写语法
 
+{% if dialogue_lines %}
+在 `text` 中写画面描述，画面资产用 `@[名称]`，在对应叙事位置插入 `[[对白片段编号]]`。
+{% else %}
 {{ partial("shared/writing_syntax") }}
+{% endif %}
 
 # 本阶段的正文写作指引
 

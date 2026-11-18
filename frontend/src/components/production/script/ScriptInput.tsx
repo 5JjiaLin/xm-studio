@@ -36,7 +36,7 @@ function initialInput() {
   }
   catch { return DEFAULT_INPUT; }
 }
-export function ScriptInput({ projectName, episode: targetEpisode, createOnly = false, source = "", disabled = false, readOnly = false, repairEnabled = false }: { projectName?: string; episode?: number; createOnly?: boolean; source?: string; disabled?: boolean; readOnly?: boolean; repairEnabled?: boolean }) {
+export function ScriptInput({ projectName, episode: targetEpisode, createOnly = false, source = "", sourceRevision = null, disabled = false, readOnly = false, repairEnabled = false }: { projectName?: string; episode?: number; createOnly?: boolean; source?: string; sourceRevision?: string | null; disabled?: boolean; readOnly?: boolean; repairEnabled?: boolean }) {
   const draftKey = projectName ? `xm:script-draft:${projectName}:${targetEpisode}` : "xm:script-draft";
   const [initialDraft] = useState(() => restoreSourceDraft(draftKey, source, readOnly || !projectName));
   const [lastSourceProp, setLastSourceProp] = useState(source);
@@ -53,6 +53,7 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
   const selectedTemplate = STYLE_TEMPLATES.find((template) => template.id === value.templateId);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [savedText, setSavedText] = useState(initialDraft.baseline);
+  const [savedRevision, setSavedRevision] = useState<string | null>(null);
   const [needsConfirmation, setNeedsConfirmation] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [extracting, setExtracting] = useState(false);
@@ -62,6 +63,7 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
     if (readOnly || !pendingFile && (value.text === savedText || value.text === source)) {
       setValue({ ...value, text: source });
       setSavedText(source);
+      setSavedRevision(null);
     }
     setNeedsConfirmation(false);
     setConfirmed(false);
@@ -72,7 +74,7 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
     else if (!readOnly && value.text !== savedText) sessionStorage.setItem(draftKey, JSON.stringify({ text: value.text, baseline: savedText }));
     else sessionStorage.removeItem(draftKey);
   }, [value, savedText, draftKey, projectName, readOnly]);
-  const persist = async (): Promise<{ name: string; episode: number | null } | null> => {
+  const persist = async (): Promise<{ name: string; episode: number | null; revision: string | null } | null> => {
     if (busy || extracting || disabled || (!projectName && !value.title.trim()) || (!createOnly && !value.text.trim())) return null;
     if (createdName && createdEpisode && isResourceBusy("text_script_plan", createdName, scriptPlanResourceId(createdEpisode))) return null;
     setBusy(true); setError(null);
@@ -82,20 +84,23 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
         name = (await API.createProject({ title: value.title.trim(), content_mode: "drama", generation_mode: "reference_video", aspect_ratio: value.aspect, style_template_id: value.templateId })).name;
         setCreatedName(name);
       }
-      if (createOnly) return { name, episode: null };
+      if (createOnly) return { name, episode: null, revision: null };
       let episode = createdEpisode;
       if (episode == null) {
         episode = (await API.createEpisode(name, { title: value.title.trim() })).episode;
         setCreatedEpisode(episode);
       }
+      let revision = value.text === source ? sourceRevision : savedRevision;
       if (value.text !== savedText || pendingFile) {
         const result = await API.saveProductionSource(name, episode, value.text, savedText, pendingFile, confirmed);
         if (result.needs_confirmation) { setNeedsConfirmation(true); return null; }
+        revision = result.source_revision;
+        setSavedRevision(revision);
         setObservedSource(value.text);
         setSavedText(value.text); setPendingFile(null); setNeedsConfirmation(false); setConfirmed(false);
       }
       sessionStorage.removeItem(draftKey);
-      return { name, episode };
+      return { name, episode, revision };
     } catch (e) { setError(errMsg(e)); return null; }
     finally { setBusy(false); }
   };
@@ -117,7 +122,10 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
     if (target.episode == null) return;
     setBusy(true);
     try {
-      await enqueueScriptPlan(target.name, target.episode, repairEnabled && repairOnce ? { repair_once: true } : {});
+      await enqueueScriptPlan(target.name, target.episode, {
+        ...(target.revision ? { expected_source_revision: target.revision } : {}),
+        ...(repairEnabled && repairOnce ? { repair_once: true } : {}),
+      });
       setRepairOnce(false);
       sessionStorage.removeItem(draftKey);
       navigate(productionPath(target.name, "breakdown", target.episode));
