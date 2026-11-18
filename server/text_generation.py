@@ -44,14 +44,18 @@ from lib.generation.video_request_facts import (
 )
 from lib.i18n import _ as translate
 from lib.infra.async_thread import run_sync_transaction
-from lib.infra.content_digest import prefixed_sha256_file
+from lib.infra.content_digest import prefixed_canonical_json_digest, prefixed_sha256_file
 from lib.infra.json_io import load_json_or_none
 from lib.infra.path_safety import PathTraversalError, safe_join
 from lib.infra.schema_guards import is_int, is_str
 from lib.infra.text_utils import DuplicateJSONKeyError, strict_json_loads, strip_json_code_fences
 from lib.project.asset_types import ASSET_SPECS, BUCKET_KEY, asset_name_comparison_key
 from lib.project.project_manager import ProjectManager, is_reference_video_project
-from lib.prompts.prompt_builders_reference import build_reference_units_split_prompt, reference_source_spans
+from lib.prompts.prompt_builders_reference import (
+    build_reference_units_split_prompt,
+    reference_source_spans,
+    resolve_reference_span,
+)
 from lib.prompts.prompt_builders_script import build_narration_split_prompt, build_normalize_prompt
 from lib.references.reference_catalog import ReferenceCatalog, build_reference_catalog
 from lib.script import script_review
@@ -81,6 +85,7 @@ from lib.script.prompt_authoring_scope import PromptOverwriteRequired, prompt_ov
 from lib.script.reference_video.draft_validation import (
     out_of_order_source_anchor_indices,
     validate_dialogue_load,
+    validate_reference_source_bindings,
     validate_source_text_anchor,
     validate_unit_text,
 )
@@ -615,7 +620,7 @@ def _parse_script_plan_json(response_text: str, model: type[BaseModel], *, label
 def parse_reference_script_plan_candidate(
     response_text: str, schema: type[BaseModel], supported_durations: list[int], novel_text: str, *, manual: bool = False
 ) -> dict:
-    """在生成与草稿重判边界统一解析跨度响应，交给草稿/晋升流程前还原既有三字段单元。
+    """Resolve model span IDs to exact text and retain the selected source position.
 
     纯旧响应继续使用逐字原文锚校验。出现任一跨度字段就必须满足完整跨度 schema，
     不能用 source_text 或响应内的兼容标记绕过跨度校验。
@@ -633,11 +638,12 @@ def parse_reference_script_plan_candidate(
     if not uses_spans:
         return flat
     span_offsets = {span_id: (start, end) for span_id, start, end, _text in reference_source_spans(novel_text)}
+    source_revision = prefixed_canonical_json_digest(novel_text)
     canonical_units = []
     violations = []
     for index, unit in enumerate(flat["units"]):
-        start_range = span_offsets.get(unit["source_span_start"])
-        end_range = span_offsets.get(unit["source_span_end"])
+        start_range = resolve_reference_span(span_offsets, unit["source_span_start"])
+        end_range = resolve_reference_span(span_offsets, unit["source_span_end"])
         if start_range is None or end_range is None or start_range[0] > end_range[0]:
             violations.append(DraftViolation(
                 f"units[{index}] 原文跨度 {unit['source_span_start']} → {unit['source_span_end']} 无法解引用或顺序反向；请修正编号",
@@ -645,7 +651,18 @@ def parse_reference_script_plan_candidate(
                 params={"source_span_start": unit["source_span_start"], "source_span_end": unit["source_span_end"]},
             ))
             continue
-        canonical_units.append({"duration_seconds": unit["duration_seconds"], "source_text": novel_text[start_range[0]:end_range[1]], "text": unit["text"]})
+        canonical_units.append({
+            "duration_seconds": unit["duration_seconds"],
+            "source_text": novel_text[start_range[0]:end_range[1]],
+            "text": unit["text"],
+            "source_binding": {
+                "source_revision": source_revision,
+                "start": start_range[0],
+                "end": end_range[1],
+                "span_start": unit["source_span_start"],
+                "span_end": unit["source_span_end"],
+            },
+        })
     if violations:
         raise ScriptPlanParseError("原文跨度无效", flat, violations)
     flat["units"] = canonical_units
@@ -1407,8 +1424,9 @@ def collect_reference_flat_violations(
     # 台词口播量的语速与 prompt 侧同源：项目级覆盖优先，否则按语言默认。
     speech_rate_override = project_speech_rate_override(project)
     validation = plan_reference_validation(project, new_assets, flat_units)
-    violations: list[DraftViolation] = []
-    for index, flat in enumerate(validation.entries, start=1):
+    located = [{**unit, "unit_id": _reference_unit_id(episode, index)} for index, unit in enumerate(validation.entries, start=1)]
+    violations = validate_reference_source_bindings(located, novel_text)
+    for index, flat in enumerate(located, start=1):
         label = _reference_unit_label(episode, index)
         duration = flat["duration_seconds"]
         source_text = flat["source_text"]
@@ -1458,7 +1476,7 @@ def collect_reference_flat_violations(
 
         violations.extend(
             validate_screenplay_coverage(
-                validation.entries,
+                located,
                 novel_text,
                 speaker_aliases=screenplay_speaker_aliases(project, new_assets)
                 if not validation.asset_problems
@@ -1508,6 +1526,7 @@ def build_reference_units_from_flat(
                 "text": flat["text"],
                 "duration_seconds": flat["duration_seconds"],
                 "source_text": flat["source_text"],
+                **({"source_binding": flat["source_binding"]} if flat.get("source_binding") else {}),
             }
         )
     return units

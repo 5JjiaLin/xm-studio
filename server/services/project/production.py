@@ -10,15 +10,18 @@ import asyncio
 import hashlib
 import json
 import logging
+import uuid
 from contextlib import suppress
 from typing import Any
 
 from lib.config.resolver import ConfigResolver
 from lib.db import async_session_factory
 from lib.edit_timeline import EditTimelineService, RevisionAuthor
+from lib.edit_timeline.errors import EditTimelineError
 from lib.final_cut.basis import BURNED_SUBTITLES
 from lib.final_cut.service import FinalCutService
 from lib.generation.generation_batch import GenerationBatchReadModel
+from lib.generation.generation_queue import GenerationBatchNotFound
 from lib.generation.generation_result import GenerationBatchResult
 from lib.infra.async_thread import run_sync_transaction
 from lib.infra.data_root_layout import list_project_dirs
@@ -109,13 +112,17 @@ class ProductionService:
             current = await review.get_state(project, episode)
             if current["fingerprint"] != fingerprint:
                 raise ProductionError("script_plan_changed")
-            # The same accepted content cannot launch a second paid continuation.
             if (
                 state.get("action") == "assets"
                 and state.get("fingerprint") == fingerprint
                 and state["status"] == "completed"
             ):
-                return state
+                _, plan = await load_asset_sheet_batch_plan(
+                    self.projects, self.services.queue, project_name=project,
+                    scope=AssetSheetScope(episode_id=episode), user_id=user_id,
+                )
+                if not plan.target_ids and not plan.preflight.items:
+                    return state
             state = {
                 **{key: state[key] for key in ("timeline_id", "output") if key in state},
                 "episode": episode,
@@ -124,6 +131,7 @@ class ProductionService:
                 "user_id": user_id,
                 "status": "submitting",
                 "stage": "confirm",
+                "operation_id": uuid.uuid4().hex,
             }
             await self._write(project, episode, state)
             try:
@@ -154,24 +162,19 @@ class ProductionService:
             if state["status"] in {"active", "submitting", "unknown"}:
                 return state
             basis = await asyncio.to_thread(self._script_hash, project, episode)
+            admission = None
             if (
                 state.get("action") == "videos"
                 and state.get("basis") == basis
                 and state["status"] == "completed"
                 and not unit_ids
             ):
-                # Completed video batches wait for explicit review, even before a timeline exists.
-                # Rerolls use selected unit_ids; a repeated whole-episode action is idempotent.
-                if state.get("stage") == "videos" and not state.get("unit_ids"):
-                    return state
-                if state.get("stage") != "videos" and state.get("timeline_id"):
-                    output = await FinalCutService(self.projects).status(
-                        project, state["timeline_id"], narration="without_narration", subtitles=BURNED_SUBTITLES
-                    )
-                    if output.status == "current":
-                        return state
-            if durations is None:
                 admission = await self.preview_videos(project, episode, user_id, unit_ids)
+                if admission["submittable"] and all(unit["outcome"] == "reuse" for unit in admission["units"]):
+                    return state
+            if durations is None:
+                if admission is None:
+                    admission = await self.preview_videos(project, episode, user_id, unit_ids)
                 if not admission["submittable"]:
                     details = [
                         p["detail"]
@@ -188,6 +191,7 @@ class ProductionService:
                 "user_id": user_id,
                 "status": "submitting",
                 "stage": "videos",
+                "operation_id": uuid.uuid4().hex,
                 "basis": basis,
                 "durations": durations,
                 "unit_ids": unit_ids,
@@ -262,6 +266,7 @@ class ProductionService:
                 "user_id": user_id,
                 "status": "submitting",
                 "stage": "render",
+                "operation_id": uuid.uuid4().hex,
                 "narration": WITHOUT_NARRATION,
                 "basis": basis,
             }
@@ -277,10 +282,11 @@ class ProductionService:
         # Persist intent before calling a command; interruption leaves a queryable
         # ambiguous state rather than authorizing a second supplier submission.
         state.update(status="submitting", stage=stage, batch_id=None, error=None)
+        state.setdefault("operation_id", uuid.uuid4().hex)
         await self._write(project, episode, state)
         scope = ProjectScope(project_name=project, data_root=self.projects.data_root)
         # Media tool adapters return their durable batch handle for this host.
-        caller = CallerContext(user_id=state["user_id"], source="mcp")
+        caller = CallerContext(user_id=state["user_id"], source="mcp", production_batch_id=state["operation_id"])
         if stage == "prompts":
             result = await generate_episode_script(
                 ToolRequest(GenerateEpisodeScriptRequest(episode_id=episode)), scope, caller, self.services
@@ -305,28 +311,7 @@ class ProductionService:
             )
             result = await generate_videos(ToolRequest(request), scope, caller, self.services)
         else:
-            timelines = EditTimelineService(self.projects)
-            timeline_id = state.get("timeline_id")
-            if not timeline_id:
-                # The name is unique in the episode. Recover a timeline created
-                # before an interrupted journal write without creating another.
-                name = "XM Studio " + state["basis"][:12]
-                existing = await timelines.list_timelines(project, episode=episode)
-                match = next((t for t in existing if t.name == name), None)
-                timeline_id = (
-                    match.id
-                    if match
-                    else (
-                        await timelines.create_from_script(
-                            project,
-                            episode=episode,
-                            name=name,
-                            author=RevisionAuthor(kind="creator", user_id=state["user_id"]),
-                        )
-                    ).timeline.id
-                )
-                state["timeline_id"] = timeline_id
-                await self._write(project, episode, state)
+            timeline_id = await self._production_timeline(project, episode, state)
             state["narration"] = WITHOUT_NARRATION
             # Mechanical creation supplies defaults once. Keep every creator revision on rerender.
             # MCP host semantics return the durable render handle immediately.
@@ -340,7 +325,7 @@ class ProductionService:
                     )
                 ),
                 scope,
-                CallerContext(user_id=state["user_id"], source="mcp"),
+                caller,
                 self.services,
             )
         if result.problem:
@@ -366,6 +351,36 @@ class ProductionService:
             raise ProductionError(str(batch))
         await self._write(project, episode, state)
 
+    async def _production_timeline(self, project: str, episode: int, state: dict[str, Any]) -> str:
+        timelines = EditTimelineService(self.projects)
+        timeline_id = state.get("timeline_id")
+        if timeline_id:
+            try:
+                current = await timelines.read(project, timeline_id, revision=state.get("revision"))
+            except EditTimelineError as exc:
+                if exc.code != "timeline_not_found":
+                    raise
+            else:
+                if not any(clip.status == "unit_deleted" for clip in current.clips):
+                    return timeline_id
+            state.pop("revision", None)
+            state.pop("output", None)
+        # Recover a timeline created before its ID reached the journal.
+        name = "XM Studio " + state["basis"][:12]
+        existing = await timelines.list_timelines(project, episode=episode)
+        match = next((t for t in existing if t.name == name), None)
+        if match:
+            timeline_id = match.id
+        else:
+            result = await timelines.create_from_script(
+                project, episode=episode, name=name,
+                author=RevisionAuthor(kind="creator", user_id=state["user_id"]),
+            )
+            timeline_id = result.timeline.id
+        state["timeline_id"] = timeline_id
+        await self._write(project, episode, state)
+        return timeline_id
+
     async def _fail(self, project: str, episode: int, state: dict[str, Any], exc: Exception):
         state.update(status="failed" if isinstance(exc, ProductionError) else "unknown", error=str(exc))
         await self._write(project, episode, state)
@@ -376,20 +391,42 @@ class ProductionService:
             state = await asyncio.to_thread(self._read, project, episode)
             if state.get("action") == "finish":
                 if state["status"] == "submitting":
-                    # The local render submission may have been accepted before
-                    # its handle was saved. Do not silently submit it again.
-                    state.update(status="failed", error="finish_render_failed")
+                    operation = state.get("operation_id")
+                    try:
+                        if not operation:
+                            raise GenerationBatchNotFound("legacy operation has no batch ID")
+                        batch = await self.services.queue.get_generation_batch(
+                            project_name=project, batch_id=operation, user_id=state["user_id"],
+                        )
+                    except GenerationBatchNotFound:
+                        state.pop("operation_id", None)
+                        state.update(status="failed", error="finish_render_failed")
+                    else:
+                        state.update(status="active", batch_id=batch.batch_id, error=None)
                     await self._write(project, episode, state)
                     return
                 await self.post_production.advance(project, episode, state)
                 return
-            if state["status"] == "submitting":
-                # The submission holds this same lock until its handle is saved.
-                # Reaching it here means that process was interrupted. Do not
-                # infer a batch or replay a possibly accepted provider request.
-                state.update(status="unknown", error="submission_result_unknown")
+            if state["status"] in {"submitting", "unknown"} and not state.get("batch_id"):
+                operation = state.get("operation_id")
+                if not operation or state.get("stage") == "prompts":
+                    if state["status"] == "submitting":
+                        state.update(status="unknown", error="submission_result_unknown")
+                        await self._write(project, episode, state)
+                    return
+                try:
+                    original = await self.services.queue.get_generation_batch(
+                        project_name=project, batch_id=operation, user_id=state["user_id"],
+                    )
+                except GenerationBatchNotFound:
+                    state.update(status="failed", error="submission_not_started")
+                    await self._write(project, episode, state)
+                    return
+                except Exception as exc:
+                    await self._fail(project, episode, state, exc)
+                    return
+                state.update(status="active", batch_id=original.batch_id, error=None)
                 await self._write(project, episode, state)
-                return
             if state["status"] not in {"active", "unknown"} or not state.get("batch_id"):
                 return
             try:

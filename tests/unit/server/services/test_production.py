@@ -199,6 +199,9 @@ async def test_restarted_service_advances_existing_video_batch_without_resubmitt
     monkeypatch.setattr(restarted, "_script_hash", lambda *_: "basis")
     submit = AsyncMock()
     monkeypatch.setattr(restarted, "_submit", submit)
+    monkeypatch.setattr(restarted, "preview_videos", AsyncMock(return_value={
+        "submittable": True, "units": [{"unit_id": "E1U1", "outcome": "reuse"}],
+    }))
     await restarted.advance("demo", 1)
     state = await restarted.status("demo", 1)
     assert state["stage"] == "videos"
@@ -230,7 +233,8 @@ async def test_completed_video_review_allows_selected_reroll(production, monkeyp
         },
     )
     monkeypatch.setattr(production, "_script_hash", lambda *_: "basis")
-    preview = AsyncMock(return_value={"submittable": True, "confirmed_request_durations": {"E1U2": 8}})
+    preview = AsyncMock(return_value={"submittable": True, "confirmed_request_durations": {"E1U2": 8},
+        "units": [{"unit_id": "E1U1", "outcome": "reuse"}, {"unit_id": "E1U2", "outcome": "generate"}]})
     submit = AsyncMock()
     monkeypatch.setattr(production, "preview_videos", preview)
     monkeypatch.setattr(production, "_submit", submit)
@@ -257,7 +261,8 @@ async def test_single_video_completion_does_not_prevent_generating_other_missing
         },
     )
     monkeypatch.setattr(production, "_script_hash", lambda *_: "basis")
-    preview = AsyncMock(return_value={"submittable": True, "confirmed_request_durations": {"E1U2": 8}})
+    preview = AsyncMock(return_value={"submittable": True, "confirmed_request_durations": {"E1U2": 8},
+        "units": [{"unit_id": "E1U1", "outcome": "reuse"}, {"unit_id": "E1U2", "outcome": "generate"}]})
     submit = AsyncMock()
     monkeypatch.setattr(production, "preview_videos", preview)
     monkeypatch.setattr(production, "_submit", submit)
@@ -306,8 +311,13 @@ async def test_explicit_asset_generation_starts_images_and_keeps_same_action_ide
     assert state["action"] == "assets"
     state.update(status="completed")
     await production._write("demo", 1, state)
+    admission = AsyncMock(return_value=(None, SimpleNamespace(target_ids=[], preflight=SimpleNamespace(items=[]))))
+    monkeypatch.setattr("server.services.project.production.load_asset_sheet_batch_plan", admission)
     await production.start_assets("demo", 1, "default", "confirmed")
     submit.assert_awaited_once()
+    admission.return_value[1].target_ids = ["character/阿明"]
+    await production.start_assets("demo", 1, "default", "confirmed")
+    assert submit.await_count == 2
 
 
 @pytest.mark.asyncio

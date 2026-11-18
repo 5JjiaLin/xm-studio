@@ -625,6 +625,7 @@ def _flatten_reference_script_plan_units(units: list[Any]) -> list[dict[str, Any
                 "duration_seconds": unit.get("duration_seconds"),
                 "source_text": unit.get("source_text", ""),
                 "text": text if isinstance(text, str) else "",
+                **({"source_binding": unit["source_binding"]} if "source_binding" in unit else {}),
             }
         )
     return flat

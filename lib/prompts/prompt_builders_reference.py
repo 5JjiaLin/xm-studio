@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import json
 import re
+from itertools import pairwise
 
-from lib.infra.text_metrics import reading_unit_noun
+from lib.infra.text_metrics import count_reading_units, find_reading_unit_offset, reading_unit_noun
 from lib.prompts.prompt_builders_script import outline_slot, overview_slot, project_asset_appearances
 from lib.prompts.prompt_rules.asset_appearance import asset_reference_names
 from lib.prompts.prompt_templates.builtin import builtin_templates
@@ -49,6 +50,49 @@ def reference_source_spans(source_text: str) -> list[tuple[str, int, int, str]]:
     if source_text[start:].strip():
         spans.append((f"S{len(spans) + 1:04d}", start, len(source_text), source_text[start:]))
     return spans
+
+
+def resolve_reference_span(spans: dict[str, tuple[int, int]], span_id: str) -> tuple[int, int] | None:
+    """Resolve a whole span or a character range relative to that stable span."""
+    base, separator, fragment = span_id.partition(":")
+    bounds = spans.get(base)
+    if bounds is None or not separator:
+        return bounds
+    match = re.fullmatch(r"(0|[1-9][0-9]{0,8})-([1-9][0-9]{0,8})", fragment)
+    if match:
+        left, right = map(int, match.groups())
+        start, end = bounds
+        if left < right <= end - start:
+            return start + left, start + right
+    return None
+
+
+def _screenplay_span_lines(spans, source_text: str, language: str | None, budget: int) -> list[str]:
+    from lib.script.reference_video.screenplay_coverage import screenplay_source_dialogue
+
+    speech, _ = screenplay_source_dialogue(source_text)
+    ranges = iter(fragment for line in speech for fragment in line.ranges)
+    active = next(ranges, None)
+    lines = []
+    for span_id, start, end, text in spans:
+        while active and active[1] <= start:
+            active = next(ranges, None)
+        points = [0]
+        while active and active[0] < end:
+            left, right = max(start, active[0]) - start, min(end, active[1]) - start
+            while count_reading_units(text[left:right], language) > budget:
+                offset = left + find_reading_unit_offset(text[left:right], budget, language)
+                points.append(offset)
+                left = offset
+            if active[1] > end:
+                break
+            active = next(ranges, None)
+        if len(points) == 1:
+            lines.append(f"[{span_id}] {text}")
+        else:
+            points.append(len(text))
+            lines.extend(f"[{span_id}:{a}-{b}] {text[a:b]}" for a, b in pairwise(points))
+    return lines
 
 
 def build_reference_units_split_prompt(
@@ -146,7 +190,13 @@ def build_reference_units_split_prompt(
     speech_rate = speech_rate_units_per_second(source_language, speech_rate_override)
 
     source_spans = reference_source_spans(novel_text)
-    rendered_source_spans = "\n".join(f"[{span_id}] {text}" for span_id, _start, _end, text in source_spans)
+    if source_kind == "screenplay":
+        longest_tier = min(max(tiers) for tiers in (normalized_reference_durations, normalized_text_durations, normalized_durations) if tiers)
+        rendered_source_spans = "\n".join(_screenplay_span_lines(
+            source_spans, novel_text, source_language, max(1, int(speech_rate * longest_tier * 0.8)),
+        ))
+    else:
+        rendered_source_spans = "\n".join(f"[{span_id}] {text}" for span_id, _start, _end, text in source_spans)
     return builtin_templates.render(
         "text/reference_video_script_plan",
         source_kind="screenplay" if source_kind == "screenplay" else "novel",

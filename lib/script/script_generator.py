@@ -2041,7 +2041,9 @@ class ScriptGenerator:
             try:
                 model_units = compile_policy_handoffs(model_units, context_units)
             except DraftViolation as exc:
-                raise AuthoringCandidateViolation(violation_items(exc), flat.title, model_units) from exc
+                items = violation_items(exc)
+                locate_violations_by_id(items, [str(unit["unit_id"]) for unit in units])
+                raise AuthoringCandidateViolation(items, flat.title, model_units) from exc
 
         for index, (unit, flat_unit) in enumerate(zip(units, flat.units, strict=True)):
             label = f"unit {unit['unit_id']}"
@@ -2109,7 +2111,9 @@ class ScriptGenerator:
         if prompt_policy_version == "drama_detail_v1" and context_units is not None:
             from lib.script.reference_video.prompt_policy_validation import validate_policy_handoffs
 
-            violations.extend(validate_policy_handoffs(authored, context_units))
+            handoff_issues = validate_policy_handoffs(authored, context_units)
+            locate_violations_by_id(handoff_issues, [str(unit["unit_id"]) for unit in units])
+            violations.extend(handoff_issues)
         if violations:
             raise AuthoringCandidateViolation(violations, flat.title, model_units)
         return authored

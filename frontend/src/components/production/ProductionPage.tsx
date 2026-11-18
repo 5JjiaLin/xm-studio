@@ -80,12 +80,17 @@ export function ProductionPage() {
   const { busy: planning, latestTask: planTask } = useScriptPlanEntry(projectName ?? "", episode ?? 0);
   const planFailed = planTask?.status === "failed" || planTask?.status === "cancelled";
   const retryPlan = step === "breakdown" && !review?.content && planFailed;
+  const assetItems = workflow?.content?.referenced_assets ?? [];
   const imageCharacters = useActiveResourceIds("character", projectName);
   const imageScenes = useActiveResourceIds("scene", projectName);
   const imageProps = useActiveResourceIds("prop", projectName);
   const imageDerivatives = useActiveResourceIds("character_derivative", projectName);
-  const imagesBusy = imageCharacters.size + imageScenes.size + imageProps.size + imageDerivatives.size > 0;
-  const videosBusy = useActiveResourceIds("reference_video", projectName).size > 0;
+  const imagesBusy = assetItems.some(({ asset_type: kind, name, owner }) => (
+    kind === "character" ? (owner ? imageDerivatives : imageCharacters).has(name)
+    : kind === "scene" ? imageScenes.has(name) : kind === "prop" && imageProps.has(name)
+  ));
+  const activeVideos = useActiveResourceIds("reference_video", projectName);
+  const videosBusy = units.some((unit) => activeVideos.has(unit.unit_id));
   const authoring = useActiveResourceIds("text_episode_script", projectName).has(promptAuthoringResourceId(episode ?? 0));
   const authoringTask = useLatestTasksByResource(projectName ?? "", "text_episode_script").get(promptAuthoringResourceId(episode ?? 0));
   const repairTask = useLatestTasksByResource(projectName ?? "", "text_draft_repair").get(draftRepairResourceId(episode ?? 0, "reference_prompt_authoring"));
@@ -105,7 +110,6 @@ export function ProductionPage() {
   const outputUrl = projectName && outputCurrent ? API.getFileUrl(projectName, output.artifact_path, output.version) : null;
   const inputGate = workflow?.gates.production_inputs;
   const canRebuild = inputGate?.videos_ready === true;
-  const assetItems = workflow?.content?.referenced_assets ?? [];
   const completedImages = assetItems.filter((asset) => asset.sheet_state === "current" || asset.sheet_state === "stale").length;
   const allImagesReady = inputGate?.references_ready === true;
   const assetSummary = workflow?.content?.asset_summary;

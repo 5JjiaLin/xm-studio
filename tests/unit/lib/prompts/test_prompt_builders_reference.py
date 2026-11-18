@@ -1,5 +1,7 @@
 """reference_video prompt builder 单元测试。"""
 
+import re
+
 import pytest
 
 from lib.prompts.prompt_builders_reference import (
@@ -7,6 +9,7 @@ from lib.prompts.prompt_builders_reference import (
     build_reference_video_prompt,
     reference_source_spans,
     render_reference_units_for_prompt_authoring,
+    resolve_reference_span,
 )
 
 _SCENE_REFERENCE_RULE = "同一地点的连续单元**逐条重复引用**同一个场景资产，不能只在第一个单元写一次。"
@@ -58,6 +61,19 @@ def _split_prompt(**overrides) -> str:
     }
     kwargs.update(overrides)
     return build_reference_units_split_prompt(**kwargs)
+
+
+def test_long_unpunctuated_dialogue_offers_exact_sentence_internal_spans():
+    source = "阿明：" + "我们沿着这条路一直走到桥对面" * 5 + "。"
+    prompt = _split_prompt(novel_text=source, source_kind="screenplay", source_language="zh",
+                           supported_durations=[4, 8], reference_supported_durations=[8],
+                           text_supported_durations=[4, 8])
+    spans = {key: (start, end) for key, start, end, _ in reference_source_spans(source)}
+    selected = re.findall(r"\[(S0001:\d+-\d+)\]", prompt)
+    assert len(selected) >= 3
+    bounds = [resolve_reference_span(spans, key) for key in selected]
+    assert "".join(source[start:end] for start, end in bounds) == source
+    assert resolve_reference_span(spans, "S0001:1-999") is None
 
 
 def test_build_reference_video_prompt_contains_required_sections():
@@ -238,16 +254,16 @@ def test_build_reference_units_split_prompt_rejects_bad_inputs():
 
 
 def test_build_reference_units_split_prompt_writes_reference_duration_linkage():
-    """两套档位不同时，prompt 写明各自的档位与两条出路（换档位 / 去引用）。"""
+    """尚未出图的视觉引用仍按带图档规划。"""
     prompt = _split_prompt(
         supported_durations=[4, 6, 8],
         reference_supported_durations=[8],
         text_supported_durations=[4, 6, 8],
         default_duration=None,
     )
-    assert "带 `@` 引用取（8）" in prompt
+    assert "画面带 `@[资产]` 取（8）" in prompt
     assert "不带取（4, 6, 8）" in prompt
-    assert "不用 `@` 引用" in prompt
+    assert "新资产尚未出图也按带图档规划" in prompt
 
 
 def test_build_reference_units_split_prompt_states_both_tiers_without_containment():
@@ -262,7 +278,7 @@ def test_build_reference_units_split_prompt_states_both_tiers_without_containmen
         text_supported_durations=[6],
         default_duration=None,
     )
-    assert "带 `@` 引用取（4, 6, 8）" in prompt
+    assert "画面带 `@[资产]` 取（4, 6, 8）" in prompt
     assert "不带取（6）" in prompt
 
 
@@ -280,7 +296,7 @@ def test_build_reference_units_split_prompt_excludes_dialogue_speaker_from_refer
         text_supported_durations=[4, 6, 8],
         default_duration=None,
     )
-    assert "台词记号 `@[角色]{台词}` 的说话人不计入" in prompt
+    assert "只有发声、没有画面资产引用时取无图档" in prompt
 
 
 def test_build_reference_units_split_prompt_scopes_default_to_its_tier():

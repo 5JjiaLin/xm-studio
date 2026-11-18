@@ -222,10 +222,13 @@ async def test_promote_draft_repairs_span_response_mixed_speech_without_regenera
     assert out.problem is not None
     envelope = read_rv_quarantine(fake_ctx)
     assert "mixed_speech" in [item["code"] for item in envelope["violations"]]
-    assert envelope["content"]["units"][0] == rv_unit("@[张三] 在 @[村口] 等候\n@[张三]：{快走。}\n{风吹过旷野。}")
+    original = envelope["content"]["units"][0]
+    binding = original["source_binding"]
+    assert original == {**rv_unit("@[张三] 在 @[村口] 等候\n@[张三]：{快走。}\n{风吹过旷野。}"), "source_binding": binding}
+    assert (binding["span_start"], binding["span_end"], binding["start"], binding["end"]) == ("S0001", "S0001", 0, len(_RV_NOVEL))
     envelope["content"]["units"] = [
-        rv_unit("@[张三] 在 @[村口] 等候\n@[张三]：{快走。}"),
-        rv_unit("@[张三] 在 @[村口] 等候\n{风吹过旷野。}"),
+        {**rv_unit("@[张三] 在 @[村口] 等候\n@[张三]：{快走。}"), "source_binding": binding},
+        {**rv_unit("@[张三] 在 @[村口] 等候\n{风吹过旷野。}"), "source_binding": binding},
     ]
     rv_quarantine_path(fake_ctx).write_text(json.dumps(envelope, ensure_ascii=False), encoding="utf-8")
 
@@ -236,6 +239,7 @@ async def test_promote_draft_repairs_span_response_mixed_speech_without_regenera
     saved = json.loads(rv_script_plan_path(fake_ctx).read_text(encoding="utf-8"))
     assert [unit["text"] for unit in saved["units"]] == [unit["text"] for unit in envelope["content"]["units"]]
     assert all(unit["source_text"] == _RV_NOVEL for unit in saved["units"])
+    assert all(unit["source_binding"] == binding for unit in saved["units"])
 
 
 async def test_promote_draft_reports_again_without_round_limit(fake_ctx: ToolHarness, monkeypatch) -> None:

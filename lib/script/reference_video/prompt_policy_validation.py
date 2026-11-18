@@ -60,6 +60,9 @@ def compile_policy_handoffs(authored: Sequence[dict], context: Sequence[dict]) -
                         raise DraftViolation(
                             f"unit {uid}: 开场或首段人物左右位置与前组交接不一致；请修订实际镜头动作",
                             code="prompt_policy_handoff_mismatch", label=f"unit {uid}",
+                            item_id=uid,
+                            locations=({"unit_id": str(previous["unit_id"]), "section": "组尾交接"},
+                                       {"unit_id": uid, "section": "开场承接"}),
                         )
                     # Only the explicit model-owned slot is writable. Matching
                     # sides alone cannot prove matching contact or held objects.
@@ -262,7 +265,7 @@ def validate_policy_handoffs(authored: Sequence[dict], context: Sequence[dict]) 
                     DraftViolation(
                         f"unit {item.get('unit_id')}: 首个单元必须声明叙事关系为首组",
                         code="prompt_policy_narrative_relation",
-                        label=f"unit {item.get('unit_id')}",
+                        label=f"unit {uid}", item_id=uid,
                     )
                 )
             continue
@@ -271,7 +274,7 @@ def validate_policy_handoffs(authored: Sequence[dict], context: Sequence[dict]) 
                 DraftViolation(
                     f"unit {item.get('unit_id')}: 非首个单元不能声明叙事关系为首组",
                     code="prompt_policy_narrative_relation",
-                    label=f"unit {item.get('unit_id')}",
+                    label=f"unit {uid}", item_id=uid,
                 )
             )
             continue
@@ -288,11 +291,15 @@ def validate_policy_handoffs(authored: Sequence[dict], context: Sequence[dict]) 
         actual_sides = _screen_sides(_first_segment(text))
         contradicts = any(name in actual_sides and actual_sides[name] != side for name, side in expected_sides.items())
         if not handoff or normalized_opening != normalized_handoff or contradicts:
+            previous_id = str(predecessor["unit_id"])
             violations.append(
                 DraftViolation(
                     f"unit {item.get('unit_id')}: 开场承接与前一单元 {predecessor.get('unit_id')} 的组尾交接不一致",
                     code="prompt_policy_handoff_mismatch",
                     label=f"unit {item.get('unit_id')}",
+                    item_id=uid if uid in targets else previous_id,
+                    locations=({"unit_id": previous_id, "section": "组尾交接"},
+                               {"unit_id": uid, "section": "开场承接"}),
                 )
             )
     return violations

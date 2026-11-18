@@ -79,6 +79,61 @@ async def test_rebuild_renders_full_clips_and_refreshes_after_replacement(
     await asyncio.to_thread(edit_prompt)
     assert (await production.status("demo", 1))["output"]["status"] == "stale"
 
+    def replace_units():
+        script = timeline_project.load_script("demo", "episode_1.json")
+        script["video_units"] = [
+            {"unit_id": "E1U12", "text": "新确认的镜头", "duration_seconds": 4},
+        ]
+        timeline_project.save_script("demo", script, "episode_1.json")
+
+    await asyncio.to_thread(replace_units)
+    await asyncio.to_thread(install, "E1U12", 0.8)
+    replacement = await production.start_render("demo", 1, DEFAULT_USER_ID)
+    assert replacement["timeline_id"] != timeline_id
+    old = await EditTimelineService(timeline_project).read("demo", timeline_id)
+    assert [clip.unit_id for clip in old.clips] == ["E1U1", "E1U2"]
+    replacement_output = await complete(replacement)
+    new = await EditTimelineService(timeline_project).read("demo", replacement["timeline_id"])
+    assert [clip.unit_id for clip in new.clips] == ["E1U12"]
+    media = await probe_media(timeline_project.get_project_path("demo") / replacement_output["output"]["artifact_path"])
+    assert media.first_stream("video").duration_seconds == pytest.approx(0.8, abs=0.1)
+
+
+@pytest.mark.parametrize("received", [None, 0, 1, 2])
+async def test_production_recovers_original_queue_members(timeline_project, file_db_factory, received):
+    from lib.generation.generation_batch import GenerationBatchRequestedItem, GenerationBatchRequestSnapshot
+
+    queue = GenerationQueue(session_factory=file_db_factory, project_manager=timeline_project)
+    service = ProductionService(timeline_project, replace(Services.defaults(timeline_project), queue=queue))
+    ids = ("E1U1", "E1U2")
+    operation_id = "b" * 32
+    state = {"episode": 1, "status": "submitting", "action": "videos", "stage": "confirm" if received is None else "videos",
+             "user_id": DEFAULT_USER_ID, "operation_id": operation_id, "basis": service._script_hash("demo", 1)}
+    service._path("demo", 1).parent.mkdir(exist_ok=True)
+    await service._write("demo", 1, state)
+    accepted = {}
+    if received is not None:
+        await queue.create_generation_batch(
+            project_name="demo", operation="generate_videos", source="mcp", batch_id=operation_id,
+            requested=GenerationBatchRequestSnapshot(selection="explicit", requested=[
+                GenerationBatchRequestedItem(unit_id=uid) for uid in ids
+            ]), blocked=[],
+        )
+        for uid in ids[:received]:
+            task = await queue.enqueue_task(project_name="demo", task_type="reference_video", media_type="video",
+                                            resource_id=uid, source="mcp", batch_id=operation_id, batch_unit_id=uid)
+            accepted[uid] = task["task_id"]
+    restarted = ProductionService(timeline_project, service.services)
+    await restarted.advance("demo", 1)
+    recovered = await restarted.status("demo", 1)
+    assert recovered["status"] == ("active" if received else "failed")
+    if received is None:
+        assert recovered["error"] == "submission_not_started"
+    else:
+        assert recovered["batch_id"] == operation_id
+        assert {member["unit_id"]: member["task_id"] for member in recovered["members"] if member["task_id"]} == accepted
+        assert {member["unit_id"] for member in recovered["members"] if member["status"] == "failed"} == set(ids) - accepted.keys()
+
 
 async def test_manual_edits_survive_rebuild_and_media_changes_require_repair(timeline_project, file_db_factory):
     from lib.edit_timeline.model import RevisionAuthor

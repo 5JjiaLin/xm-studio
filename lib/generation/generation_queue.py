@@ -578,9 +578,10 @@ class GenerationQueue:
         blocked: list[GenerationBatchBlockedItem],
         source: str,
         user_id: str = DEFAULT_USER_ID,
+        batch_id: str | None = None,
     ) -> str:
         validate_blocked_items(requested, blocked)
-        batch_id = uuid.uuid4().hex
+        batch_id = batch_id or uuid.uuid4().hex
         try:
             async with self._task_repo() as repo:
                 await repo.create_batch(

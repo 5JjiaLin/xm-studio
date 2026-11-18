@@ -183,7 +183,14 @@ def _screenplay_docx():
 
     buffer = io.BytesIO()
     xml = b'<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
-    xml += "<w:p><w:r><w:t>第一场</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>小明：你好。</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>小红：再见。</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>第二场</w:t></w:r></w:p>".encode()
+    def paragraph(text):
+        return f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>"
+
+    rows = "".join(
+        f"<w:tr><w:tc>{paragraph(cue)}</w:tc><w:tc>{''.join(map(paragraph, lines))}</w:tc></w:tr>"
+        for cue, lines in [("人物", ["对白"]), ("小明", ["你好。", "请进。"]), ("小红", ["再见。"])]
+    )
+    xml += (paragraph("第一场") + f"<w:tbl>{rows}</w:tbl>" + paragraph("第二场")).encode()
     xml += b"</w:body></w:document>"
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("word/document.xml", xml)
@@ -199,7 +206,7 @@ def test_docx_preview_then_edited_save_retains_original_and_episode_identity(man
         preview = client.post("/api/v1/production/source-preview", files={"file": ("单集.docx", original)})
         assert preview.status_code == 200
         text = preview.json()["text"]
-        assert text.index("第一场") < text.index("小明：你好。") < text.index("小红：再见。") < text.index("第二场")
+        assert text.index("第一场") < text.index("小明：你好。\n\t请进。") < text.index("小红：再见。") < text.index("第二场")
         assert pm.load_project("demo") == before
         saved = client.post(
             url,

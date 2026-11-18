@@ -2,6 +2,7 @@ import pytest
 
 from lib.script.reference_video.screenplay_coverage import (
     screenplay_dialogue,
+    screenplay_source_dialogue,
     screenplay_speaker_aliases,
     validate_screenplay_coverage,
 )
@@ -192,3 +193,41 @@ def test_block_cues_strip_delivery_directions_and_separate_adjacent_speakers():
         speaker_aliases={"gideon": "吉迪恩", "elias": "埃利亚斯"},
     )
     assert {issue.code for issue in issues} == {"screenplay_speaker_attribution"}
+
+
+def test_source_dialogue_preserves_speaker_delivery_and_original_line_ranges():
+    source = "人物：阿明、守卫\n阿明（心声）：门开了。\n\t先等等。\n△门轴转动。\n旁白：已是深夜。\n守卫\n不准进去。\n路人\n跑过小巷。"
+    lines, ambiguous = screenplay_source_dialogue(source)
+    assert [(line.id, line.speaker, line.delivery, line.text) for line in lines] == [
+        ("D0002", "阿明", "offscreen", "门开了。\n先等等。"),
+        ("D0005", "", "narration", "已是深夜。"),
+        ("D0006", "守卫", "onscreen", "不准进去。"),
+    ]
+    assert [[source[start:end] for start, end in line.ranges] for line in lines] == [
+        ["门开了。", "先等等。"], ["已是深夜。"], ["不准进去。"],
+    ]
+    assert ambiguous == [8]
+
+
+def test_correct_words_in_the_wrong_unit_report_original_line_and_actual_unit():
+    source = "阿明：关门。\n三小时后，走廊空无一人。"
+    boundary = source.index("三小时")
+    units = [
+        {"unit_id": "E1U10", "source_text": source[:boundary], "text": "门在画面中。",
+         "source_binding": {"start": 0, "end": boundary}},
+        {"unit_id": "E1U30", "source_text": source[boundary:], "text": "空镜。@[阿明]{关门。}",
+         "source_binding": {"start": boundary, "end": len(source)}},
+    ]
+    [issue] = validate_screenplay_coverage(units, source, speaker_aliases={"阿明": "阿明"})
+    assert (issue.code, issue.item_id, issue.item_index, issue.locations) == (
+        "screenplay_dialogue_outside_unit", "E1U30", 1, ({"source_line": 1, "dialogue_id": "D0001"},),
+    )
+
+
+def test_pure_action_cannot_acquire_dialogue():
+    source = "△门自行关上。"
+    units = [{"unit_id": "E1U01", "source_text": source, "text": "镜头推进。"}]
+    assert not validate_screenplay_coverage(units, source)
+    units[0]["text"] += "{关门。}"
+    [issue] = validate_screenplay_coverage(units, source)
+    assert (issue.code, issue.item_id) == ("screenplay_dialogue_coverage", "E1U01")

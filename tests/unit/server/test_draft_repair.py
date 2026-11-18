@@ -2,12 +2,29 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from lib.script.draft_quarantine import QUARANTINE_KIND_NARRATION_SCRIPT_PLAN, QUARANTINE_KIND_SCRIPT_PLAN
 from server.draft_repair import RepairScope, build_repair_prompt, merge_repair, repair_scope
 
 _CONTENT = {"episode": 1, "segments": [{"segment_id": "E1S01"}, {"segment_id": "E1S02"}]}
+
+
+def test_item_scoped_repair_sends_all_diagnostics_without_expanding_writable_scope():
+    content = {"units": [{"text": f"shot {i}"} for i in range(20)]}
+    violations = [{"item_index": i, "message": f"诊断 {i}"} for i in range(12)]
+    violations += [
+        {"message": "衔接异常", "locations": [{"unit_id": "E1U17"}, {"unit_id": "E1U18"}]},
+        {"message": "衔接异常", "locations": [{"unit_id": "E1U18"}, {"unit_id": "E1U19"}]},
+    ]
+    scope = RepairScope("units", tuple(range(12)))
+    prompt = build_repair_prompt(QUARANTINE_KIND_SCRIPT_PLAN, content, scope, violations,
+                                 source_text="正式原词", instructions=None)
+    assert json.loads(prompt.split("<diagnostics>")[1].split("</diagnostics>")[0]) == violations
+    merged = merge_repair(content, scope, {"units": [{"text": "fixed"}] * 12})
+    assert merged["units"][12:] == content["units"][12:]
 
 
 def test_item_mode_puts_back_only_the_violating_items() -> None:

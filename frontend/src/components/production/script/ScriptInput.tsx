@@ -15,6 +15,19 @@ import { productionPath, projectPath } from "../production-paths";
 import { DEFAULT_TEMPLATE_ID, STYLE_TEMPLATES } from "@/data/style-templates";
 
 const DEFAULT_INPUT = { title: "", text: "", aspect: "9:16" as "9:16" | "16:9", templateId: DEFAULT_TEMPLATE_ID };
+type SourceDraft = { text: string; baseline: string };
+
+function restoreSourceDraft(key: string, source: string, readOnly: boolean): SourceDraft {
+  if (!readOnly) {
+    try {
+      const draft = JSON.parse(sessionStorage.getItem(key) ?? "null") as Partial<SourceDraft> | null;
+      if (typeof draft?.text === "string" && typeof draft.baseline === "string" && draft.text !== draft.baseline && draft.text !== source) {
+        return { text: draft.text, baseline: draft.baseline };
+      }
+    } catch { /* Older cache entries have no trustworthy baseline. */ }
+  }
+  return { text: source, baseline: source };
+}
 function initialInput() {
   try { const v: unknown = JSON.parse(sessionStorage.getItem("xm:script-draft") ?? "{}");
     if (!v || typeof v !== "object") return DEFAULT_INPUT;
@@ -25,26 +38,40 @@ function initialInput() {
 }
 export function ScriptInput({ projectName, episode: targetEpisode, createOnly = false, source = "", disabled = false, readOnly = false, repairEnabled = false }: { projectName?: string; episode?: number; createOnly?: boolean; source?: string; disabled?: boolean; readOnly?: boolean; repairEnabled?: boolean }) {
   const draftKey = projectName ? `xm:script-draft:${projectName}:${targetEpisode}` : "xm:script-draft";
-  const [initial] = useState(() => {
-    if (!projectName) return initialInput();
-    return { ...DEFAULT_INPUT, text: readOnly ? source : sessionStorage.getItem(draftKey) ?? source };
-  });
+  const [initialDraft] = useState(() => restoreSourceDraft(draftKey, source, readOnly || !projectName));
+  const [lastSourceProp, setLastSourceProp] = useState(source);
+  const [observedSource, setObservedSource] = useState(source);
   const { t } = useTranslation("dashboard");
   const { t: templateText } = useTranslation("templates");
   const [, navigate] = useLocation();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [repairOnce, setRepairOnce] = useState(false);
-  const [value, setValue] = useState(initial);
+  const [value, setValue] = useState(() => projectName ? { ...DEFAULT_INPUT, text: initialDraft.text } : initialInput());
   const [createdName, setCreatedName] = useState<string | null>(projectName ?? null);
   const [createdEpisode, setCreatedEpisode] = useState<number | null>(targetEpisode ?? null);
   const selectedTemplate = STYLE_TEMPLATES.find((template) => template.id === value.templateId);
-  useEffect(() => { sessionStorage.setItem(draftKey, projectName ? value.text : JSON.stringify(value)); }, [value, draftKey, projectName]);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
-  const [savedText, setSavedText] = useState(source);
+  const [savedText, setSavedText] = useState(initialDraft.baseline);
   const [needsConfirmation, setNeedsConfirmation] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [extracting, setExtracting] = useState(false);
+  if (projectName && lastSourceProp !== source) {
+    setLastSourceProp(source);
+    setObservedSource(source);
+    if (readOnly || !pendingFile && (value.text === savedText || value.text === source)) {
+      setValue({ ...value, text: source });
+      setSavedText(source);
+    }
+    setNeedsConfirmation(false);
+    setConfirmed(false);
+  }
+  const sourceConflict = !!projectName && !readOnly && observedSource !== savedText && (value.text !== savedText || !!pendingFile);
+  useEffect(() => {
+    if (!projectName) sessionStorage.setItem(draftKey, JSON.stringify(value));
+    else if (!readOnly && value.text !== savedText) sessionStorage.setItem(draftKey, JSON.stringify({ text: value.text, baseline: savedText }));
+    else sessionStorage.removeItem(draftKey);
+  }, [value, savedText, draftKey, projectName, readOnly]);
   const persist = async (): Promise<{ name: string; episode: number | null } | null> => {
     if (busy || extracting || disabled || (!projectName && !value.title.trim()) || (!createOnly && !value.text.trim())) return null;
     if (createdName && createdEpisode && isResourceBusy("text_script_plan", createdName, scriptPlanResourceId(createdEpisode))) return null;
@@ -64,6 +91,7 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
       if (value.text !== savedText || pendingFile) {
         const result = await API.saveProductionSource(name, episode, value.text, savedText, pendingFile, confirmed);
         if (result.needs_confirmation) { setNeedsConfirmation(true); return null; }
+        setObservedSource(value.text);
         setSavedText(value.text); setPendingFile(null); setNeedsConfirmation(false); setConfirmed(false);
       }
       sessionStorage.removeItem(draftKey);
@@ -71,7 +99,17 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
     } catch (e) { setError(errMsg(e)); return null; }
     finally { setBusy(false); }
   };
-  useLeaveGuard({ dirty: !createOnly && (value.text !== savedText || !!pendingFile), saving: busy || extracting, save: async () => !!(await persist()), discard: () => { setValue((v) => ({ ...v, text: savedText })); setPendingFile(null); sessionStorage.removeItem(draftKey); } });
+  const discard = () => {
+    const latest = sourceConflict ? observedSource : savedText;
+    setValue((v) => ({ ...v, text: latest }));
+    setSavedText(latest);
+    setPendingFile(null);
+    setNeedsConfirmation(false);
+    setConfirmed(false);
+    setError(null);
+    sessionStorage.removeItem(draftKey);
+  };
+  useLeaveGuard({ dirty: !createOnly && !readOnly && (value.text !== savedText || !!pendingFile), saving: busy || extracting, save: async () => !!(await persist()), discard });
   const create = async () => {
     const target = await persist();
     if (!target) return;
@@ -120,6 +158,14 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
     </>}
     {!createOnly && <div className="flex flex-col gap-2"><Label htmlFor="work-script">{t("production_script")}</Label>
       <Textarea readOnly={readOnly} id="work-script" className="min-h-80" required disabled={busy || extracting || disabled} value={value.text} onChange={(e) => setValue((p) => ({ ...p, text: e.target.value }))} placeholder={t("production_script_hint")} />
+      {sourceConflict && <div className="space-y-2">
+        <p role="status" className="text-sm text-destructive">{t("production_source_conflict")}</p>
+        <details className="text-sm">
+          <summary>{t("production_source_latest")}</summary>
+          <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words">{observedSource}</pre>
+        </details>
+        <Button type="button" variant="outline" disabled={busy || extracting} onClick={discard}>{t("production_source_use_latest")}</Button>
+      </div>}
       <Label htmlFor="script-upload">{t("production_upload")}</Label>
       <Input id="script-upload" type="file" disabled={busy || extracting || disabled || readOnly} accept=".docx,.txt,.md,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(e) => {
         const file = e.target.files?.[0]; e.target.value = ""; if (file) void upload(file);

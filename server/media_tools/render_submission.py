@@ -64,6 +64,7 @@ async def submit_render_task(
         blocked=[],
         source=caller.source,
         user_id=caller.user_id,
+        **({"batch_id": caller.production_batch_id} if caller.production_batch_id else {}),
     )
     try:
         enqueued = await enqueue_task_only(

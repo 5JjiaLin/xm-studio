@@ -137,6 +137,10 @@ async def prepare_repair_context(
             raise PlanRepairError("repair_revision_conflict: 草稿已变化，请刷新后核对")
         if "source" not in draft.meta:
             raise PlanRepairError("repair_source_missing: 草稿来源依据缺失，请重新规划")
+        formal_path = script_review.official_reference_script_plan_path(project_path, request.episode)
+        formal_baseline = await asyncio.to_thread(script_review.content_fingerprint, formal_path)
+        if "base_fingerprint" in draft.meta and draft.meta["base_fingerprint"] != formal_baseline:
+            raise PlanRepairError("repair_revision_conflict: 正式拆解已更新，请核对后再修复")
         source = draft.meta["source"]
         if request.prompt_policy_version != draft.meta.get("prompt_policy_version"):
             raise PlanRepairError("repair_policy_changed: 修复必须保留原草稿的提示词策略")
@@ -171,7 +175,7 @@ async def prepare_repair_context(
         "draft_file_digest": await asyncio.to_thread(
             _file_digest, quarantine_path(project_path, request.episode, QUARANTINE_KIND_SCRIPT_PLAN)
         ),
-        "formal_fingerprint": await asyncio.to_thread(
+        "formal_fingerprint": formal_baseline if draft is not None else await asyncio.to_thread(
             script_review.content_fingerprint,
             script_review.official_reference_script_plan_path(project_path, request.episode),
         ),

@@ -971,6 +971,19 @@ test("selected episode source survives reload and all step links preserve identi
   await expect(page.getByRole("textbox", { name: "单集剧本", exact: true })).toHaveValue("第二集：重逢，人物再次相见。");
 });
 
+test("an active video in episode one leaves episode two source editable", async ({ page, api }) => {
+  api.override({ ...multiBase,
+    "GET /api/v1/tasks?page_size=200&project_name=demo": { status: 200, body: { items: [
+      { ...planTask, task_id: "episode-one-video", task_type: "reference_video", media_type: "video", resource_id: "E1U01", status: "running" },
+    ], total: 1 } },
+  });
+  await page.goto("/app/make/demo?step=script&episode=2");
+  const script = page.getByRole("textbox", { name: "单集剧本", exact: true });
+  await expect(script).toBeEnabled();
+  await script.fill("第二集：她在门口停下。");
+  await expect(page.getByRole("button", { name: "保存剧本", exact: true })).toBeEnabled();
+});
+
 test("episode create rename reorder archive and restore use stable episode identities", async ({ page, api }) => {
   let project = structuredClone(multiProject);
   const calls: string[] = [];
@@ -1330,7 +1343,7 @@ test("blank episode opens without reading a missing source and preserves the dra
   let saved = false;
   const reads: string[] = [];
   api.override(productionBase);
-  await page.addInitScript((draft) => sessionStorage.setItem("xm:script-draft:demo:1", draft), text);
+  await page.addInitScript((draft) => sessionStorage.setItem("xm:script-draft:demo:1", JSON.stringify({ text: draft, baseline: "" })), text);
   await page.route("**/api/v1/projects/demo/workflow-status**", (route) => route.fulfill({ json: { ...workflowFixture, target: { ...workflowFixture.target, source: "source/episode_1.txt" }, content: { ...workflowFixture.content, formal_script: "absent", episode_source: saved ? "present" : "absent" } } }));
   await page.route("**/api/v1/projects/demo/source/episode_1.txt", async (route) => {
     reads.push(route.request().url());
@@ -1355,6 +1368,44 @@ test("blank episode opens without reading a missing source and preserves the dra
   await expect(page.getByRole("alert")).toHaveCount(0);
   expect(reads.length).toBeGreaterThan(0);
 });
+
+for (const edited of [false, true]) {
+  test(`reopening the script keeps the correct source baseline (edited=${edited})`, async ({ page, api }) => {
+    let source = "小明：原稿 A。";
+    const local = "小明：本地修改。";
+    const latest = "小明：已保存 B。";
+    let submissions = 0;
+    api.override(productionBase);
+    await page.route("**/api/v1/projects/demo/workflow-status**", (route) => route.fulfill({ json: {
+      ...workflowFixture, target: { ...workflowFixture.target, source: "source/episode_1.txt" },
+      content: { ...workflowFixture.content, episode_source: "present" },
+    } }));
+    await page.route("**/api/v1/projects/demo/source/episode_1.txt", (route) => route.fulfill({ contentType: "text/plain", body: source }));
+    await page.route("**/api/v1/projects/demo/episodes/1/production/source", async (route) => {
+      submissions++;
+      expect(route.request().postData()).toContain('name="expected_text"\r\n\r\n小明：原稿 A。');
+      await route.fulfill({ status: 409, json: { detail: "原稿已更新" } });
+    });
+    await page.goto("/app/make/demo?step=script&episode=1");
+    const textbox = page.getByRole("textbox", { name: "单集剧本", exact: true });
+    await expect(textbox).toHaveValue(source);
+    if (edited) {
+      await textbox.fill(local);
+      await expect.poll(() => page.evaluate(() => sessionStorage.getItem("xm:script-draft:demo:1"))).toContain(local);
+    }
+    source = latest;
+    await page.reload();
+    await expect(textbox).toHaveValue(edited ? local : latest);
+    if (edited) {
+      await page.getByText("查看最新保存稿", { exact: true }).click();
+      await expect(page.getByText(latest, { exact: true })).toBeVisible();
+      await page.getByRole("button", { name: "保存剧本", exact: true }).click();
+      await expect(page.getByRole("alert")).toBeVisible();
+      await expect(textbox).toHaveValue(local);
+    }
+    expect(submissions).toBe(edited ? 1 : 0);
+  });
+}
 
 for (const entry of ["footer", "navigation"] as const) {
   test(`confirming assets via ${entry} writes prompts once and waits for explicit video generation`, async ({ page, api }) => {

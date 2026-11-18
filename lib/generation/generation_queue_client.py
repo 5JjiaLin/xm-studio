@@ -715,6 +715,7 @@ async def submit_generation_batch(
     source: str,
     user_id: str = DEFAULT_USER_ID,
     queue: GenerationQueue | None = None,
+    batch_id: str | None = None,
 ) -> tuple[GenerationBatchReadModel, list[EnqueuedTask], list[BatchTaskResult]]:
     """Persist one admission result, enqueue its members, and return the durable read model."""
 
@@ -727,6 +728,7 @@ async def submit_generation_batch(
         blocked=blocked,
         source=source,
         user_id=user_id,
+        **({"batch_id": batch_id} if batch_id else {}),
     )
     try:
         enqueued, failures = await batch_enqueue_only(

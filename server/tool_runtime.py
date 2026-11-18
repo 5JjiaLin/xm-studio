@@ -274,6 +274,7 @@ class CallerContext:
     user_id: str
     source: Literal["embedded", "mcp", "webui"]
     batch_waiter: BatchWaiter | None = None
+    production_batch_id: str | None = None
 
     def waiting_with(self, **options: Any) -> CallerContext:
         """给等待器绑定额外选项（如 ``on_enqueued`` / ``stop_on_failure``）；没有等待器时原样返回。"""
@@ -370,6 +371,7 @@ async def submit_media_generation(
             source=caller.source,
             user_id=caller.user_id,
             queue=services.queue,
+            batch_id=caller.production_batch_id,
         )
         return MediaGenerationSubmission(batch=batch)
     batch_id = await services.queue.create_generation_batch(

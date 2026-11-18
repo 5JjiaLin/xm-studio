@@ -562,7 +562,8 @@ class ScriptReviewService:
                 content = _read_json(path)
                 if not isinstance(content, dict) or not isinstance(content.get("units"), list):
                     raise ScriptReviewError("invalid_content")
-                flat = {**content, "units": [{key: unit.get(key) for key in ("duration_seconds", "source_text", "text")} for unit in content["units"]]}
+                retained = {"duration_seconds", "source_text", "text", "source_binding"}
+                flat = {**content, "units": [{key: value for key, value in unit.items() if key in retained} for unit in content["units"]]}
                 write_quarantine(project_path, episode, QUARANTINE_KIND_SCRIPT_PLAN, content=flat, violations=[],
                     meta={"source": None, "base_fingerprint": plan_fingerprint, "user_revision": True})
         await run_sync_transaction(start)
@@ -712,6 +713,7 @@ class ScriptReviewService:
                 from lib.script.reference_video.draft_validation import (
                     DraftViolation,
                     out_of_order_source_anchor_indices,
+                    validate_reference_source_bindings,
                     validate_source_text_anchor,
                 )
                 from lib.script.reference_video.prompt_policy_validation import validate_policy_asset_descriptions
@@ -721,12 +723,13 @@ class ScriptReviewService:
                 )
                 from server.text_generation import load_novel_source
 
-                if episode_source_kind(project, episode) == "screenplay":
+                screenplay = episode_source_kind(project, episode) == "screenplay"
+                if screenplay or any(unit.get("source_binding") for unit in dumped["units"]):
                     try:
                         source = load_novel_source(project_path, None, episode=episode)
                     except ValueError as exc:
                         raise ScriptReviewError("invalid_content", str(exc)) from exc
-                    coverage_issues = []
+                    coverage_issues = validate_reference_source_bindings(dumped["units"], source)
                     for unit in dumped["units"]:
                         try:
                             validate_source_text_anchor(str(unit["unit_id"]), unit.get("source_text", ""), source)
@@ -736,11 +739,12 @@ class ScriptReviewService:
                         DraftViolation(f"unit {dumped['units'][index]['unit_id']}: 原文依据顺序与源剧本不符", code="source_text_out_of_order")
                         for index in out_of_order_source_anchor_indices([unit.get("source_text", "") for unit in dumped["units"]], source)
                     )
-                    coverage_issues.extend(validate_screenplay_coverage(
-                        asset_resolution.rewrite_entries(dumped["units"]),
-                        source,
-                        speaker_aliases=screenplay_speaker_aliases(project, resolution=asset_resolution),
-                    ))
+                    if screenplay:
+                        coverage_issues.extend(validate_screenplay_coverage(
+                            asset_resolution.rewrite_entries(dumped["units"]),
+                            source,
+                            speaker_aliases=screenplay_speaker_aliases(project, resolution=asset_resolution),
+                        ))
                     if coverage_issues:
                         raise ScriptReviewError("invalid_content", "；".join(str(issue) for issue in coverage_issues))
                 if dumped.get("prompt_policy_version") == "drama_detail_v1":

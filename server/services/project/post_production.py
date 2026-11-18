@@ -254,25 +254,7 @@ class PostProduction:
 
     async def _prepare(self, project, episode, state):
         timelines = EditTimelineService(self.projects)
-        if not state.get("timeline_id"):
-            name = "XM Studio " + state["basis"][:12]
-            existing = await timelines.list_timelines(project, episode=episode)
-            match = next((t for t in existing if t.name == name), None)
-            timeline = (
-                match.id
-                if match
-                else (
-                    await timelines.create_from_script(
-                        project,
-                        episode=episode,
-                        name=name,
-                        author=RevisionAuthor(kind="creator", user_id=state["user_id"]),
-                    )
-                ).timeline.id
-            )
-            state["timeline_id"] = timeline
-            await self.owner._write(project, episode, state)
-        timeline = state["timeline_id"]
+        timeline = await self.owner._production_timeline(project, episode, state)
         if state["local_delivery"]:
             settings = await asyncio.to_thread(delivery_store(self.projects).settings)
             compatible = await asyncio.to_thread(compatibility, settings)
@@ -418,6 +400,7 @@ class PostProduction:
         if batch.counts.failed or batch.counts.cancelled or batch.counts.blocked:
             # Local rendering can be retried without music submission.
             state["batch_id"] = None
+            state.pop("operation_id", None)
             raise ProductionError("finish_render_failed")
         output = await FinalCutService(self.projects).status(
             project, state["timeline_id"], narration=state["narration"], subtitles=BURNED_SUBTITLES

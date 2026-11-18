@@ -23,6 +23,7 @@ import unicodedata
 from collections.abc import Collection, Container, Sequence
 from typing import Any
 
+from lib.infra.content_digest import prefixed_canonical_json_digest
 from lib.project.asset_types import asset_name_comparison_key
 from lib.references.reference_catalog import build_reference_catalog
 from lib.script.draft_violation import (
@@ -119,6 +120,44 @@ def out_of_order_source_anchor_indices(source_texts: Sequence[str], novel_text: 
             continue
         previous_start = position
     return out_of_order
+
+
+def validate_reference_source_bindings(units: Sequence[dict], source: str) -> list[DraftViolation]:
+    """Check stored positions independently of semantic prompt validation."""
+    if not any(unit.get("source_binding") for unit in units):
+        return []
+    from lib.prompts.prompt_builders_reference import reference_source_spans, resolve_reference_span
+
+    spans = {key: (start, end) for key, start, end, _ in reference_source_spans(source)}
+    revision = prefixed_canonical_json_digest(source)
+    previous_start = -1
+    issues = []
+    for index, unit in enumerate(units):
+        binding = unit.get("source_binding")
+        if not binding:
+            continue  # legacy anchors remain readable
+        first = resolve_reference_span(spans, binding["span_start"])
+        last = resolve_reference_span(spans, binding["span_end"])
+        start, end = binding["start"], binding["end"]
+        item_id = unit.get("unit_id")
+        label = f"unit {item_id}" if item_id else f"units[{index}]"
+        if (
+            binding["source_revision"] != revision or first is None or last is None
+            or first[0] != start or last[1] != end or start >= end
+            or source[start:end] != unit.get("source_text")
+        ):
+            issues.append(DraftViolation(
+                f"{label} 的原文位置与当前剧本版本、跨度编号或摘录不符，请重新核对原文。",
+                code="source_binding_conflict", label=label, item_index=index, item_id=item_id,
+            ))
+        elif start < previous_start:
+            issues.append(DraftViolation(
+                f"{label} 的原文位置早于前一单元，请按原文顺序调整。",
+                code="source_text_out_of_order", label=label, item_index=index, item_id=item_id,
+            ))
+        else:
+            previous_start = start
+    return issues
 
 
 #: 全角花括号。语法只认半角，但中文输入法下模型很容易写出全角形；行里出现全角花括号时

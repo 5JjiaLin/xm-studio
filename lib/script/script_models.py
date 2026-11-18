@@ -858,6 +858,16 @@ class ReferenceResource(BaseModel):
     name: str = Field(description="商品/角色/场景/道具名称，必须在 project.json 对应 bucket 中已注册")
 
 
+class ReferenceSourceBinding(BaseModel):
+    model_config = _STRICT_CONFIG
+
+    source_revision: str
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    span_start: str
+    span_end: str
+
+
 class ReferenceVideoUnit(BaseModel):
     """视频单元——一个视频文件的最小生成粒度。
 
@@ -891,6 +901,7 @@ class ReferenceVideoUnit(BaseModel):
     # 对应原文：内容确认时从脚本规划单元透传，供创作者对照来源。对 LLM 隐藏，不在 web PATCH
     # 白名单内；Agent 可经批量编辑改写，项目有源文时须是本集源文的逐字子串。手动新增的单元为空。
     source_text: SkipJsonSchema[str] = Field(default="", description="该单元所依据的逐字原文摘录")
+    source_binding: SkipJsonSchema[ReferenceSourceBinding | None] = Field(default=None, exclude_if=lambda value: value is None)
     # 待编写：视觉层尚未补出。不带视觉层的新增条目置位，提示词编写写回或手写齐视觉层时清除；
     # 对 LLM 隐藏，不在任何 PATCH 白名单内。落盘只在置位时出现。
     pending_authoring: SkipJsonSchema[bool] = Field(default=False, description="该条目待编写")
@@ -966,6 +977,7 @@ class ReferenceScriptPlanUnit(BaseModel):
     # 逐字原文锚：拆分工具校验其为源文子串后原样落盘，供内容确认时对照与失真定位。
     # 默认空串：不带该字段的存量草稿照常通过校验。
     source_text: SkipJsonSchema[str] = Field(default="", description="该 unit 所依据的逐字原文摘录（追溯锚）")
+    source_binding: SkipJsonSchema[ReferenceSourceBinding | None] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ReferenceScriptPlanDraft(BaseModel):
@@ -1007,6 +1019,7 @@ class ReferenceScriptPlanFlatUnit(BaseModel):
         description="该单元时长（秒）",
     )
     source_text: str = Field(min_length=1, description="该单元所依据的小说原文逐字摘录（不转述、不翻译）")
+    source_binding: SkipJsonSchema[ReferenceSourceBinding | None] = Field(default=None, exclude_if=lambda value: value is None)
     text: str = Field(min_length=1, description="该单元的引用语法正文：画面描述 + 行内的台词 / 画外音记号")
 
 

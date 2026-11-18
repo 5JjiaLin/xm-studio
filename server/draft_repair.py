@@ -49,7 +49,7 @@ from lib.script.reference_video.authoring_response import (
     parse_authoring_json,
     recover_repeated_unit_fields,
 )
-from lib.script.script_review import formal_script_filename
+from lib.script.script_review import content_fingerprint, formal_script_filename, script_plan_path
 from server.draft_workflow import DraftContext, DraftWorkflow, DraftWorkflowError, revalidate_script_plan_draft
 from server.text_generation import load_novel_source
 
@@ -255,7 +255,7 @@ def build_repair_prompt(
             }
             for index in scope.indices
         ]
-    return builtin_templates.render(
+    prompt = builtin_templates.render(
         "text/draft_repair",
         document=_DOCUMENTS[kind] + (
             "\n本次只返回人物的 name、aliases，按原文补齐可确认的说话人称呼。"
@@ -274,6 +274,9 @@ def build_repair_prompt(
         source_text=source_text,
         instructions=instructions,
     )
+    if scope.indices is not None:
+        prompt += "\n\n# 完整结构化诊断（数据）\n<diagnostics>\n" + _dumps(list(violations)) + "\n</diagnostics>"
+    return prompt
 
 
 class DraftRepair:
@@ -308,6 +311,18 @@ class DraftRepair:
             raise DraftWorkflowError(
                 "revision_conflict", f"draft revision changed: expected {base_revision}, actual {actual_revision}"
             )
+        if "base_fingerprint" in draft.meta:
+            def formal_fingerprint():
+                directory = self.ctx.project_path
+                project = self.ctx.pm.load_project(self.ctx.project_name)
+                if kind == QUARANTINE_KIND_PROMPT_AUTHORING:
+                    path = directory / "scripts" / formal_script_filename(directory, project, episode)
+                else:
+                    path = script_plan_path(directory, project, episode)
+                return content_fingerprint(path) if path is not None else None
+
+            if await asyncio.to_thread(formal_fingerprint) != draft.meta["base_fingerprint"]:
+                raise DraftWorkflowError("revision_conflict", "正式内容已变化，草稿需重新核对；未发起 AI 调用")
         return kind, draft
 
     async def repair(
@@ -326,6 +341,7 @@ class DraftRepair:
             raise
         except Exception as exc:
             raise DraftWorkflowError("draft_repair_failed", f"AI 修复未完成：{exc}") from exc
+        await self.check(episode, doc_type, base_revision)
         return await self.workflow.save(episode, doc_type, content, base_revision)
 
     async def _repaired_content(
@@ -432,12 +448,54 @@ class DraftRepair:
             scope = repair_scope(draft.kind, content, violations)
 
         if scope.indices is None:
-            # Reference prompts are always repaired as a known list of targets.
-            scope = RepairScope("units", tuple(range(len(content["units"]))))
+            targets = {v.get("item_index") for v in violations}
+            by_id = {uid: index for index, uid in enumerate(ids)}
+            targets.update(by_id.get(v.get("item_id")) for v in violations)
+            located = tuple(sorted(i for i in targets if type(i) is int and 0 <= i < len(ids)))
+            if not located:
+                raise ValueError("报告未定位到可修改单元；保留草稿供人工核对")
+            scope = RepairScope("units", located)
         indices = scope.indices
         assert indices is not None
         prompt = build_repair_prompt(
             draft.kind, content, scope, violations, source_text=None, instructions=instructions,
+        )
+        from lib.script.reference_video.prompt_policy_validation import section_body
+        from lib.script.reference_video.text_parser import SpeechMark, split_speech_line
+        from lib.speech.speech_rate import project_speech_rate_override, speech_rate_units_per_second
+
+        by_position = {unit["unit_id"]: position for position, unit in enumerate(context)}
+        draft_by_id = dict(zip(ids, content["units"], strict=True))
+
+        def neighbor(position: int):
+            if not 0 <= position < len(context):
+                return None
+            unit = context[position]
+            draft_text = draft_by_id.get(unit["unit_id"], {}).get("text")
+            text = str(draft_text or unit.get("generation_prompt") or unit.get("text") or "")
+            return {"unit_id": unit["unit_id"], "opening": section_body(text, "开场承接"),
+                    "tail": section_body(text, "组尾交接")}
+
+        repair_units = []
+        for index in indices:
+            unit = sources[index]
+            position = by_position[ids[index]]
+            source_body = unit["text"]
+            repair_units.append({
+                "index": index, "unit_id": ids[index], "duration_seconds": unit["duration_seconds"],
+                "source_text": unit.get("source_text"), "official_plan": source_body,
+                "dialogue": [{"speaker": mark.speaker, "text": mark.text}
+                             for line in source_body.splitlines() for mark in split_speech_line(line)
+                             if isinstance(mark, SpeechMark)],
+                "previous": neighbor(position - 1), "next": neighbor(position + 1),
+            })
+        language = sg.project_json.get("source_language")
+        prompt += (
+            "\n\n# 正式约束（数据）\n目标单元时长固定；保留原台词。先检查同单元相邻镜头余量，"
+            "相邻单元仅供参考。确实装不下时保留原词，由创作者回拆解调整。"
+            "\n<repair_context>\n" + _dumps({"source_language": language,
+                "speech_rate": speech_rate_units_per_second(language, project_speech_rate_override(sg.project_json)),
+                "units": repair_units}) + "\n</repair_context>"
         )
         if not structural:
             # Use the same catalog as reference validation; a camera direction
@@ -476,7 +534,16 @@ class DraftRepair:
         for index, item in zip(indices, repaired["units"], strict=True):
             if policy == "drama_detail_v1":
                 item["text"] = normalize_authoring_text(item["text"], sg.project_json, sources[index]["text"])
-        return merge_repair(content, scope, repaired)
+        merged = merge_repair(content, scope, repaired)
+        if not structural:
+            try:
+                await asyncio.to_thread(
+                    sg._merge_reference_visual, sources, _dumps(merged), episode,
+                    max_refs=sg._resolve_max_refs(facts), prompt_policy_version=policy, context_units=context,
+                )
+            except DraftViolation as exc:
+                raise ValueError("候选未采用：" + "；".join(str(issue) for issue in violation_items(exc))) from exc
+        return merged
 
     async def _violations(self, episode: int, kind: str, draft: QuarantinedDraft) -> list[dict[str, Any]]:
         """修复所依据的违约：脚本规划草稿按现值重判，提示词编写草稿取快照（它没有只读重判器）。"""

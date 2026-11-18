@@ -11,6 +11,8 @@ import copy
 import re
 import unicodedata
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from typing import Literal
 
 from lib.project.asset_types import asset_name_comparison_key
 from lib.script.draft_violation import DraftViolation
@@ -27,50 +29,98 @@ _METADATA = re.compile(
 )
 # Inline character cues (including performance directions) are unambiguous.
 # Unlabeled prose is never guessed to be dialogue.
-_INLINE_SPEECH = re.compile(
-    r"^(?P<speaker>[A-Z][A-Z \d_.-]{0,60}|[\u4e00-\u9fff·]{1,16})"
-    r"(?:\s*(?:[Oo][.]?[Ss][.]?|[Vv][.]?[Oo][.]?|旁白|画外音|内心独白))?"
-    r"\s*(?:[（(][^()（）]*[）)]\s*)?[:：]\s*(?P<text>.+)$"
+_OFFSCREEN = r"(?i:O\.?\s*S\.?|V\.?\s*O\.?)|旁白|画外音|心声|内心独白|内心|画外"
+_NAME = r"[A-Z][A-Z \d_.-]{0,60}?|[\u4e00-\u9fff·]{1,16}?"
+_CUE = re.compile(
+    rf"(?P<speaker>{_NAME})(?P<delivery>\s*(?:[（(][^()（）]*[）)]|{_OFFSCREEN}))?\s*"
 )
+_INLINE_SPEECH = re.compile(r"(?P<cue>[^:：]+)[:：]\s*(?P<text>\S.*)")
 _NON_SPEAKERS = frozenset({"人物", "出场人物", "角色", "场景", "时间", "地点", "镜头", "动作", "画面"})
-_BLOCK_CUE = re.compile(r"(?P<speaker>[A-Z][A-Z \d_.-]{0,60}?)(?:\s*[（(][^()（）]*[）)])?")
+_ACTION = re.compile(r"^(?:[△▲【#]|\s*(?:动作|画面)\s*[:：])")
 
 
 def _normal(text: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFC", text)).strip()
 
 
+@dataclass(frozen=True)
+class SourceDialogue:
+    id: str
+    line: int
+    speaker: str
+    delivery: Literal["onscreen", "offscreen", "narration"]
+    text: str
+    ranges: tuple[tuple[int, int], ...]
+
+
+def _cue(raw: str) -> tuple[str, Literal["onscreen", "offscreen", "narration"]] | None:
+    raw = raw.strip()
+    if raw in {"旁白", "画外音", "无主旁白"} or raw.upper() == "NARRATOR":
+        return "", "narration"
+    cue = _CUE.fullmatch(raw)
+    if not cue or cue["speaker"].strip() in _NON_SPEAKERS:
+        return None
+    delivery = (cue["delivery"] or "").strip(" ()（）")
+    return cue["speaker"].strip(), "offscreen" if re.search(_OFFSCREEN, delivery) else "onscreen"
+
+
+def screenplay_source_dialogue(source: str) -> tuple[list[SourceDialogue], list[int]]:
+    """Extract exact speech fragments; bare Chinese cues need cast or inline evidence."""
+    lines = source.splitlines(keepends=True)
+    inlines = [_INLINE_SPEECH.fullmatch(line.strip().lstrip("# ")) for line in lines]
+    known = set()
+    for line, match in zip(lines, inlines, strict=True):
+        bare = line.strip()
+        if cast := re.fullmatch(r"(?:出场人物|人物|角色)\s*[:：]\s*(.*)", bare):
+            known.update(name.strip() for name in re.split(r"[、,，/／]", cast[1]))
+        elif match and not _METADATA.fullmatch(bare) and (identity := _cue(match["cue"])):
+            known.add(identity[0])
+
+    results: list[SourceDialogue] = []
+    ambiguous: list[int] = []
+    offset = 0
+    pending: tuple[int, str, Literal["onscreen", "offscreen", "narration"]] | None = None
+    allow_continuation = False
+    for line_number, (line, match) in enumerate(zip(lines, inlines, strict=True), start=1):
+        bare = line.strip()
+        start = offset + len(line) - len(line.lstrip())
+        end = start + len(bare)
+        offset += len(line)
+        if not bare or _ACTION.match(bare) or _METADATA.fullmatch(bare):
+            pending = None
+        elif match and (identity := _cue(match["cue"])) is not None:
+            text = match["text"]
+            results.append(SourceDialogue(f"D{line_number:04d}", line_number, *identity, text, ((end - len(text), end),)))
+            pending = None
+            allow_continuation = True
+            continue
+        elif pending and re.fullmatch(r"[（(][^()（）]*[）)]", bare):
+            if re.search(_OFFSCREEN, bare) and pending[1]:
+                pending = (pending[0], pending[1], "offscreen")
+            continue
+        elif allow_continuation and line.startswith(("\t", "　　")):
+            previous = results[-1]
+            results[-1] = replace(previous, text=previous.text + "\n" + bare, ranges=(*previous.ranges, (start, end)))
+            continue
+        elif (identity := _cue(bare.rstrip(":："))) and (
+            identity[0] in known or identity[1] != "onscreen" or bare.endswith((":", "："))
+            or re.fullmatch(r"[A-Z][A-Z \d_.-]{0,60}", identity[0])
+        ):
+            pending = (line_number, *identity)
+        elif pending:
+            cue_line, speaker, delivery = pending
+            results.append(SourceDialogue(f"D{cue_line:04d}", cue_line, speaker, delivery, bare, ((start, end),)))
+            pending = None
+            allow_continuation = True
+            continue
+        elif re.fullmatch(r"[\u4e00-\u9fff·]{1,8}", bare):
+            ambiguous.append(line_number)
+        allow_continuation = False
+    return results, ambiguous
+
+
 def screenplay_dialogue(source: str) -> list[tuple[str, str]]:
-    """Extract colon cues and standard uppercase cue blocks without rewriting words."""
-    lines = source.splitlines()
-    result: list[tuple[str, str]] = []
-    index = 0
-    while index < len(lines):
-        line = lines[index].strip().lstrip("# ")
-        match = _INLINE_SPEECH.fullmatch(line)
-        if match and match["speaker"] not in _NON_SPEAKERS:
-            result.append((match["speaker"].strip(), match["text"].strip()))
-        elif line and (cue := _BLOCK_CUE.fullmatch(line)) and not _METADATA.fullmatch(line):
-            # In screenplay layout, a cue is immediately followed by its speech,
-            # optionally with a parenthesized delivery direction on its own line.
-            end = index + 1
-            speech: list[str] = []
-            while end < len(lines) and lines[end].strip():
-                following = lines[end].strip()
-                if (
-                    following.startswith(("△", "【", "#"))
-                    or _INLINE_SPEECH.fullmatch(following)
-                    or (speech and _BLOCK_CUE.fullmatch(following))
-                ):
-                    break
-                if not re.fullmatch(r"[（(].*[）)]", following):
-                    speech.append(following)
-                end += 1
-            if speech:
-                result.append((cue["speaker"].strip(), " ".join(speech)))
-                index = end - 1
-        index += 1
-    return result
+    return [(line.speaker, line.text) for line in screenplay_source_dialogue(source)[0]]
 
 
 def screenplay_speaker_aliases(
@@ -154,62 +204,88 @@ def validate_screenplay_coverage(
             )
         )
 
-    expected = screenplay_dialogue(source)
+    expected, ambiguous = screenplay_source_dialogue(source)
     actual = [
-        part
-        for unit in units
+        (index, part)
+        for index, unit in enumerate(units)
         for line in str(unit.get("text") or "").splitlines()
         for part in split_speech_line(line)
         if isinstance(part, SpeechMark)
     ]
     # Speech may be split across units to fit a model's duration tiers. Ignore only
     # boundary whitespace; punctuation, spelling, repetitions and order stay exact.
-    pattern = " ?".join(f"({re.escape(_normal(mark.text))})" for mark in actual)
-    original = " ".join(_normal(text) for _speaker, text in expected)
+    pattern = " ?".join(f"({re.escape(_normal(mark.text))})" for _index, mark in actual)
+    original = " ".join(_normal(line.text) for line in expected)
     matched = re.fullmatch(pattern, original) if actual else None
     dialogue_mismatch = bool(expected and matched is None)
     aliases = speaker_aliases or {}
-    speaker_mismatch = False
-    unresolved: list[str] = []
+    if not expected and not ambiguous and actual:
+        issues.extend(
+            DraftViolation(
+                "源剧本没有可发声的对白；此单元新增了台词。",
+                code="screenplay_dialogue_coverage", item_index=index, item_id=units[index].get("unit_id"),
+            )
+            for index in dict.fromkeys(index for index, _ in actual)
+        )
     if expected and matched is not None:
         # Attribute every intersecting span, so splitting a speech across units or
         # merging adjacent speeches cannot bypass the speaker check.
         offset = 0
-        for source_speaker, text in expected:
-            end = offset + len(_normal(text))
-            expected_asset = aliases.get(asset_name_comparison_key(source_speaker).casefold())
-            if speaker_aliases is not None and expected_asset is None:
-                unresolved.append(source_speaker)
-            if expected_asset is not None:
-                for index, mark in enumerate(actual, start=1):
-                    start_actual, end_actual = matched.span(index)
-                    if start_actual >= end or end_actual <= offset:
-                        continue
-                    actual_key = asset_name_comparison_key(mark.speaker).casefold()
-                    actual_asset = aliases.get(actual_key, mark.speaker)
-                    if (
-                        asset_name_comparison_key(actual_asset).casefold()
-                        != asset_name_comparison_key(expected_asset).casefold()
-                    ):
-                        speaker_mismatch = True
+        for speech in expected:
+            end = offset + len(_normal(speech.text))
+            source_key = asset_name_comparison_key(speech.speaker).casefold()
+            expected_asset = aliases.get(source_key, speech.speaker)
+            for group, (index, mark) in enumerate(actual, start=1):
+                start_actual, end_actual = matched.span(group)
+                if start_actual >= end or end_actual <= offset:
+                    continue
+                unit = units[index]
+                unit_id = unit.get("unit_id")
+                label = unit_id or f"单元 {index + 1}"
+                coordinates = {"source_line": speech.line, "dialogue_id": speech.id}
+                actual_key = asset_name_comparison_key(mark.speaker).casefold()
+                actual_asset = aliases.get(actual_key, mark.speaker)
+                if speaker_aliases is not None and source_key and source_key not in aliases and speech.delivery == "onscreen":
+                    issues.append(DraftViolation(
+                        f"{label}：原文第 {speech.line} 行说话人 {speech.speaker} 未匹配已登记或建议人物。",
+                        code="screenplay_speaker_unresolved", item_index=index, item_id=unit_id, locations=(coordinates,),
+                    ))
+                elif (speaker_aliases is not None or speech.delivery != "onscreen") and (
+                    asset_name_comparison_key(actual_asset).casefold() != asset_name_comparison_key(expected_asset).casefold()
+                ):
+                    issues.append(DraftViolation(
+                        f"{label}：原文第 {speech.line} 行 {speech.id}「{speech.text}」应由"
+                        f" {expected_asset or '无主旁白'} 发声，当前为 {actual_asset or '无主旁白'}。",
+                        code="screenplay_speaker_attribution", item_index=index, item_id=unit_id, locations=(coordinates,),
+                    ))
+                if binding := unit.get("source_binding"):
+                    prefix_len = 0
+                    for range_start, range_end in speech.ranges:
+                        fragment = _normal(source[range_start:range_end])
+                        fragment_start = offset + prefix_len
+                        fragment_end = fragment_start + len(fragment)
+                        prefix_len += len(fragment) + 1
+                        if start_actual >= fragment_end or end_actual <= fragment_start:
+                            continue
+                        a = max(range_start, binding["start"])
+                        b = min(range_end, binding["end"])
+                        if a < b and (
+                            len(_normal(source[range_start:a])) <= max(0, start_actual - fragment_start)
+                            and len(_normal(source[b:range_end])) <= max(0, fragment_end - end_actual)
+                        ):
+                            continue
+                        issues.append(DraftViolation(
+                            f"{label}：台词「{mark.text}」属于原文第 {speech.line} 行 {speech.id}，超出本单元所选原文范围。",
+                            code="screenplay_dialogue_outside_unit", item_index=index, item_id=unit_id, locations=(coordinates,),
+                        ))
                         break
-            if speaker_mismatch:
-                break
             offset = end + 1
-    if unresolved:
-        issues.append(DraftViolation(
-            f"源剧本说话人 {'、'.join(dict.fromkeys(unresolved))} 无法对应已登记或建议人物；请在人物 aliases 补充原文称呼后重验",
-            code="screenplay_speaker_unresolved",
-        ))
-    if dialogue_mismatch or speaker_mismatch:
-        detail = "说话人归属不匹配" if speaker_mismatch and not dialogue_mismatch else "发声记号未按序逐字保留"
+    if dialogue_mismatch:
         issues.append(
             DraftViolation(
-                f"源剧本可识别出 {len(expected)} 段对白，但{detail}；"
+                f"源剧本可识别出 {len(expected)} 段对白，但发声记号未按序逐字保留；"
                 "请补齐遗漏对白，保留原文拼写和标点，不得只把台词放进 source_text 或画面描述。",
-                code="screenplay_speaker_attribution"
-                if speaker_mismatch and not dialogue_mismatch
-                else "screenplay_dialogue_coverage",
+                code="screenplay_dialogue_coverage",
             )
         )
     return issues

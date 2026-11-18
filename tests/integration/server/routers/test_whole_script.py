@@ -61,11 +61,15 @@ def test_upload_preview_import_and_explicit_start(whole_client, extension):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
             paragraphs = "".join(f"<w:p><w:r><w:t>{line}</w:t></w:r></w:p>" for line in TEXT.splitlines())
+            rows = "".join(
+                "<w:tr>" + "".join(f"<w:tc><w:p><w:r><w:t>{cell}</w:t></w:r></w:p></w:tc>" for cell in row) + "</w:tr>"
+                for row in [("角色", "台词"), ("乙", "让我看看。"), ("甲", "请进。")]
+            )
             archive.writestr(
                 "word/document.xml",
                 '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
                 + paragraphs
-                + "</w:body></w:document>",
+                + f"<w:tbl>{rows}</w:tbl></w:body></w:document>",
             )
         raw = buffer.getvalue()
     upload = (f"整本.{extension}", raw)
@@ -81,7 +85,10 @@ def test_upload_preview_import_and_explicit_start(whole_client, extension):
         ids = imported.json()["episodes"]
         assert len(ids) == 2
         directory = pm.get_project_path("demo")
-        assert "盔甲" in episode_source_path(directory, ids[1]).read_text()
+        second_source = episode_source_path(directory, ids[1]).read_text()
+        assert "盔甲" in second_source
+        if extension == "docx":
+            assert second_source.index("盔甲") < second_source.index("乙：让我看看。") < second_source.index("甲：请进。")
         assert next((directory / "source" / "raw").rglob(f"*.{extension}")).read_bytes() == raw
         state = client.get(BASE + "/script-batch").json()
         assert state["status"] == "idle"
