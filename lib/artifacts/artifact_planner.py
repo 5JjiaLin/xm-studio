@@ -763,10 +763,12 @@ class TargetStatePlanner:
                 self._skip(script_plan_key, script_plan_rel, f"episode source {source_rel} is not UTF-8")
                 return
             try:
+                from lib.project.archive_context import generation_project
+
                 script_plan_basis = build_script_plan_basis(
                     source_content,
                     episode=binding.episode,
-                    project=self.project,
+                    project=generation_project(self.project_dir, self.project, episode=binding.episode),
                 )
             except (TypeError, ValueError):
                 pass

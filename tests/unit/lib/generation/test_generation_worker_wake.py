@@ -2,7 +2,10 @@ import asyncio
 from datetime import datetime
 from typing import Any
 
+import pytest
+
 from lib.generation.generation_worker import CapacityTable, GenerationWorker
+from lib.infra.server_runtime import runtime
 from tests.fakes import refuse_resume_execution
 
 
@@ -67,3 +70,44 @@ async def test_wake_claims_task_without_waiting_for_poll_interval() -> None:
         assert queue.succeeded == [("wake-task", {"ok": True})]
     finally:
         await worker.stop()
+
+
+@pytest.mark.parametrize("pause_at", ["claim", "projection"])
+async def test_pause_during_claim_or_projection_returns_task_without_starting_paid_work(monkeypatch, pause_at):
+    requeued = []
+
+    class PausingQueue:
+        async def claim_next_task(self, **kwargs):
+            if pause_at == "claim":
+                monkeypatch.setattr(runtime, "maintenance", True)
+            return {"task_id": "pending", "media_type": "text"}
+
+    async def projection(task):
+        if pause_at == "projection":
+            monkeypatch.setattr(runtime, "maintenance", True)
+        return "text"
+
+    async def execute(task, **kwargs):
+        pytest.fail("maintenance dispatched paid work")
+
+    async def requeue(task_id):
+        requeued.append(task_id)
+
+    monkeypatch.setattr(runtime, "maintenance", False)
+    worker = GenerationWorker(
+        queue=PausingQueue(),
+        capacity=CapacityTable(_limits={}, _defaults={"text": 1}),
+        provider_projection=projection,
+        executor=execute,
+        lanes=("text",),
+        resume_executor=refuse_resume_execution,
+    )
+    monkeypatch.setattr(worker, "_requeue_single_task", requeue)
+    monkeypatch.setattr(worker, "_record_provider", lambda *args: _true())
+    assert not await worker._claim_tasks()
+    assert requeued == ["pending"]
+    assert worker.active_count == 0
+
+
+async def _true():
+    return True

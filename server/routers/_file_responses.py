@@ -11,6 +11,7 @@ from __future__ import annotations
 import mimetypes
 import os
 from collections.abc import Mapping
+from pathlib import Path
 
 from fastapi import Request, Response
 from fastapi.responses import FileResponse
@@ -26,13 +27,26 @@ REVALIDATE_CACHE_CONTROL = "no-cache"
 # 不挂载、不读目录；directory=None 时构造不触碰文件系统
 _CONDITIONAL_CHECKER = StaticFiles(directory=None, check_dir=False)
 
+# Native browser media must not depend on optional Windows registry MIME entries.
+_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+}
+
 
 def guess_media_type(path: str | os.PathLike[str]) -> str:
     """按扩展名推断响应的 media type，与 ``FileResponse`` 的默认推断同口径。
 
     进程内首次调用会加载系统 mime 表（读文件），调用方放进工作线程。
     """
-    return mimetypes.guess_type(path)[0] or "application/octet-stream"
+    known_type = _MEDIA_TYPES.get(Path(path).suffix.lower())
+    return known_type or mimetypes.guess_type(path)[0] or "application/octet-stream"
 
 
 def cached_file_response(
@@ -43,6 +57,7 @@ def cached_file_response(
     immutable: bool,
     headers: Mapping[str, str] | None = None,
     media_type: str | None = None,
+    private: bool = False,
 ) -> Response:
     """按缓存策略构造文件响应；请求带的校验器与当前文件一致时返回 304。
 
@@ -53,7 +68,13 @@ def cached_file_response(
     返回 304（RFC 9110 §13.2.2 的求值顺序）。
     """
     merged = dict(headers or {})
-    merged["Cache-Control"] = IMMUTABLE_CACHE_CONTROL if immutable else REVALIDATE_CACHE_CONTROL
+    if private:
+        # Every media request must re-enter authorization after logout or member
+        # removal, including versioned URLs and thumbnails. Do not cache bytes.
+        merged["Cache-Control"] = "private, no-store"
+        merged["Vary"] = "Cookie, Authorization"
+    else:
+        merged["Cache-Control"] = IMMUTABLE_CACHE_CONTROL if immutable else REVALIDATE_CACHE_CONTROL
     response = FileResponse(path, headers=merged, media_type=media_type, stat_result=stat_result)
     if request.method in ("GET", "HEAD") and _CONDITIONAL_CHECKER.is_not_modified(response.headers, request.headers):
         return NotModifiedResponse(response.headers)

@@ -27,6 +27,7 @@ from typing import Any, Literal
 
 from pydantic import ValidationError
 
+from lib.project.archive_context import ARCHIVED_ASSET_NAMES
 from lib.project.asset_derivatives import derivative_table, ensure_derivative_table, find_derivative_name
 from lib.project.asset_types import (
     ASSET_SPECS,
@@ -104,6 +105,7 @@ class _Registration:
     description: str
     generation_prompt: str = ""
     aliases: list[str] = field(default_factory=list)
+    archive_replacement: bool = False
 
 
 @dataclass
@@ -116,6 +118,7 @@ class NewAssetResolution:
     aliases: list[tuple[str, str, str]]
     #: 与已登记的同类资产同名、确认时自动归并的新增项：``(类型, 称呼, 资产名)``。
     auto_merged: list[tuple[str, str, str]]
+    isolated_derivatives: set[tuple[str, str]] = field(default_factory=set)
 
     def rewrite_entries(self, entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         """返回改写引用后的规划条目副本。"""
@@ -205,6 +208,12 @@ class NewAssetResolution:
                         bucket[name]["generation_prompt"] = registration.generation_prompt
                     existing = name
                 entry = bucket[existing]
+                if registration.archive_replacement and (
+                    not isinstance(entry, dict)
+                    or entry.get("description") != registration.description
+                    or entry.get("generation_prompt", "") != registration.generation_prompt
+                ):
+                    raise ValueError(f"新资产「{name}」被其他任务占用，请刷新后重新确认拆解")
                 if isinstance(entry, dict):
                     record_asset_aliases(entry, registration.aliases, asset_name=existing)
         for asset_type, name, alias in self.aliases:
@@ -225,6 +234,10 @@ class NewAssetResolution:
                 table[derivative] = {"description": description, ASSET_SPECS["character"].sheet_field: ""}
             elif asset_name_comparison_key(existing) != asset_name_comparison_key(derivative):
                 raise ValueError(f"衍生名「{derivative}」与「{base}」已有的衍生「{existing}」重名")
+            elif (base, derivative) in self.isolated_derivatives and (
+                not isinstance(table[existing], dict) or table[existing].get("description") != description
+            ):
+                raise ValueError(f"新衍生「{base}/{derivative}」被其他任务占用，请刷新后重新确认拆解")
 
 
 def _remap_mention(outcome: _Outcome | None, speaker: bool) -> str | None:
@@ -292,6 +305,12 @@ class _Resolver:
         parsed, self.problems = _parse_items(raw_items)
         self.registered, self.owners = _registered_names(project)
         self.namespace = _namespace_names(project)
+        self.archived_namespace = {
+            asset_name_namespace_key(name)
+            for names in project.get(ARCHIVED_ASSET_NAMES, {}).values()
+            for name in names
+        }
+        self.archived_replacements: dict[tuple[str, str], str] = {}
         #: 判重键 → 本次已登记的 (类型, 登记名)；两项新增的登记名只差大小写时后一项落不了地。
         self.claimed: dict[str, tuple[str, str]] = {}
         #: (类型, 称呼判等键) → (下标, 新增项)；同类同名只留第一项。
@@ -326,6 +345,7 @@ class _Resolver:
         self.registrations: dict[str, dict[str, _Registration]] = {asset_type: {} for asset_type in _TYPES}
         self.aliases: list[tuple[str, str, str]] = []
         self.derivatives: list[tuple[str, str, str]] = []
+        self.isolated_derivatives: set[tuple[str, str]] = set()
         #: 本体 → 本次新登记的衍生名（值不用）；同一本体下两项新增衍生只差大小写时后一项落不了地。
         self.claimed_derivatives: dict[str, dict[str, None]] = {}
         self.auto_merged: list[tuple[str, str, str]] = []
@@ -365,6 +385,7 @@ class _Resolver:
             derivatives=self.derivatives,
             aliases=self.aliases,
             auto_merged=self.auto_merged,
+            isolated_derivatives=self.isolated_derivatives,
         )
 
     def _asset(self, asset_type: str, key: str, chain: tuple[str, ...]) -> str | None:
@@ -399,6 +420,35 @@ class _Resolver:
 
     def _register(self, asset_type: str, key: str, index: int, item: PlanNewAsset) -> str | None:
         final = validate_asset_name(item.asset_name or item.name)
+        replacement_key = (asset_type, asset_name_namespace_key(final))
+        if replacement_key in self.archived_replacements:
+            final = self.archived_replacements[replacement_key]
+        elif asset_name_namespace_key(final) in self.archived_namespace:
+            # Keep archived scripts/images bound to their original identity. A new
+            # same-name declaration gets a separate registry entry and rewritten refs.
+            base = final
+            number = 2
+            requested = {
+                asset_name_namespace_key(other.asset_name or other.name)
+                for _, other in self.items.values()
+            }
+            while True:
+                final = f"{base}（新版{number}）"
+                candidate = asset_name_namespace_key(final)
+                existing = self.registered[asset_type].get(asset_name_comparison_key(final))
+                entry = self.project.get(ASSET_SPECS[asset_type].bucket_key, {}).get(existing)
+                if (
+                    isinstance(entry, Mapping)
+                    and item.name in entry.get("aliases", [])
+                    and entry.get("description") == item.description
+                    and entry.get("generation_prompt", "") == item.generation_prompt
+                    and candidate not in self.archived_namespace
+                ):
+                    break  # Revalidating/reconfirming an already materialized plan.
+                if candidate not in self.archived_namespace | set(self.namespace) | set(self.claimed) | requested:
+                    break
+                number += 1
+            self.archived_replacements[replacement_key] = final
         final_key = asset_name_comparison_key(final)
         registered = self.registered[asset_type].get(final_key)
         if registered is not None:
@@ -421,7 +471,9 @@ class _Resolver:
         registration = registrations.get(final)
         if registration is None:
             registrations[final] = registration = _Registration(
-                item.description, generation_prompt=item.generation_prompt
+                item.description,
+                generation_prompt=item.generation_prompt,
+                archive_replacement=replacement_key in self.archived_replacements,
             )
         registration.aliases.extend((item.name, *item.aliases))
         return final
@@ -456,6 +508,21 @@ class _Resolver:
             )
             return
         derivative = validate_asset_name(item.asset_name or item.name)
+        if asset_name_namespace_key(f"{base}/{derivative}") in self.archived_namespace:
+            original = derivative
+            number = 2
+            table = _derivatives_of(self.project, base)
+            while True:
+                derivative = f"{original}（新版{number}）"
+                existing_key = find_derivative_name(table, derivative)
+                existing_entry = table.get(existing_key)
+                if asset_name_namespace_key(f"{base}/{derivative}") not in self.archived_namespace:
+                    if existing_key is None and find_derivative_name(self.claimed_derivatives.get(base, {}), derivative) is None:
+                        break
+                    if isinstance(existing_entry, Mapping) and existing_entry.get("description") == item.description:
+                        break
+                number += 1
+            self.isolated_derivatives.add((base, derivative))
         existing = find_derivative_name(_derivatives_of(self.project, base), derivative)
         owner = "已有的"
         if existing is None:

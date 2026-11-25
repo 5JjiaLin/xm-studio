@@ -60,7 +60,7 @@ export interface ScriptImport { import_id: string; episodes: number[]; fingerpri
 export interface ScriptBatchState {
   status: "idle" | "active" | "submitting" | "unknown" | "stopping" | "stopped" | "failed" | "completed";
   import_id?: string; error?: string | null; input_changed?: boolean; input_revision?: string;
-  items: Array<{ episode: number; position?: number | null; title?: string; status: "pending" | "submitting" | "active" | "unknown" | "failed" | "completed" }>;
+    items: Array<{ episode: number; position?: number | null; title?: string; requires_provider_check?: boolean; status: "pending" | "submitting" | "active" | "unknown" | "failed" | "completed" }>;
   imports: ScriptImport[];
 }
 

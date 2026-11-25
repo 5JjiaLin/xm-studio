@@ -1,7 +1,10 @@
 """Unit tests for SdkTranscriptAdapter."""
 
+import asyncio
 import os
 import tempfile
+import threading
+from uuid import uuid4
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -170,6 +173,56 @@ class TestSdkTranscriptAdapterStorePath:
         assert args[0] is fake_store
         assert args[1] == "sdk-session-x"
         assert kwargs.get("directory") == "/tmp/proj"
+
+    async def test_sdk_parsing_runs_off_loop_but_store_reads_stay_on_owner_loop(self, tmp_path):
+        from lib.agent.agent_session_store import make_project_key
+        from server.agent_runtime.sdk_transcript_adapter import _decode_main
+
+        owner_loop = asyncio.get_running_loop()
+        owner_thread = threading.get_ident()
+        reads = []
+
+        class Store:
+            async def load(self, key):
+                assert asyncio.get_running_loop() is owner_loop
+                assert threading.get_ident() == owner_thread
+                reads.append(key)
+                return [
+                    {
+                        "type": "user",
+                        "uuid": "message-1",
+                        "parentUuid": None,
+                        "timestamp": "2026-11-10T08:00:00Z",
+                        "message": {"role": "user", "content": "hello"},
+                    }
+                ]
+
+        def off_loop(call, *args):
+            assert threading.get_ident() != owner_thread
+            with pytest.raises(RuntimeError):
+                asyncio.get_running_loop()
+            return call(*args)
+
+        with (
+            patch(
+                "lib.agent.agent_session_store.make_project_key", side_effect=lambda *a: off_loop(make_project_key, *a)
+            ),
+            patch(
+                "server.agent_runtime.sdk_transcript_adapter._decode_main",
+                side_effect=lambda *a: off_loop(_decode_main, *a),
+            ),
+        ):
+            result = await SdkTranscriptAdapter(Store()).read_raw_messages(str(uuid4()), tmp_path)
+
+        assert result == [
+            {
+                "type": "user",
+                "uuid": "message-1",
+                "content": "hello",
+                "timestamp": "2026-11-10T08:00:00Z",
+            }
+        ]
+        assert len(reads) == 2
 
     @pytest.mark.asyncio
     async def test_read_via_store_returns_empty_on_error(self):

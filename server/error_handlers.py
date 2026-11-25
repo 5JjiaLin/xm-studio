@@ -25,6 +25,7 @@ from lib.generation.generation_queue_client import TaskSpecValidationError
 from lib.generation.task_failure import FAILURE_CODE_KEYS
 from lib.i18n import render_generation_input_error, render_message
 from lib.infra.api_errors import ApiError
+from lib.infra.server_runtime import MaintenanceError
 from lib.script.script_editor import ScriptEditError
 from server.i18n import get_translator, request_display_names
 from server.services.project.episode_display import present_request_diagnostics
@@ -97,6 +98,14 @@ def register_error_handlers(
             content["diagnostic"] = exc.diagnostic
         content = await present_request_diagnostics(content, request, _t)
         return JSONResponse(status_code=exc.status_code, content=content)
+
+    @app.exception_handler(MaintenanceError)
+    async def _handle_maintenance(request: Request, exc: MaintenanceError) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(exc), "code": "server_maintenance"},
+            headers={"Retry-After": "60"},
+        )
 
     @app.exception_handler(HTTPException)
     async def _handle_http_error(request: Request, exc: HTTPException) -> JSONResponse:

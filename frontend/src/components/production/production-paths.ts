@@ -8,3 +8,7 @@ export function projectPath(project?: string) {
 export function productionPath(project?: string | null, step: ProductionStep = "script", episode?: number | null) {
   return `${PRODUCTION_PATH}${project ? `/${encodeURIComponent(project)}?step=${step}${episode ? `&episode=${episode}` : ""}` : ""}`;
 }
+
+export function resumeProductionPath(project: string, episode: number) {
+  return `${PRODUCTION_PATH}/${encodeURIComponent(project)}?episode=${episode}`;
+}

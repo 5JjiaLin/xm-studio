@@ -79,8 +79,10 @@ from lib.speech.audio_utils import (
     AUDIO_REFERENCE_MIN_SECONDS,
     probe_audio_duration_seconds,
 )
+from server.auth import employee_auth_enabled
 from server.dependencies import require_project_migration_ok
 from server.i18n import Translator
+from server.media_auth import get_current_media_user, require_project_media_access
 from server.routers._episode_source_errors import episode_source_http_error
 from server.routers._file_responses import cached_file_response, guess_media_type
 from server.routers._script_review_errors import raise_review_error
@@ -101,7 +103,8 @@ SourceUploadRole = Literal["whole_source", "episode"]
 _IMAGE_EXTS: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp")
 
 # 公开端点：前端经 <img src> / <video src> / <audio src> 加载，浏览器原生请求带不了
-# Authorization header。按 ADR 0071「静态媒体维持匿名可读」，公开端点只放行媒体：
+# Authorization header。共享模式按 ADR 0071 维持匿名媒体；员工模式使用媒体 Cookie
+# 或显式 Bearer，并重查当前员工和项目成员权限。端点只放行媒体：
 # 路径先经 safe_join 收在根目录内，再须同时满足下方的目录白名单与扩展名白名单。
 public_router = APIRouter()
 
@@ -300,7 +303,7 @@ _FORMAL_SHEET_UPLOAD_TYPES = frozenset(ASSET_SPECS)
 ALLOWED_EXTENSIONS = {upload_type: list(spec.allowed_exts) for upload_type, spec in UPLOAD_SPECS.items()}
 
 
-@public_router.get("/files/{project_name}/{path:path}")
+@public_router.get("/files/{project_name}/{path:path}", dependencies=[Depends(require_project_media_access)])
 async def serve_project_file(project_name: str, path: str, request: Request, _t: Translator):
     """服务项目内的媒体文件（图片/视频/音频），范围见 ``is_public_media_path``
 
@@ -323,7 +326,11 @@ async def serve_project_file(project_name: str, path: str, request: Request, _t:
             # 媒体范围按解析后的真实路径判定（symlink 指向非媒体文件同样拒绝）；
             # 非媒体与文件不存在同形返回 404
             relative_parts = file_path.relative_to(os.path.realpath(project_dir)).parts
-            stat_result = _regular_file_stat(file_path) if is_public_media_path(relative_parts) else None
+            # Windows realpath restores on-disk casing. Check the requested
+            # spelling as well so the directory allowlist has the same meaning
+            # on Windows and Linux; still check the target to reject symlinks.
+            allowed = is_public_media_path(Path(path).parts) and is_public_media_path(relative_parts)
+            stat_result = _regular_file_stat(file_path) if allowed else None
             if stat_result is None:
                 raise HTTPException(status_code=404, detail=_t("file_not_found", path=path))
 
@@ -359,12 +366,13 @@ async def serve_project_file(project_name: str, path: str, request: Request, _t:
             immutable=immutable,
             headers=_PUBLIC_FILE_HEADERS,
             media_type=media_type,
+            private=employee_auth_enabled(),
         )
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=project_name) from exc
 
 
-@public_router.get("/global-assets/{asset_type}/{filename}")
+@public_router.get("/global-assets/{asset_type}/{filename}", dependencies=[Depends(get_current_media_user)])
 async def serve_global_asset(asset_type: str, filename: str, request: Request, _t: Translator):
     """服务 global_assets 下的全局资产媒体文件（仅全局库类型：character/scene/prop）"""
     if asset_type not in GLOBAL_LIBRARY_ASSET_TYPES:
@@ -392,7 +400,13 @@ async def serve_global_asset(asset_type: str, filename: str, request: Request, _
     query = request.query_params
     immutable = bool(query.get("fp") or query.get("v"))
     return cached_file_response(
-        path, stat_result, request, immutable=immutable, headers=_PUBLIC_FILE_HEADERS, media_type=media_type
+        path,
+        stat_result,
+        request,
+        immutable=immutable,
+        headers=_PUBLIC_FILE_HEADERS,
+        media_type=media_type,
+        private=employee_auth_enabled(),
     )
 
 

@@ -102,7 +102,16 @@ export function WholeScriptPanel({ project, disabled, onImported, onActive }: {
       {batch.input_changed && <p className="text-sm text-destructive">{t("whole_script_changed")}</p>}
       <div className="flex flex-wrap gap-3">{batch.items.map((item, index) => <Link key={item.episode} href={productionPath(project, "breakdown", item.episode)} className="text-sm text-primary">{t("whole_script_item", { episode: item.position ?? index + 1 })}{item.title ? ` · ${item.title}` : ""} · {t(`whole_script_item_${item.status}`)}</Link>)}</div>
       {active && batch.status !== "stopping" && <Button variant="outline" className="self-start" disabled={busy} onClick={() => void perform(async () => { await API.controlScriptBatch(project, "stop"); setBatch(await API.getScriptBatch(project)); })}>{t("whole_script_stop")}</Button>}
-      {["stopped", "failed"].includes(batch.status) && <Button className="self-start" disabled={busy || disabled} onClick={() => void perform(async () => { await API.controlScriptBatch(project, "continue", batch.input_changed ? batch.input_revision : undefined); setBatch(await API.getScriptBatch(project)); })}>{t(batch.input_changed ? "whole_script_accept_continue" : "whole_script_continue")}</Button>}
+      {batch.status === "unknown" && !batch.items.some((item) => item.requires_provider_check) && <Button variant="outline" className="self-start" disabled={busy} onClick={() => void perform(async () => { await API.controlScriptBatch(project, "resolve_unknown"); setBatch(await API.getScriptBatch(project)); })}>{t("whole_script_recheck_submission")}</Button>}
+      {batch.status === "unknown" && batch.items.some((item) => item.status === "unknown") && <Button variant="outline" className="self-start" disabled={busy} onClick={() => {
+        if (!window.confirm(t("whole_script_confirm_not_submitted"))) return;
+        void perform(async () => { await API.controlScriptBatch(project, "resolve_unknown", undefined, true); setBatch(await API.getScriptBatch(project)); });
+      }}>{t("whole_script_resolve_unknown")}</Button>}
+      {["stopped", "failed"].includes(batch.status) && <Button className="self-start" disabled={busy || disabled} onClick={() => {
+        const requiresCheck = batch.items.some((item) => item.requires_provider_check);
+        if (requiresCheck && !window.confirm(t("whole_script_confirm_provider_checked"))) return;
+        void perform(async () => { await API.controlScriptBatch(project, "continue", batch.input_changed ? batch.input_revision : undefined, requiresCheck); setBatch(await API.getScriptBatch(project)); });
+      }}>{t(batch.input_changed ? "whole_script_accept_continue" : "whole_script_continue")}</Button>}
     </div>}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
   </section>;

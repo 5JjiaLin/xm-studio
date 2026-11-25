@@ -17,6 +17,7 @@ def _row_to_dict(row: AgentSession) -> dict[str, Any]:
     return {
         "id": row.id,
         "sdk_session_id": row.sdk_session_id,
+        "user_id": row.user_id,
         "project_name": row.project_name,
         "title": row.title or "",
         "status": row.status,
@@ -71,11 +72,14 @@ class SessionRepository(BaseRepository):
         status: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         # 被分叉取代的会话不进列表；数据整行保留，按 sdk_session_id 仍可 get 到。
         stmt = select(AgentSession).where(AgentSession.superseded_by.is_(None))
         if project_name:
             stmt = stmt.where(AgentSession.project_name == project_name)
+        if user_id is not None:
+            stmt = stmt.where(AgentSession.user_id == user_id)
         if status:
             stmt = stmt.where(AgentSession.status == status)
         stmt = stmt.order_by(AgentSession.updated_at.desc())

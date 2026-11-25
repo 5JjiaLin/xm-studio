@@ -275,7 +275,7 @@ class TestAssistantService:
         async def fake_find_by_client_key(session_id, client_key):
             return {"seq": 0, "type": "user", "content": []}
 
-        async def fake_find_new_session_by_client_key(client_key):
+        async def fake_find_new_session_by_client_key(client_key, **scope):
             return None
 
         service.event_log_store.find_by_client_key = fake_find_by_client_key
@@ -585,7 +585,7 @@ class TestAssistantService:
             service._new_session_client_keys[client_key] = "sdk-fresh"
             return  # 旧会话（sdk-deleted）条目已不存在
 
-        async def find_new_session_by_client_key(client_key):
+        async def find_new_session_by_client_key(client_key, **scope):
             return None  # 本测试只关心清理分支，不需要真的兜底恢复
 
         service.event_log_store = SimpleNamespace(
@@ -613,7 +613,7 @@ class TestAssistantService:
         async def find_by_client_key(session_id, client_key):
             return None
 
-        async def find_new_session_by_client_key(client_key):
+        async def find_new_session_by_client_key(client_key, **scope):
             # 模拟另一并发请求在本次查询期间已经建好新会话并记入映射。
             service._new_session_client_keys[client_key] = "sdk-fresh"
             return "sdk-old", {"seq": 0, "type": "user"}

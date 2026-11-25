@@ -81,6 +81,12 @@ async def serve(control: Path, action: str, phase: str) -> None:
             listener.setblocking(False)
             (control / "port.json").write_text(json.dumps(listener.getsockname()[1]))
             server = uvicorn.Server(uvicorn.Config(app, log_level="warning", lifespan="on"))
+
+            async def shutdown():
+                server.should_exit = True
+                return {"stopping": True}
+
+            app.add_api_route("/__fixture__/shutdown", shutdown, methods=["POST"])
             await server.serve(sockets=[listener])
 
 

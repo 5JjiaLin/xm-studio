@@ -2066,8 +2066,8 @@ class API {
     return this.request(`/projects/${encodeURIComponent(project)}/production/script-batch`, { method: "POST", body: JSON.stringify({ import_id: importId }) });
   }
 
-  static async controlScriptBatch(project: string, action: "stop" | "continue", inputRevision?: string): Promise<ScriptBatchState> {
-    return this.request(`/projects/${encodeURIComponent(project)}/production/script-batch/control`, { method: "POST", body: JSON.stringify({ action, input_revision: inputRevision }) });
+  static async controlScriptBatch(project: string, action: "stop" | "continue" | "resolve_unknown", inputRevision?: string, confirmNotSubmitted = false): Promise<ScriptBatchState> {
+    return this.request(`/projects/${encodeURIComponent(project)}/production/script-batch/control`, { method: "POST", body: JSON.stringify({ action, input_revision: inputRevision, confirm_not_submitted: confirmNotSubmitted }) });
   }
 
   static async previewProductionSource(file: File): Promise<{ text: string; filename: string }> {

@@ -162,9 +162,13 @@ async def _rewrite_session_store_keys(context: DataRootMigrationContext) -> None
     """
     layout = context.layout
     project_names = sorted(await asyncio.to_thread(_moved_project_names, layout.projects_dir))
-    key_pairs = [
-        (make_project_key(layout.root / name), make_project_key(layout.projects_dir / name)) for name in project_names
-    ]
+    # The SDK canonicalizes Windows paths using filesystem operations.
+    key_pairs = await asyncio.to_thread(
+        lambda: [
+            (make_project_key(layout.root / name), make_project_key(layout.projects_dir / name))
+            for name in project_names
+        ]
+    )
     key_pairs = [(legacy, current) for legacy, current in key_pairs if legacy != current]
     rewritten: set[tuple[str, str]] = set()
     async with context.session_factory() as session:
@@ -522,14 +526,19 @@ async def migrate_data_root_layout(
     context = DataRootMigrationContext(layout=layout, session_factory=session_factory, sdk_config_dir=sdk_config_dir)
     for step in _STEPS:
         name = getattr(step, "__name__", repr(step))
-        logger.info("数据根布局迁移：执行 %s", name)
+        await asyncio.to_thread(logger.info, "数据根布局迁移：执行 %s", name)
         try:
             await step(context)
-        except Exception:
-            logger.exception("数据根布局迁移在 %s 失败，未写完成标记，下次启动从头续跑", name)
+        except Exception as exc:
+            await asyncio.to_thread(
+                logger.error,
+                "数据根布局迁移在 %s 失败，未写完成标记，下次启动从头续跑",
+                name,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
             raise
     await asyncio.to_thread(_write_marker, marker)
-    logger.info("数据根布局迁移完成：%s", marker)
+    await asyncio.to_thread(logger.info, "数据根布局迁移完成：%s", marker)
 
 
 def _write_marker(marker: Path) -> None:

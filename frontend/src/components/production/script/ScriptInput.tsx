@@ -36,7 +36,7 @@ function initialInput() {
   }
   catch { return DEFAULT_INPUT; }
 }
-export function ScriptInput({ projectName, episode: targetEpisode, createOnly = false, source = "", sourceRevision = null, disabled = false, readOnly = false, repairEnabled = false }: { projectName?: string; episode?: number; createOnly?: boolean; source?: string; sourceRevision?: string | null; disabled?: boolean; readOnly?: boolean; repairEnabled?: boolean }) {
+export function ScriptInput({ projectName, episode: targetEpisode, createOnly = false, source = "", sourceRevision = null, disabled = false, readOnly = false, repairEnabled = false, openSavedBreakdown = false }: { projectName?: string; episode?: number; createOnly?: boolean; source?: string; sourceRevision?: string | null; disabled?: boolean; readOnly?: boolean; repairEnabled?: boolean; openSavedBreakdown?: boolean }) {
   const draftKey = projectName ? `xm:script-draft:${projectName}:${targetEpisode}` : "xm:script-draft";
   const [initialDraft] = useState(() => restoreSourceDraft(draftKey, source, readOnly || !projectName));
   const [lastSourceProp, setLastSourceProp] = useState(source);
@@ -116,6 +116,8 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
   };
   useLeaveGuard({ dirty: !createOnly && !readOnly && (value.text !== savedText || !!pendingFile), saving: busy || extracting, save: async () => !!(await persist()), discard });
   const create = async () => {
+    // A saved breakdown may only be rerun through the explicit replanning action.
+    if (openSavedBreakdown) return;
     const target = await persist();
     if (!target) return;
     if (createOnly) { sessionStorage.removeItem(draftKey); navigate(projectPath(target.name)); return; }
@@ -170,7 +172,7 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
         <p role="status" className="text-sm text-destructive">{t("production_source_conflict")}</p>
         <details className="text-sm">
           <summary>{t("production_source_latest")}</summary>
-          <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words">{observedSource}</pre>
+          <pre className="relative max-h-64 overflow-auto whitespace-pre-wrap break-words">{observedSource}</pre>
         </details>
         <Button type="button" variant="outline" disabled={busy || extracting} onClick={discard}>{t("production_source_use_latest")}</Button>
       </div>}
@@ -185,8 +187,8 @@ export function ScriptInput({ projectName, episode: targetEpisode, createOnly = 
     </div>
     }
     {readOnly && <p className="text-sm text-muted-foreground">{t("whole_script_source_readonly")}</p>}
-    {!createOnly && repairEnabled && <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={repairOnce} onChange={(event) => setRepairOnce(event.target.checked)} disabled={busy || disabled} />{t("production_repair_once")}</label>}
+    {!createOnly && !openSavedBreakdown && repairEnabled && <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={repairOnce} onChange={(event) => setRepairOnce(event.target.checked)} disabled={busy || disabled} />{t("production_repair_once")}</label>}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-    <p className="text-sm text-muted-foreground">{busy ? t("common:loading") : createOnly ? t("management_create_hint") : t("production_text_cost_unknown")}</p>
+    <p className="text-sm text-muted-foreground">{busy ? t("common:loading") : createOnly ? t("management_create_hint") : openSavedBreakdown ? t("production_open_saved_breakdown_hint") : t("production_text_cost_unknown")}</p>
   </form>;
 }

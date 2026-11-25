@@ -55,6 +55,7 @@ class _FakeEntrySessionManager:
         self.queue: asyncio.Queue = asyncio.Queue()
         self.draft_state = draft_state or {"draft": None, "rev": 0}
         self.pending = pending or []
+        self.stream_closed = False
 
     async def get_status(self, session_id):
         return self.status_value
@@ -88,7 +89,10 @@ class _FakeEntrySessionManager:
                     continue
                 yield LiveMessage(message=message)
 
-        yield _iter()
+        try:
+            yield _iter()
+        finally:
+            self.stream_closed = True
 
 
 @pytest.fixture
@@ -113,6 +117,70 @@ def _collect(event: ServerSentEvent) -> tuple[str, dict, str | None]:
 
 
 class TestStreamEntryEvents:
+    async def test_authorization_revocation_on_heartbeat_closes_stream(self, entry_service):
+        service, _store = entry_service
+        manager = _FakeEntrySessionManager(status="running")
+        service.session_manager = manager
+        manager.queue.put_nowait(HEARTBEAT)
+        manager.queue.put_nowait(
+            {
+                "type": "log_delta",
+                "session_id": SESSION_ID,
+                "message_id": "m1",
+                "delta_type": "text_delta",
+                "text": "must not be sent",
+            }
+        )
+        checks = 0
+
+        async def authorization_check():
+            nonlocal checks
+            checks += 1
+            return checks < 2
+
+        events = [
+            _collect(event)
+            async for event in service.stream_entry_events(
+                SESSION_ID, authorization_check=authorization_check
+            )
+        ]
+
+        assert [name for name, _, _ in events] == ["draft", "queue", "status"]
+        assert checks == 2
+        assert manager.stream_closed is True
+
+    async def test_authorization_revocation_on_live_message_closes_stream(self, entry_service):
+        service, _store = entry_service
+        manager = _FakeEntrySessionManager(status="running")
+        service.session_manager = manager
+        manager.queue.put_nowait(HEARTBEAT)
+        manager.queue.put_nowait(
+            {
+                "type": "log_delta",
+                "session_id": SESSION_ID,
+                "message_id": "m1",
+                "delta_type": "text_delta",
+                "text": "must not be sent",
+            }
+        )
+        checks = 0
+
+        async def authorization_check():
+            nonlocal checks
+            checks += 1
+            return checks < 3
+
+        events = [
+            _collect(event)
+            async for event in service.stream_entry_events(
+                SESSION_ID, authorization_check=authorization_check
+            )
+        ]
+
+        assert [name for name, _, _ in events] == ["draft", "queue", "status"]
+        assert checks == 3
+        assert manager.stream_closed is True
+
     async def test_startup_failure_events_are_ephemeral_and_end_with_error_status(self, entry_service):
         service, store = entry_service
         failure = {
@@ -377,7 +445,9 @@ class _CursorCapturingService:
     async def get_session(self, session_id):
         return self.meta if session_id == SESSION_ID else None
 
-    async def stream_entry_events(self, session_id, *, meta=None, request=None, after_seq=-1):
+    async def stream_entry_events(
+        self, session_id, *, meta=None, request=None, after_seq=-1, authorization_check=None
+    ):
         self.captured_after = after_seq
         yield ServerSentEvent(event="status", data={"status": "idle"})
 

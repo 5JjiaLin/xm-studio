@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from lib.infra.content_digest import prefixed_canonical_json_digest
 from lib.project.project_activity import ACTIVITY_FILENAME, recorded_project_activity
 from lib.project.project_manager import ProjectManager
 from lib.script.draft_quarantine import (
@@ -386,6 +388,89 @@ async def test_ai_repair_rewrites_the_whole_draft_for_episode_level_violations(n
 
     assert result["adopted"] is True
     assert _formal_segments(project_path) == [_segment()]
+
+
+@pytest.mark.parametrize("already_repaired_dialogue", [False, True])
+async def test_reference_ai_repair_restores_layout_before_and_after_model_call(
+    narration, monkeypatch, already_repaired_dialogue,
+):
+    pm, project_path = narration
+    source = "▲手机响。\n张三（喊）：你在哪？赶快回来！"
+    (project_path / "source/episode_1.txt").write_text(source, encoding="utf-8")
+
+    def setup(project):
+        project.update(content_mode="drama", generation_mode="reference_video")
+        project["episodes"][0].update(source_kind="screenplay", source_origin="own")
+
+    pm.update_project("demo", setup)
+    broken_anchor = source.replace("？赶", "？\n赶")
+    complete_speech = "手机响。@[张三]{你在哪？赶快回来！}"
+    source_binding = {
+        "source_revision": prefixed_canonical_json_digest(source),
+        "start": 0,
+        "end": len(source),
+        "span_start": "S0001",
+        "span_end": "S0003",
+    }
+    unit = {
+        "source_text": broken_anchor if already_repaired_dialogue else source,
+        "text": complete_speech if already_repaired_dialogue else "手机响。@[张三]{你在哪？}",
+        "duration_seconds": 8,
+    }
+    if not already_repaired_dialogue:
+        unit["source_binding"] = source_binding
+    content = {"units": [unit], "new_assets": []}
+    write_quarantine(project_path, 1, QUARANTINE_KIND_SCRIPT_PLAN, content=content, violations=[],
+                     meta={"source": None})
+    service = EpisodeDraftService(pm)
+    view = await service.get_draft("demo", 1, "reference_script_plan")
+    assert {v["code"] for v in view["violations"]} == (
+        {"source_text_not_verbatim"} if already_repaired_dialogue
+        else {"screenplay_dialogue_coverage"}
+    )
+    assert bool(view["coverage_advisories"]) is already_repaired_dialogue
+    model = FakeTextGenerator(json.dumps({"units": [{
+        "source_text": broken_anchor, "source_binding": {"start": 999},
+        "text": complete_speech, "duration_seconds": 8,
+    }], "new_assets": []}, ensure_ascii=False))
+    use_text_generator(monkeypatch, model.create)
+
+    result = await _repair(pm).repair(1, "reference_script_plan", view["revision"])
+
+    assert result["adopted"] is True
+    assert len(model.requests) == (0 if already_repaired_dialogue else 1)
+    saved = json.loads((project_path / "drafts/episode_1/script_plan_reference_units.json").read_text(encoding="utf-8"))
+    assert saved["units"][0]["source_text"] == source
+    if not already_repaired_dialogue:
+        assert saved["units"][0]["source_binding"] == source_binding
+    assert saved["units"][0]["text"] == complete_speech
+    assert saved["units"][0]["duration_seconds"] == 8
+    assert not quarantine_path(project_path, 1, QUARANTINE_KIND_SCRIPT_PLAN).exists()
+
+
+async def test_source_layout_repair_still_rejects_a_concurrent_draft_edit(narration, monkeypatch):
+    pm, project_path = narration
+    pm.update_project("demo", lambda p: p.update(content_mode="drama", generation_mode="reference_video"))
+    content = {"units": [{"source_text": "张三在\n村口等人。", "text": "@[张三]等人。", "duration_seconds": 4}]}
+    write_quarantine(project_path, 1, QUARANTINE_KIND_SCRIPT_PLAN, content=content, violations=[], meta={"source": None})
+    view = await EpisodeDraftService(pm).get_draft("demo", 1, "reference_script_plan")
+    repair = _repair(pm)
+    original_violations = repair._violations
+
+    async def edit_during_validation(*args):
+        violations = await original_violations(*args)
+        content["units"][0]["text"] = "@[张三]低头等人。"
+        await asyncio.to_thread(
+            write_quarantine, project_path, 1, QUARANTINE_KIND_SCRIPT_PLAN,
+            content=content, violations=[], meta={"source": None},
+        )
+        return violations
+
+    monkeypatch.setattr(repair, "_violations", edit_during_validation)
+    with pytest.raises(DraftWorkflowError, match="draft revision changed"):
+        await repair.repair(1, "reference_script_plan", view["revision"])
+    after = await EpisodeDraftService(pm).get_draft("demo", 1, "reference_script_plan")
+    assert after["content"] == content
 
 
 async def test_ai_repair_that_still_violates_updates_the_draft(narration, monkeypatch) -> None:

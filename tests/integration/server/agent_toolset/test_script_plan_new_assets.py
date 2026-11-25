@@ -7,6 +7,9 @@ from typing import Any
 
 import pytest
 
+from lib.backends.text_backends.connection_errors import TextProviderConnectionError
+from lib.generation.generation_result import decode_generation_problem
+from server import tool_runtime
 from tests.fakes import use_text_generator
 from tests.integration.server.agent_tool_support import (
     ToolHarness,
@@ -32,6 +35,59 @@ from tests.integration.server.agent_tool_support import (
 
 def _new(name: str, decision: str, **fields: Any) -> dict[str, Any]:
     return {"type": "character", "name": name, "decision": decision, "reason": "原文第一次出现", **fields}
+
+
+@pytest.mark.parametrize("route", ["reference", "narration", "drama"])
+async def test_plan_prefers_stream_and_preserves_connection_failure_category(
+    fake_ctx: ToolHarness, monkeypatch, video_request_facts, route: str
+) -> None:
+    if route == "reference":
+        rv_source(fake_ctx)
+        use_fake_caps(fake_ctx)
+    elif route == "drama":
+        drama_project(fake_ctx)
+    else:
+        nr_source(fake_ctx)
+
+    class Generator:
+        async def generate(self, request, project_name=None):
+            assert request.prefer_stream is True
+            raise TextProviderConnectionError(
+                provider_id="custom-1",
+                model="gpt-6.1-sol",
+                phase="read",
+                cause_types=("APIConnectionError", "ReadError"),
+            )
+
+    async def create(_task_type, project_name=None, **_kwargs):
+        return Generator()
+
+    use_text_generator(monkeypatch, create)
+    out = await run_declared_tool("generate_script_plan", fake_ctx, {"episode_id": 1})
+
+    assert out.problem is not None
+    assert out.problem.code == "text_provider_connection_failed"
+    assert out.problem.action == "retry"
+    assert out.problem.params["phase"] == "read"
+    assert out.problem.params["may_have_been_accepted"] is True
+    assert "供应商" in out.problem.detail
+
+    task_id = f"connection-failure-{route}"
+    monkeypatch.setitem(tool_runtime._TEXT_TASK_SERVICES, task_id, (fake_ctx.scope, fake_ctx.services))
+    with pytest.raises(RuntimeError) as caught:
+        await tool_runtime.execute_queued_text_task(
+            {
+                "task_id": task_id,
+                "project_name": fake_ctx.project_name,
+                "task_type": f"text_{route}_script_plan",
+                "payload": {"episode": 1},
+            }
+        )
+    problem = decode_generation_problem(str(caught.value))
+    assert problem is not None
+    assert problem.code == out.problem.code
+    assert problem.action == out.problem.action
+    assert problem.params == out.problem.params
 
 
 def _register_known_cast(fake_ctx: ToolHarness) -> None:

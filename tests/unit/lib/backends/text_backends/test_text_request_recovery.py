@@ -46,7 +46,7 @@ async def _backend(protocol):
     kwargs = {"api_key": "test", "model": "arbitrary-model", "base_url": "https://relay.test/v1"}
     if protocol == "gemini":
         backend = GeminiTextBackend(**{**kwargs, "base_url": "https://relay.test"})
-        url = "https://relay.test/v1beta/models/arbitrary-model:generateContent"
+        url = "https://relay.test/v1/models/arbitrary-model:generateContent"
     elif protocol == "ark":
         # Declare native support explicitly: test catalog snapshots need not contain it.
         backend = ArkTextBackend(**{**kwargs, "model": "doubao-seed-2-1-lite-260915"})

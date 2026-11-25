@@ -78,6 +78,10 @@ MESSAGES = {
     # Lý do tác vụ thất bại (GenerationWorker lưu mã lỗi + tham số; tasks API kết xuất theo ngôn ngữ khi đọc)
     "task_fail_provider_unsupported_media": "Nhà cung cấp {provider_id} không hỗ trợ tạo {media_type}",
     "task_fail_provider_rejected": "Nhà cung cấp đã từ chối yêu cầu tạo này (HTTP {status})",
+    "task_fail_text_generation_timeout": "Tạo văn bản vượt quá {timeout_seconds} giây. Nhà cung cấp có thể đã nhận yêu cầu; hãy kiểm tra bản ghi trước khi thử lại.",
+    "task_fail_draft_quarantined": "Kết quả đã được lưu thành bản nháp cần sửa. Hãy mở bản nháp của tập này để xử lý thay vì tạo lại.",
+    "draft_quarantined": "Kết quả đã được lưu thành bản nháp cần sửa. Hãy mở bản nháp của tập này để xử lý thay vì tạo lại.",
+    "text_generation_timeout": "Tạo văn bản vượt quá {timeout_seconds} giây. Nhà cung cấp có thể đã nhận yêu cầu; hãy kiểm tra bản ghi trước khi thử lại.",
     "task_fail_dispatch_provider_requeue_failed": "Nhà cung cấp tác vụ đã đổi từ {claimed_provider_id} sang {actual_provider_id}, nhưng không thể đưa tác vụ trở lại hàng đợi để nhận khe mới; vui lòng thử lại",
     "task_fail_project_deleted_during_task": "Dự án đã bị xóa trong khi tác vụ đang chạy; kết quả tạo ra không được lưu",
     "task_fail_restart_lost_image": "Tác vụ ảnh bị gián đoạn khi dịch vụ khởi động lại và không thể tiếp tục; vui lòng thử lại thủ công để tránh bị tính phí trùng",

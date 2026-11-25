@@ -6,13 +6,14 @@ from pathlib import Path
 
 from server.agent_toolset.remote import _project_relative_outcome, project_path_spellings, relativize_project_paths
 from server.tool_runtime import ToolOutcome, ToolProblem
+from tests.fakes import create_test_directory_link
 
 
 def test_relativize_rewrites_both_the_given_and_the_resolved_project_dir(tmp_path: Path) -> None:
     real = tmp_path / "real" / "projects" / "demo"
     real.mkdir(parents=True)
     alias = tmp_path / "alias"
-    alias.symlink_to(tmp_path / "real", target_is_directory=True)
+    create_test_directory_link(alias, tmp_path / "real")
     project_dir = alias / "projects" / "demo"
     spellings = project_path_spellings(project_dir)
 

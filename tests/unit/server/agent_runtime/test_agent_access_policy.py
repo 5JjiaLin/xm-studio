@@ -13,6 +13,7 @@ import pytest
 from lib.agent.agent_memory_paths import project_memory_dir
 from lib.infra.data_root_layout import DataRootLayout
 from server.agent_runtime.agent_access_policy import AgentAccessPolicy
+from tests.fakes import create_test_directory_link
 
 #: 逐调用传入的当前用户 id（生产取自 SessionManager 的 CurrentUser 上下文）。
 _USER_ID = "default"
@@ -56,7 +57,7 @@ def _cwd(policy: AgentAccessPolicy) -> Path:
 
 def test_pure_construction_with_fake_roots() -> None:
     """假根路径（磁盘上不存在）+ sandbox_enabled 即可纯构造，裁决照常工作。"""
-    fake = Path("/nonexistent/fake-root")
+    fake = Path("/nonexistent/fake-root").resolve()
     policy = AgentAccessPolicy(
         project_root=fake / "repo",
         data_root=fake / "repo" / "projects",
@@ -351,7 +352,12 @@ def test_write_protected_via_symlink_project_json_denied(policy: AgentAccessPoli
     real = cwd / "other.json"
     real.write_text("{}", encoding="utf-8")
     link = cwd / "project.json"
-    link.symlink_to(real)
+    try:
+        link.symlink_to(real)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows account has no file-symlink privilege; directory alias cases still run")
+        raise
     allowed, reason = policy.check_path_access(str(link), tool, cwd, user_id=_USER_ID)
     assert not allowed, "symlink 形态的 project.json 写入应被拒"
     assert reason
@@ -365,7 +371,7 @@ def test_write_protected_via_symlink_scripts_dir_denied(policy: AgentAccessPolic
     real_dir = cwd / "data"
     real_dir.mkdir()
     link_dir = cwd / "scripts"
-    link_dir.symlink_to(real_dir)
+    create_test_directory_link(link_dir, real_dir)
     target = link_dir / "episode_1.json"
     allowed, reason = policy.check_path_access(str(target), tool, cwd, user_id=_USER_ID)
     assert not allowed, "symlink 形态的 scripts/ 下 .json 写入应被拒"
@@ -384,7 +390,7 @@ def test_write_protected_with_symlinked_project_cwd_denied(
     real_root = tmp_path / "real_data"
     (real_root / "projects" / "selfproj").mkdir(parents=True)
     link_cwd = _projects_dir(policy) / "selfproj_link"
-    link_cwd.symlink_to(real_root / "projects" / "selfproj")
+    create_test_directory_link(link_cwd, real_root / "projects" / "selfproj")
 
     # caller 把 symlinked cwd 传入,check_path_access 内 logical.resolve() 会展开 symlink,
     # 然后 _check_write_access 把 resolved target 与原始 link_cwd 比较——若不把 base 也
@@ -593,7 +599,7 @@ def test_build_sandbox_settings_deny_write_includes_resolved_paths(policy: Agent
     real_root = tmp_path / "real_data"
     (real_root / "projects" / "selfproj").mkdir(parents=True)
     link_cwd = _projects_dir(policy) / "selfproj_link"
-    link_cwd.symlink_to(real_root / "projects" / "selfproj")
+    create_test_directory_link(link_cwd, real_root / "projects" / "selfproj")
 
     settings = policy.build_sandbox_settings(link_cwd)
     deny_write = settings["filesystem"]["denyWrite"]

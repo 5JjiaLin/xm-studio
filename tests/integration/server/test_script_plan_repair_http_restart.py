@@ -51,12 +51,15 @@ async def application_process(control: Path, action: str, phase: str, env: dict[
                 yield process, client
         finally:
             if process.returncode is None:
-                process.terminate()
                 try:
+                    async with httpx.AsyncClient(trust_env=False, timeout=3) as stop_client:
+                        response = await stop_client.post(str(client.base_url) + "/__fixture__/shutdown")
+                        response.raise_for_status()
                     await asyncio.wait_for(process.wait(), 15)
-                except TimeoutError:
-                    process.kill()
-                    await process.wait()
+                finally:
+                    if process.returncode is None:
+                        process.kill()
+                        await process.wait()
 
 
 async def terminal_task(client: httpx.AsyncClient, task_id: str) -> dict:
@@ -99,6 +102,8 @@ async def test_http_restart_recovery_never_replays_a_model_or_advances_downstrea
     database_url = f"sqlite+aiosqlite:///{root / 'http-test.db'}"
     env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT") if key in os.environ}
     env.update(
+        PYTHONUTF8="1", USERPROFILE=str(root / "fixture-profile"), HOME=str(root / "fixture-profile"),
+        ARCREEL_PROFILE_DIR=str(root / "fixture-profile" / "agent"),
         PYTHON_DOTENV_DISABLED="1", ARCREEL_DATA_DIR=str(root), DATABASE_URL=database_url,
         CLAUDE_CONFIG_DIR=str(root / "fixture-sdk"), AUTH_ENABLED="true",
         AUTH_USERNAME="fixture-admin", AUTH_PASSWORD="fixture-password",

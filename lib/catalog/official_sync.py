@@ -170,9 +170,15 @@ async def sync_once(
 async def _sync_loop(
     session_factory: async_sessionmaker[AsyncSession], http_client: Callable[[], httpx.AsyncClient]
 ) -> None:
+    from lib.infra.server_runtime import runtime
+
     while True:
+        if runtime.paused:
+            await asyncio.sleep(1)
+            continue
         try:
-            await sync_once(session_factory, http_client)
+            with runtime.activity("catalog_sync"):
+                await sync_once(session_factory, http_client)
         except Exception as exc:
             logger.warning("官方同步异常，等下一轮", exc_info=True)
             # 只更新进程内状态：异常可能就出在数据库上。诊断信息照样能看到这次失败

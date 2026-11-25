@@ -1253,7 +1253,9 @@ class ScriptGenerator:
             raise FileNotFoundError(f"未找到 project.json: {path}")
 
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            from lib.project.archive_context import generation_project
+
+            return generation_project(self.project_path, json.load(f))
 
     def _freeze_script_plan_input_claim(self, episode: int, script_plan_path: Path, *, content_digest: str) -> None:
         """Bind parsed script_plan bytes to their formal identity for provider admission."""

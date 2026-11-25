@@ -12,7 +12,9 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 
 from lib.infra.api_errors import BadRequestError, NotFoundError
+from server.auth import CurrentUser
 from server.services.project.project_events import ProjectEventService
+from server.sse_auth import project_stream_authorizer
 
 logger = logging.getLogger(__name__)
 
@@ -52,14 +54,19 @@ async def _project_events_service(
 async def stream_project_events(
     project_name: str,
     request: Request,
+    current_user: CurrentUser,
     service: ProjectEventService = Depends(_project_events_service),
 ) -> AsyncIterator[ServerSentEvent]:
+    authorization_check = project_stream_authorizer(request, project_name, current_user)
     try:
         async with service.stream_events(project_name, idle_timeout=PROJECT_EVENTS_SSE_POLL_SECONDS) as stream:
             async for item in stream:
                 # 每轮迭代顶部都查断线;_idle 仅作为「队列空闲时也要醒一次」的唤醒兜底,
                 # 不再独占断线检测的时机——持续高频事件流下断线一样能立刻发现。
                 if await request.is_disconnected():
+                    break
+                if authorization_check is not None and not await authorization_check():
+                    logger.info("员工会话或项目权限已撤销，关闭项目事件流: %s", project_name)
                     break
                 if isinstance(item, dict) and item.get("type") == "_idle":
                     continue

@@ -68,7 +68,10 @@ class TestUserModel:
             columns = await conn.run_sync(
                 lambda sync_conn: {c["name"] for c in inspect(sync_conn).get_columns("users")}
             )
-        assert columns == {"id", "username", "role", "is_active", "created_at", "updated_at"}
+        assert columns == {
+            "id", "username", "role", "is_active", "created_at", "updated_at",
+            "password_hash", "session_version", "failed_login_attempts", "locked_until",
+        }
 
     async def test_user_round_trip(self, db_session):
         user = User(id="u1", username="alice")

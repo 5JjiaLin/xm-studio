@@ -100,6 +100,42 @@ async def test_a_new_character_is_registered_with_its_aliases(tmp_path: Path, vi
     assert _formal(pm)["segments"][0]["characters_in_segment"] == ["裴与", "小桃"]
 
 
+async def test_archive_then_confirm_replacement_keeps_old_asset_and_registers_new_identity(tmp_path, video_request_facts):
+    from lib.episode.episode_management import create_episode
+    from lib.project.production_management import set_archive
+    from lib.script import script_review
+    from server.text_generation import _load_project_context
+
+    pm = _project(tmp_path, "narration")
+    _write_plan(pm, "narration", _narration_plan(["小桃"], [_new("小桃", "register", description="原来的外观")]))
+    await _confirm(pm)
+    path = pm.get_project_path("demo")
+    old_script = (path / "scripts" / "episode_1.json").read_bytes()
+    set_archive(pm, "demo", True, 1)
+    replacement = create_episode(pm, "demo", title="重新上传第一集", source_text="新的原文", source_kind="novel")
+    assert "小桃" not in _load_project_context(pm, "demo")[1]["characters"]
+    plan = _narration_plan(["小桃"], [_new("小桃", "register", description="新剧本外观")])
+    plan["episode"] = replacement
+    plan["segments"][0]["segment_id"] = f"E{replacement}S01"
+    plan_path = script_review.script_plan_path(path, pm.load_project("demo"), replacement)
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(plan_path, plan)
+    activate_artifact_target_state(path, bump_schema=False)
+    service = ScriptReviewService(pm, config_resolver=cast(ConfigResolver, FakeConfigResolver()))
+    await service.confirm("demo", replacement, plan_fingerprint=script_review.content_fingerprint(plan_path))
+    new_script = json.loads((path / "scripts" / f"episode_{replacement}.json").read_text(encoding="utf-8"))
+    [name] = new_script["segments"][0]["characters_in_segment"]
+    assert name != "小桃"
+    saved = pm.load_project("demo")
+    assert saved["characters"][name]["description"] == "新剧本外观"
+    assert saved["characters"]["小桃"]["description"] == "原来的外观"
+    assert (path / "scripts" / "episode_1.json").read_bytes() == old_script
+    assert "_archived_asset_names" not in saved
+    assert "小桃" not in _load_project_context(pm, "demo")[1]["characters"]
+    set_archive(pm, "demo", False, 1)
+    assert {"小桃", name}.issubset(_load_project_context(pm, "demo")[1]["characters"])
+
+
 async def test_a_renamed_new_asset_keeps_the_planned_name_as_an_alias(tmp_path: Path, video_request_facts) -> None:
     pm = _project(tmp_path, "narration")
     _write_plan(

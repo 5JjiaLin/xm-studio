@@ -37,6 +37,7 @@ DELETE_PROJECT_FILE = ToolDeclaration(
 
 LIST_TRASH_RECORDS = ToolDeclaration(
     name="list_trash_records",
+    access="read",
     description=(
         "列出项目回收站里的删除记录，新的在前：每条含 id、object（被删对象的类型与身份）、files（删除前的项目内路径）、"
         "deleted_at、origin（user 为创作者发起，agent 为 Agent 发起）与 size；另返回 total_size 与 retention_days。"

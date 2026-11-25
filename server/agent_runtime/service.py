@@ -7,16 +7,12 @@ import copy
 import logging
 import os
 from collections import OrderedDict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from claude_agent_sdk import (
     delete_session as sdk_delete_session,
-)
-from claude_agent_sdk import (
-    delete_session_via_store,
-    list_sessions_from_store,
 )
 from claude_agent_sdk import (
     list_sessions as sdk_list_sessions,
@@ -33,6 +29,7 @@ from fastapi.sse import ServerSentEvent
 from lib.agent.agent_profile import agent_profile_dir
 from lib.agent.profile_frontmatter import FrontmatterError, parse_profile_metadata
 from lib.agent.profile_manifest import VALID_CONTENT_MODES
+from lib.db.base import DEFAULT_USER_ID
 from lib.i18n import DEFAULT_LOCALE
 from lib.infra.async_thread import run_sync_transaction
 from lib.infra.data_root_layout import DataRootLayout
@@ -52,7 +49,11 @@ from server.agent_runtime.models import (
     SubscriptionReady,
     WithdrawalIntent,
 )
-from server.agent_runtime.sdk_transcript_adapter import SdkTranscriptAdapter
+from server.agent_runtime.sdk_transcript_adapter import (
+    SdkTranscriptAdapter,
+    delete_session_via_store,
+    list_sessions_from_store,
+)
 from server.agent_runtime.session_branch import (
     BranchAnchorError,
     BranchedSession,
@@ -92,16 +93,16 @@ class InterruptSettleTimeoutError(MessageRewriteError):
 
 
 class AssistantService:
-    def __init__(self, project_root: Path):
+    def __init__(self, project_root: Path, *, data_root: Path | None = None, session_factory=None):
         self.project_root = Path(project_root)
-        self.layout = DataRootLayout.current()
+        self.layout = DataRootLayout(Path(data_root)) if data_root is not None else DataRootLayout.current()
         self.data_root = self.layout.root
 
         self.pm = ProjectManager(self.data_root)
-        self.meta_store = SessionMetaStore()
+        self.meta_store = SessionMetaStore(session_factory=session_factory)
         # 会话事件日志：UI 时间线唯一读源。store 与 SessionManager 共享同一实例，
         # live 写入点（entry pipeline）与读取端（REST / SSE / 懒生成）落同一张表。
-        self.event_log_store = EventLogStore()
+        self.event_log_store = EventLogStore(session_factory=session_factory)
         self.session_manager = SessionManager(
             project_root=self.project_root,
             meta_store=self.meta_store,
@@ -120,13 +121,15 @@ class AssistantService:
             event_log=self.event_log,
             resolve_project_cwd=self._resolve_project_cwd_safe,
         )
+        self._user_event_logs: dict[str, EventLogService] = {}
+        self._user_branches: dict[str, SessionBranchService] = {}
         self._startup_lock = asyncio.Lock()
         self._startup_done = False
         # 新会话幂等映射：client_key 唯一索引按 (session_id, client_key) 分区，
         # 覆盖不到 session_id 尚不存在的新会话受理——响应丢失后的重试若再走
         # 新会话分支会重复建会话、重复执行同一 prompt。进程内 LRU 为快路径，
         # 重启 / 淘汰后由事件日志的跨会话查询兜底（_find_accepted_new_session）。
-        self._new_session_client_keys: OrderedDict[str, str] = OrderedDict()
+        self._new_session_client_keys: OrderedDict[str | tuple[str, str, str], str] = OrderedDict()
         self._new_session_client_keys_max = 256
         # 同一 client_key 的并发新建请求在此串行化，避免在途窗口内重复建会话
         self._new_session_locks = KeyedLocks()
@@ -137,6 +140,34 @@ class AssistantService:
         # 等它结束后看到原会话已被取代，不会排进一个即将被取代的会话。
         self._admission_locks = KeyedLocks()
         self.stream_heartbeat_seconds = int(os.environ.get("ASSISTANT_STREAM_HEARTBEAT_SECONDS", "20"))
+
+    def _event_log_for(self, user_id: str) -> EventLogService:
+        if user_id == DEFAULT_USER_ID:
+            return self.event_log
+        if user_id not in self._user_event_logs:
+            transcript_store = self.session_manager._build_session_store(user_id=user_id)
+            self._user_event_logs[user_id] = EventLogService(
+                self.event_log_store.for_user(user_id), SdkTranscriptAdapter(store=transcript_store)
+            )
+        return self._user_event_logs[user_id]
+
+    def _branch_service_for(self, user_id: str) -> SessionBranchService:
+        if user_id == DEFAULT_USER_ID:
+            return self.session_branch
+        if user_id not in self._user_branches:
+            self._user_branches[user_id] = SessionBranchService(
+                store=self.session_manager._build_session_store(user_id=user_id),
+                meta_store=self.meta_store,
+                event_log=self._event_log_for(user_id),
+                resolve_project_cwd=self._resolve_project_cwd_safe,
+            )
+        return self._user_branches[user_id]
+
+    @staticmethod
+    def _new_session_key(client_key: str, project_name: str, user_id: str):
+        # Shared-mode keys retain their existing shape; employee namespaces also
+        # include the project so retries cannot collide across people/projects.
+        return client_key if user_id == DEFAULT_USER_ID else (user_id, project_name, client_key)
 
     async def startup(self, *, in_docker: bool = False, sandbox_enabled: bool = True) -> None:
         """Run async initialization (must be called from event loop).
@@ -174,18 +205,28 @@ class AssistantService:
         status: SessionStatus | None = None,
         limit: int = 50,
         offset: int = 0,
+        user_id: str | None = None,
     ) -> list[SessionMeta]:
         """List sessions, injecting SDK summary as title when available."""
-        sessions = await self.meta_store.list(project_name=project_name, status=status, limit=limit, offset=offset)
+        sessions = await self.meta_store.list(
+            project_name=project_name,
+            status=status,
+            limit=limit,
+            offset=offset,
+            **({"user_id": user_id} if user_id is not None else {}),
+        )
         if not sessions or not project_name:
             return sessions
 
         project_cwd = str(self.layout.projects_dir / project_name)
         sdk_sessions: list[Any] = []
 
-        if self._session_store is not None and list_sessions_from_store is not None:
+        session_store = (
+            self.session_manager._build_session_store(user_id=user_id) if user_id is not None else self._session_store
+        )
+        if session_store is not None and list_sessions_from_store is not None:
             try:
-                sdk_sessions = await list_sessions_from_store(self._session_store, directory=project_cwd)
+                sdk_sessions = await list_sessions_from_store(session_store, directory=project_cwd)
             except Exception:
                 logger.warning(
                     "SDK list_sessions_from_store failed, titles will be empty",
@@ -217,20 +258,26 @@ class AssistantService:
 
     async def delete_session(self, session_id: str) -> bool:
         """Delete session and cleanup."""
+        meta = await self.meta_store.get(session_id)
+        session_store = (
+            self.session_manager._build_session_store(user_id=meta.user_id)
+            if meta is not None and meta.user_id != DEFAULT_USER_ID
+            else self._session_store
+        )
         if session_id in self.session_manager.sessions:
             await self.session_manager.close_session(
                 session_id,
                 reason="session deleted",
             )
 
-        if self._session_store is not None and delete_session_via_store is not None:
+        if session_store is not None and delete_session_via_store is not None:
             # SDK derives project_key from `directory`; without it the key is
             # computed from server cwd and never matches inserted rows, so the
             # delete becomes a silent no-op. Resolve project cwd from meta.
             meta = await self.meta_store.get(session_id)
             project_cwd = str(self.layout.projects_dir / meta.project_name) if meta else None
             try:
-                await delete_session_via_store(self._session_store, session_id, directory=project_cwd)
+                await delete_session_via_store(session_store, session_id, directory=project_cwd)
             except Exception:
                 logger.warning(
                     "delete_session_via_store failed for %s",
@@ -282,6 +329,7 @@ class AssistantService:
         images: list["ImageAttachment"] | None = None,
         locale: str = DEFAULT_LOCALE,
         client_key: str | None = None,
+        user_id: str = DEFAULT_USER_ID,
     ) -> dict[str, Any]:
         """Unified send: create new session or send to existing one.
 
@@ -298,7 +346,7 @@ class AssistantService:
                 meta = await self.meta_store.get(session_id)
                 if meta is None:
                     raise FileNotFoundError(f"session not found: {session_id}")
-                if meta.project_name != project_name:
+                if meta.project_name != project_name or meta.user_id != user_id:
                     raise FileNotFoundError(f"session not found: {session_id}")
                 if meta.superseded_by is not None:
                     raise SessionSupersededError(
@@ -306,7 +354,7 @@ class AssistantService:
                     )
                 prompt = self._prepare_content(content, images)
                 # 旧会话懒生成先行：保证本条消息排在重放重建的历史之后。
-                await self.event_log.ensure_backfilled(
+                await self._event_log_for(meta.user_id).ensure_backfilled(
                     session_id, await self._aresolve_project_cwd_safe(meta.project_name)
                 )
                 accepted = await self.session_manager.send_message(
@@ -320,25 +368,29 @@ class AssistantService:
             return self._accepted_response(session_id, accepted)
         # New session
         if not client_key:
-            return await self._create_new_session(project_name, content, images, locale, client_key)
+            return await self._create_new_session(project_name, content, images, locale, client_key, user_id)
 
-        existing = await self._find_accepted_new_session(client_key, project_name)
+        existing = await self._find_accepted_new_session(client_key, project_name, user_id=user_id)
         if existing is not None:
             return existing
 
         # 同一 client_key 的并发请求在此串行化：send_new_session 在途期间
         # 后来者等锁而非各自建会话，避免重复执行同一 prompt。
-        lock = self._new_session_locks.lock_for(client_key)
+        lock = self._new_session_locks.lock_for(repr(self._new_session_key(client_key, project_name, user_id)))
         async with lock:
             # 双重检查：等锁期间先行者可能已完成同一 client_key 的建会话。
-            existing = await self._find_accepted_new_session(client_key, project_name)
+            existing = await self._find_accepted_new_session(client_key, project_name, user_id=user_id)
             if existing is not None:
                 return existing
-            result = await self._create_new_session(project_name, content, images, locale, client_key)
-            self._record_new_session_client_key(client_key, result["session_id"])
+            result = await self._create_new_session(project_name, content, images, locale, client_key, user_id)
+            self._record_new_session_client_key(
+                self._new_session_key(client_key, project_name, user_id), result["session_id"]
+            )
             return result
 
-    async def _find_accepted_new_session(self, client_key: str, project_name: str) -> dict[str, Any] | None:
+    async def _find_accepted_new_session(
+        self, client_key: str, project_name: str, *, user_id: str = DEFAULT_USER_ID
+    ) -> dict[str, Any] | None:
         """按幂等键定位已受理的新会话：进程内映射为快路径，事件日志跨会话
         查询兜底——进程重启 / LRU 淘汰后映射丢失，受理已落库的重试仍须命中
         既有会话而非重复建会话（重复执行同一 prompt、重复计费）。
@@ -347,7 +399,8 @@ class AssistantService:
         （返回 None，由调用方在当前项目新建会话），不抛错——用户未指名任何
         会话，跨项目复用同一 client_key 时新会话意图应落在当前项目。两条查找
         路径口径一致，均在返回前做归属校验。"""
-        mapped_session_id = self._new_session_client_keys.get(client_key)
+        scoped_key = self._new_session_key(client_key, project_name, user_id)
+        mapped_session_id = self._new_session_client_keys.get(scoped_key)
         if mapped_session_id is not None:
             # 幂等重试：首次受理已建会话并投递，返回同一会话的权威条目。
             entry = await self.event_log_store.find_by_client_key(mapped_session_id, client_key)
@@ -359,42 +412,50 @@ class AssistantService:
                 # 值仍是本次读到的旧值时才清，避免清掉并发写入的新映射（DB 兜底
                 # 查询本身按 client_key 定位一定命中同一权威会话，误删只是白跑
                 # 一次查询，但仍以精确条件避免这层不必要的抖动）。
-                if self._new_session_client_keys.get(client_key) == mapped_session_id:
-                    self._new_session_client_keys.pop(client_key, None)
-            elif await self._new_session_matches_project(mapped_session_id, project_name):
+                if self._new_session_client_keys.get(scoped_key) == mapped_session_id:
+                    self._new_session_client_keys.pop(scoped_key, None)
+            elif await self._new_session_matches_project(mapped_session_id, project_name, user_id=user_id):
                 # 命中即刷新 LRU 位置：否则被频繁重试命中的 key 仍按插入
                 # 顺序（而非访问顺序）淘汰，退化成 FIFO。上一行 await 期间
                 # 该 key 可能已被其他并发请求的淘汰逻辑移除，直接
                 # move_to_end 对不存在的键会抛 KeyError；复用
                 # _record_new_session_client_key 的赋值语义（不存在则插入，
                 # 存在则原地更新）再显式挪到最近使用端，两种情形都安全。
-                self._record_new_session_client_key(client_key, mapped_session_id)
+                self._record_new_session_client_key(scoped_key, mapped_session_id)
                 return {"status": "accepted", "session_id": mapped_session_id, "entry": entry, "queued_message": None}
             # else：映射命中的会话属于其他项目 → 视为未命中，落到 DB 兜底 / 新建
             # 路径。不清映射：它对原项目仍有效；后续在当前项目新建会话时由
             # _record_new_session_client_key 以本项目 session 覆盖同一 client_key。
-        recovered = await self.event_log_store.find_new_session_by_client_key(client_key)
+        recovered = await self.event_log_store.find_new_session_by_client_key(
+            client_key,
+            user_id=user_id,
+            **({"project_name": project_name} if user_id != DEFAULT_USER_ID else {}),
+        )
         if recovered is None:
             return None
         session_id, entry = recovered
-        if not await self._new_session_matches_project(session_id, project_name):
+        if not await self._new_session_matches_project(session_id, project_name, user_id=user_id):
             # 兜底命中的会话属于其他项目 → 视为未命中，走当前项目新建路径。
             return None
         # 上一行 await 期间该 key 可能已被其他并发请求记入新映射；仅当当前
         # 无映射或已是同一 session_id 时才写入，避免用本次查到的（较旧）
         # session_id 覆盖并发写入的映射。
-        if self._new_session_client_keys.get(client_key) in (None, session_id):
-            self._record_new_session_client_key(client_key, session_id)
+        if self._new_session_client_keys.get(scoped_key) in (None, session_id):
+            self._record_new_session_client_key(scoped_key, session_id)
         return {"status": "accepted", "session_id": session_id, "entry": entry, "queued_message": None}
 
-    async def _new_session_matches_project(self, session_id: str, project_name: str) -> bool:
+    async def _new_session_matches_project(
+        self, session_id: str, project_name: str, *, user_id: str = DEFAULT_USER_ID
+    ) -> bool:
         """幂等命中的新会话是否属于当前调用项目。校验依据为会话 meta 的
         ``project_name``；meta 不存在（异常 / 已删）时不阻断命中，保持既有幂等
         语义——跨项目串号的前提是命中会话 meta 存在且项目不同。"""
         meta = await self.meta_store.get(session_id)
-        return meta is None or meta.project_name == project_name
+        return (meta is None and user_id == DEFAULT_USER_ID) or (
+            meta is not None and meta.project_name == project_name and meta.user_id == user_id
+        )
 
-    def _record_new_session_client_key(self, client_key: str, session_id: str) -> None:
+    def _record_new_session_client_key(self, client_key: str | tuple[str, str, str], session_id: str) -> None:
         self._new_session_client_keys[client_key] = session_id
         self._new_session_client_keys.move_to_end(client_key)
         while len(self._new_session_client_keys) > self._new_session_client_keys_max:
@@ -407,6 +468,7 @@ class AssistantService:
         images: list["ImageAttachment"] | None,
         locale: str,
         client_key: str | None,
+        user_id: str = DEFAULT_USER_ID,
     ) -> dict[str, Any]:
         """实际创建新会话并投递首条消息，不涉及 client_key 幂等映射记账。"""
         prompt = self._prepare_content(content, images)
@@ -416,6 +478,7 @@ class AssistantService:
             locale=locale,
             user_entry=self._build_user_log_entry(prompt),
             client_key=client_key,
+            user_id=user_id,
         )
         managed = self.session_manager.sessions.get(new_sdk_session_id)
         entry = managed.initial_user_log_entry if managed is not None else None
@@ -514,7 +577,9 @@ class AssistantService:
         prompt = self._prepare_content(content, images)
 
         project_cwd = await self._aresolve_project_cwd_safe(meta.project_name)
-        anchor = await self.event_log.resolve_user_message_anchor(session_id, anchor_entry_uuid, project_cwd)
+        anchor = await self._event_log_for(meta.user_id).resolve_user_message_anchor(
+            session_id, anchor_entry_uuid, project_cwd
+        )
         if anchor is None:
             raise RewriteAnchorError(f"anchor {anchor_entry_uuid} is not a user message of session {session_id}")
 
@@ -540,7 +605,7 @@ class AssistantService:
             new_meta = await self.meta_store.get(new_session_id)
             if branched.resumable:
                 # 懒生成先行：改写后的消息要排在复制来的前缀历史之后。
-                await self.event_log.ensure_backfilled(new_session_id, project_cwd)
+                await self._event_log_for(meta.user_id).ensure_backfilled(new_session_id, project_cwd)
             accepted = await self.session_manager.send_message(
                 new_session_id,
                 prompt,
@@ -593,7 +658,10 @@ class AssistantService:
     async def _branch_or_reject(self, session_id: str, anchor_entry_uuid: str) -> BranchedSession:
         """分叉，并把分支服务的异常翻译回编排层能分辨的拒绝理由。"""
         try:
-            return await self.session_branch.branch(session_id, anchor_entry_uuid)
+            meta = await self.meta_store.get(session_id)
+            if meta is None:
+                raise FileNotFoundError(f"session not found: {session_id}")
+            return await self._branch_service_for(meta.user_id).branch(session_id, anchor_entry_uuid)
         except BranchAnchorError as exc:
             # 编排层的预检放行了、切片却拒绝：解析出的 uuid 在 transcript 里查无
             # 此条（锚点是运行中轮次刚发出、SDK 尚未回放的那条），或该条目载有
@@ -624,7 +692,10 @@ class AssistantService:
         except Exception:
             logger.exception("删除未完成分支会话事件日志失败 session_id=%s", new_session_id)
         try:
-            await self.session_branch.discard(origin_session_id, new_session_id)
+            meta = await self.meta_store.get(origin_session_id)
+            await self._branch_service_for(meta.user_id if meta else DEFAULT_USER_ID).discard(
+                origin_session_id, new_session_id
+            )
         except Exception:
             logger.exception("撤回未完成分支失败 origin=%s new=%s", origin_session_id, new_session_id)
 
@@ -732,7 +803,7 @@ class AssistantService:
                 raise FileNotFoundError(f"session not found: {session_id}")
         status = await self.session_manager.get_status(session_id) or meta.status
         project_cwd = await self._aresolve_project_cwd_safe(meta.project_name)
-        entries = await self.event_log.list_entries(session_id, project_cwd, after_seq=after_seq)
+        entries = await self._event_log_for(meta.user_id).list_entries(session_id, project_cwd, after_seq=after_seq)
         draft_state = (
             self.session_manager.get_draft_state(session_id) if status == "running" else {"draft": None, "rev": 0}
         )
@@ -751,6 +822,7 @@ class AssistantService:
         meta: SessionMeta | None = None,
         request: Request | None = None,
         after_seq: int = -1,
+        authorization_check: Callable[[], Awaitable[bool]] | None = None,
     ) -> AsyncIterator[ServerSentEvent]:
         """SSE entry 流：事件 ``id`` 即 seq，断线重连按 cursor 续传、不整帧重算。
 
@@ -774,9 +846,13 @@ class AssistantService:
             ready = await anext(stream, None)
             if not isinstance(ready, SubscriptionReady):
                 return
+            if authorization_check is not None and not await authorization_check():
+                return
             # 订阅已先行建立（无缝隙）；订阅与库读之间重复投递的条目由 seq
             # 门槛过滤——身份比对，非内容比对。
-            for entry in await self.event_log.list_entries(session_id, project_cwd, after_seq=last_seq):
+            for entry in await self._event_log_for(meta.user_id).list_entries(
+                session_id, project_cwd, after_seq=last_seq
+            ):
                 last_seq = max(last_seq, self._entry_seq(entry))
                 yield self._entry_sse_event(entry)
 
@@ -798,6 +874,8 @@ class AssistantService:
             # 在本轮条目全部广播之后发出 runtime_status。
             async for stream_event in stream:
                 if request is not None and await request.is_disconnected():
+                    break
+                if authorization_check is not None and not await authorization_check():
                     break
 
                 if isinstance(stream_event, Heartbeat):

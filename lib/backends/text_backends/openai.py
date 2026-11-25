@@ -122,6 +122,15 @@ class OpenAITextBackend:
             return await prompt_json_fallback(
                 request, self._generate_prompt_json_once, provider=self._provider_name, model=self._model
             )
+        if (
+            request.response_schema
+            and request.prefer_stream
+            and not supports_strict_schema(resolve_schema(request.response_schema))
+        ):
+            # 规划模型含可省略字段 / 开放映射，不能为迎合网关强行改成 strict schema。
+            # 直接用流式正文 + 本地校验，避免已知会拒收的 schema 与非流式 tools 降级。
+            logger.info("%s/%s 的规划 schema 不满足 strict 约束，使用流式 JSON 正文并在本地校验", self.name, self.model)
+            return await self._prompt_json_fallback(request)
         # 带图请求要读本地图片编码 data URI，放线程里构建，避免阻塞事件循环
         messages = await asyncio.to_thread(_build_messages, request)
         if request.response_schema and TextCapability.STRUCTURED_OUTPUT not in self._capabilities:

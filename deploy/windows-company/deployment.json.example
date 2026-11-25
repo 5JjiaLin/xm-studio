@@ -1,0 +1,12 @@
+{
+  "deployment_id": null,
+  "service_account": null,
+  "task_prefix": "XMStudio",
+  "server_ip": null,
+  "site_host": null,
+  "client_subnets": [],
+  "backup_unc": null,
+  "independent_backup_confirmed": false,
+  "retention_enabled": false,
+  "maintenance_timezone": "Asia/Shanghai"
+}

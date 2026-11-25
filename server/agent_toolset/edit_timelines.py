@@ -49,6 +49,7 @@ CREATE_TIMELINE = ToolDeclaration(
 
 LIST_TIMELINES = ToolDeclaration(
     name="list_timelines",
+    access="read",
     description=(
         "列出项目里的剪辑时间线：id、集 ID、显示名、最新修订号、剪辑片段数与最近修改时间，按集与创建顺序排列。"
         "只读，无副作用。"
@@ -62,6 +63,7 @@ LIST_TIMELINES = ToolDeclaration(
 
 READ_TIMELINE = ToolDeclaration(
     name="read_timeline",
+    access="read",
     description=(
         "读取一条剪辑时间线最新修订的完整内容，revision 为当前修订号。只读，无副作用；"
         "ID 不存在返回 timeline_not_found。时间一律以秒为单位，最多三位小数。"
@@ -142,6 +144,7 @@ RENAME_TIMELINE = ToolDeclaration(
 
 LIST_REVISIONS = ToolDeclaration(
     name="list_revisions",
+    access="read",
     description=(
         "列出一条剪辑时间线的修订历史，按修订号从旧到新：number、parent、author（creator 创作者、arcreel_agent、"
         "external_agent）、summary（改动摘要）、created_at、clip_count、changed_clip_ids（该修订改动过的剪辑片段，"
@@ -157,6 +160,7 @@ LIST_REVISIONS = ToolDeclaration(
 
 LIST_BGM = ToolDeclaration(
     name="list_bgm",
+    access="read",
     description=(
         "列出项目里已上传的 BGM：id（如 bgm-3f9a0c21，edit_timeline 的 insert_bgm 用它引用）、name 与 duration（秒），"
         "按上传先后排列。BGM 属于整个项目，各集的剪辑时间线都能用；上传由创作者在剪辑视图的 BGM 轨完成，"

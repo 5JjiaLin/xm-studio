@@ -1,0 +1,26 @@
+{
+    admin {$XMSTUDIO_ADMIN_ADDRESS:127.0.0.1:2019}
+    skip_install_trust
+    auto_https disable_redirects
+    storage file_system {
+        root {$XMSTUDIO_ROOT}/caddy-data
+    }
+}
+
+{$XMSTUDIO_SITE_ADDRESS} {
+    bind {$XMSTUDIO_BIND_IP}
+    tls internal
+
+    log {
+        output file {$XMSTUDIO_ROOT}/ops-logs/caddy/access.json {
+            roll_size 20MiB
+            roll_keep 10
+            roll_keep_for 168h
+        }
+    }
+
+    @operations path /_ops/*
+    respond @operations 404
+
+    reverse_proxy 127.0.0.1:{$XMSTUDIO_BACKEND_PORT:1242}
+}

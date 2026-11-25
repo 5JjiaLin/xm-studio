@@ -35,7 +35,7 @@ from server.cors_config import resolve_cors_policy
 from server.remote_mcp import ArcApiKeyVerifier, RemoteMCPHost, build_remote_mcp_server, mount_remote_mcp
 from server.tool_runtime import Services, TextGenerationResult
 from tests.factories import install_current_video, make_test_clip, make_video_request_facts, register_project_sources
-from tests.fakes import refuse_resume_execution
+from tests.fakes import create_test_directory_link, refuse_resume_execution
 from tests.integration.server.agent_tool_support import ToolHarness
 
 
@@ -107,7 +107,7 @@ def remote_projects(tmp_path: Path) -> ProjectManager:
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "project.json").write_text("{}", encoding="utf-8")
-    (projects_root / "escape").symlink_to(outside, target_is_directory=True)
+    create_test_directory_link(projects_root / "escape", outside)
 
     return manager
 

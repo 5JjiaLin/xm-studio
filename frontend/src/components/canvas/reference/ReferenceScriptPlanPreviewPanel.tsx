@@ -243,9 +243,11 @@ function InlineViolations({ violations, position }: { violations: ScriptReviewVi
     <>
       {violations.map((v, i) => {
         const speechKey = SPEECH_VIOLATION_KEYS[v.code];
-        const location = v.locations
-          ?.map(({ path, line }) => `${path.join(".")}${line === null ? "" : `:${line + 1}`}`)
-          .join(", ");
+        const location = speechKey && Array.isArray(v.locations) ? v.locations.flatMap((entry) => {
+          if (!entry || typeof entry !== "object" || !("path" in entry) || !Array.isArray(entry.path)) return [];
+          const { path, line } = entry;
+          return [`${path.join(".")}${typeof line === "number" ? `:${line + 1}` : ""}`];
+        }).join(", ") : undefined;
         const message = speechKey && location
           ? t(speechKey, { position, location })
           : draftViolationMessage(v, t, position);

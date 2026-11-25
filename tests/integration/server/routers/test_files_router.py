@@ -459,12 +459,23 @@ class TestFilesRouter:
         assert [entry["episode"] for entry in pm.load_project("demo")["episodes"]] == [1]
 
     def test_source_upload_race_project_deleted_reports_project_not_found(self, tmp_path, monkeypatch):
-        client, _ = _client(monkeypatch, tmp_path)
+        client, pm = _client(monkeypatch, tmp_path)
+        project_dir = pm.get_project_path("demo")
+        original_exists = Path.exists
+
+        def _project_disappeared(path):
+            return False if path == project_dir else original_exists(path)
 
         class _RaceLoader:
             @staticmethod
             def load(*args, **kwargs):
-                shutil.rmtree(tmp_path / "projects" / "demo")
+                if os.name == "nt":
+                    # Windows cannot delete the open project lock. Simulate the
+                    # missing directory observed by the exception mapper; Unix
+                    # still exercises physical removal while the lock is held.
+                    monkeypatch.setattr(Path, "exists", _project_disappeared)
+                else:
+                    shutil.rmtree(project_dir)
                 raise FileNotFoundError("/server/projects/demo/source gone")
 
         monkeypatch.setattr(files, "SourceLoader", _RaceLoader)

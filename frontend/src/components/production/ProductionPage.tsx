@@ -31,6 +31,8 @@ import { isResourceBusy, useActiveResourceIds, useLatestTasksByResource } from "
 import { scriptPlanResourceId, promptAuthoringResourceId, draftRepairResourceId } from "@/actions/generation";
 import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
 import { useProductionVideoProgress } from "./videos/useProductionVideoProgress";
+import { videoPromptReferenceRevision } from "./videos/video-prompt-preview";
+import { useProjectsStore } from "@/stores/projects-store";
 import { buildMentionLookup } from "@/utils/reference-mentions";
 import { AlertDialog, AlertDialogAction, AlertDialogBody, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 
@@ -60,12 +62,18 @@ export function ProductionPage() {
   const episodeQuery = new URLSearchParams(search).get("episode");
   const requestedEpisode = episodeQuery && /^[1-9][0-9]*$/.test(episodeQuery) ? Number(episodeQuery) : null;
   const { episode, project, units, source, sourceRevision, workflow, production, review, refresh, loading, refreshing, error } = useProductionProject(projectName ?? null, episodeQuery !== null && requestedEpisode === null ? -1 : requestedEpisode);
+  // Continuity validation checks the adjacent saved units as well as the edited one.
+  const handoffRevisions = units.map((unit) => unit.prompt_policy_version === "drama_detail_v1"
+    ? JSON.stringify([unit.unit_id, unit.text, unit.generation_prompt, unit.pending_authoring]) : "");
+  const mediaRevision = useProjectsStore((state) => videoPromptReferenceRevision(state.assetFingerprints));
+  const videoReferenceRevision = JSON.stringify([workflow?.project_revision, mediaRevision,
+    workflow?.content?.referenced_assets?.map(({ name, asset_type, owner, sheet_state }) =>
+      JSON.stringify([asset_type, name, owner, sheet_state])).sort()]);
   const mentionLookup = buildMentionLookup(project);
   const [picker, setPicker] = useState(false);
   const [confirmReplan, setConfirmReplan] = useState(false);
   const [replanReason, setReplanReason] = useState("");
   const [repairOnce, setRepairOnce] = useState(false);
-  const step = PRODUCTION_STEPS.find((s) => s === requestedStep) ?? (workflow?.content?.formal_script === "present" ? "assets" : "script");
   const [actionError, setActionError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const [timelineBlocked, setTimelineBlocked] = useState<Record<string, boolean>>({});
@@ -73,13 +81,8 @@ export function ProductionPage() {
     setTimelineBlocked((current) => current[key] === blocked ? current : { ...current, [key]: blocked });
   }, []);
   const hasUnsavedChanges = useHasUnsavedChanges();
-  useEffect(() => {
-    if (!projectName || loading || !project) return;
-    if (!episode || (episodeQuery !== null && requestedEpisode === null)) navigate(projectPath(projectName), { replace: true });
-  }, [episode, episodeQuery, loading, navigate, project, projectName, requestedEpisode, step]);
   const { busy: planning, latestTask: planTask } = useScriptPlanEntry(projectName ?? "", episode ?? 0);
   const planFailed = planTask?.status === "failed" || planTask?.status === "cancelled";
-  const retryPlan = step === "breakdown" && !review?.content && planFailed;
   const assetItems = workflow?.content?.referenced_assets ?? [];
   const imageCharacters = useActiveResourceIds("character", projectName);
   const imageScenes = useActiveResourceIds("scene", projectName);
@@ -99,7 +102,8 @@ export function ProductionPage() {
     && !!authoringTask && repairTask.queued_at > authoringTask.queued_at;
   const authoringFailed = !repairedAuthoring && (authoringTask?.status === "failed" || authoringTask?.status === "cancelled");
   const pendingPromptCount = units.filter((unit) => unit.pending_authoring).length;
-  const active = loading || refreshing || imagesBusy || videosBusy || authoring || planning || starting || production?.status === "active" || production?.status === "submitting" || production?.status === "unknown";
+  const operationBusy = imagesBusy || videosBusy || authoring || planning || starting || production?.status === "active" || production?.status === "submitting" || production?.status === "unknown";
+  const active = loading || refreshing || operationBusy;
   const promptsReady = workflow?.content?.formal_script === "present" && units.length > 0 && !units.some((unit) => unit.pending_authoring);
   const failedUnitIds = production?.status === "failed" ? production.members?.filter((member) => ["failed", "cancelled", "blocked"].includes(member.status)).map((member) => member.unit_id) : undefined;
   const retryVideos = production?.stage === "videos" && production.action === "videos" && Boolean(failedUnitIds?.length);
@@ -112,6 +116,29 @@ export function ProductionPage() {
   const canRebuild = inputGate?.videos_ready === true;
   const completedImages = assetItems.filter((asset) => asset.sheet_state === "current" || asset.sheet_state === "stale").length;
   const allImagesReady = inputGate?.references_ready === true;
+  const openSavedBreakdown = Boolean(review?.content || review?.quarantine);
+  const savedPlanStale = workflow?.content?.episode_plan_stale || workflow?.artifacts?.script_plan?.state === "stale";
+  const explicitStep = PRODUCTION_STEPS.find((s) => s === requestedStep);
+  const resumedStep = (
+    planning || review?.quarantine || savedPlanStale ? "breakdown"
+      : outputCurrent || production?.action === "finish" ? "output"
+      : promptsReady && allImagesReady ? "videos"
+      : review?.status === "confirmed" || workflow?.content?.formal_script === "present" ? "assets"
+      : openSavedBreakdown || planFailed || planTask?.status === "succeeded" ? "breakdown"
+      : "script"
+  );
+  const step = explicitStep ?? resumedStep;
+  useEffect(() => {
+    if (!projectName || loading || !project) return;
+    if (!episode || (episodeQuery !== null && requestedEpisode === null)) {
+      navigate(projectPath(projectName), { replace: true });
+    } else if (!explicitStep) {
+      // Resolve once on entry; later polling must not switch away from an open editor.
+      navigate(productionPath(projectName, resumedStep, episode), { replace: true });
+    }
+  }, [episode, episodeQuery, explicitStep, loading, navigate, project, projectName, requestedEpisode, resumedStep]);
+  const retryPlan = step === "breakdown" && !openSavedBreakdown && planFailed;
+  const submitForm = (step === "breakdown" && !retryPlan) || (step === "script" && !openSavedBreakdown);
   const assetSummary = workflow?.content?.asset_summary;
   const videoProgress = useProductionVideoProgress(projectName ?? "", units, production);
   const videoCounts = { succeeded: 0, running: 0, queued: 0, failed: 0, waiting: 0, submitting: 0, unknown: 0 };
@@ -272,7 +299,7 @@ export function ProductionPage() {
         {production?.action === "finish" && production.status === "active" && <p role="status" className="text-sm">{t(production.stage === "draft" ? "finish_draft" : "finish_render")}</p>}
         {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
         {loading ? <LoadingState variant="pane" /> : !projectName ? <ScriptInput /> : project && episode && <>
-          {step === "script" && <ScriptInput key={`${projectName}/${episode}`} projectName={projectName} episode={episode} source={source ?? ""} sourceRevision={sourceRevision} disabled={active} repairEnabled={review?.repair_allowed === true} readOnly={project.episodes?.find((entry) => entry.episode === episode)?.source_origin === "whole_source"} />}
+          {step === "script" && <ScriptInput key={`${projectName}/${episode}`} projectName={projectName} episode={episode} source={source ?? ""} sourceRevision={sourceRevision} openSavedBreakdown={openSavedBreakdown} disabled={active} repairEnabled={review?.repair_allowed === true} readOnly={project.episodes?.find((entry) => entry.episode === episode)?.source_origin === "whole_source"} />}
           {step === "breakdown" && <>
             <BreakdownStatus task={planTask} busy={planning} review={review} />
             {review?.repair_progress?.can_recheck && <Button type="button" variant="outline" className="self-start" disabled={active} onClick={() => void recheckPlan()}>{t("production_recheck_saved_result")}</Button>}
@@ -320,7 +347,7 @@ export function ProductionPage() {
             </Progress>
             <p className="text-sm text-muted-foreground">{t("production_videos_counts", { running: videoCounts.running, queued: videoCounts.queued + videoCounts.submitting, failed: videoCounts.failed, waiting: videoCounts.waiting + videoCounts.unknown })}</p>
             <p role="status" className="flex items-center gap-2 text-sm">{production?.stage === "render" && production.status === "active" && <Loader2 aria-hidden className="size-4 animate-spin text-primary" />}{t(production?.stage === "render" && production.status === "active" ? "production_videos_rendering" : "production_videos_hint")}</p>
-          </section><div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-4">{episode && units.map((u, i) => <ProductionVideoCard key={u.unit_id} project={projectName} episode={episode} unit={u} index={i} production={production} progress={videoProgress.get(u.unit_id)!} busy={active} onGenerate={() => startVideos([u.unit_id])} onChanged={refresh} onTimelineValidation={onTimelineValidation} />)}</div></>}</>}
+          </section><div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-4">{episode && units.map((u, i) => <ProductionVideoCard key={`${projectName}/${episode}/${u.unit_id}`} referenceRevision={JSON.stringify([videoReferenceRevision, i === 0, handoffRevisions[i - 1], handoffRevisions[i + 1]])} project={projectName} episode={episode} unit={u} index={i} production={production} progress={videoProgress.get(u.unit_id)!} busy={operationBusy} generationSyncing={refreshing} onGenerate={() => startVideos([u.unit_id])} onChanged={refresh} onTimelineValidation={onTimelineValidation} />)}</div></>}</>}
           {step === "output" && (previousOutputUrl ? <><video controls src={previousOutputUrl} className="max-h-[70vh] w-full"><track kind="captions" /></video>{!outputCurrent && <p className="text-sm text-muted-foreground">{t("production_output_changed")}</p>}{!outputCurrent && !active && canRebuild && <Button variant="outline" className="self-start" onClick={() => void rebuild()}>{t("production_rebuild_output")}</Button>}</> : <div className="flex flex-col gap-3"><p className="text-sm text-muted-foreground">{t(output && output.status !== "missing" ? "production_output_changed" : "production_wait_output")}</p>{!active && canRebuild && <Button variant="outline" className="self-start" onClick={() => void rebuild()}>{t("production_rebuild_output")}</Button>}</div>)}
           {step === "output" && production?.timeline_id && <ProductionEditor project={projectName} episode={episode} units={units} busy={active} onChanged={refresh} onRender={() => rebuild(true)} />}
           {step === "output" && production?.timeline_id && <JianyingDeliveryCard key={`${projectName}/${episode}`} project={projectName} episode={episode} busy={active} revision={JSON.stringify(production)} />}
@@ -329,7 +356,7 @@ export function ProductionPage() {
       </div>
     </main>
     {review?.status === "confirmed" && !review.quarantine && <div className="px-4 py-2"><Button variant="outline" disabled={active} onClick={() => void revisePlan()}>{t("common:edit")} · {t("production_step_breakdown")}</Button></div>}
-    <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border bg-card px-4 py-3"><p className="text-sm text-muted-foreground">{active ? t("production_running") : step === "assets" ? t("production_video_targets", { count: units.length }) : step === "videos" && canRebuild ? t("finish_merge_hint") : t("production_saved")}</p>{step === "output" && outputUrl ? <a className={buttonVariants()} href={outputUrl} download>{t("production_download")}</a> : <Button form={step === "breakdown" && !retryPlan || !projectName || step === "script" ? "production-action" : undefined} type={step === "breakdown" && !retryPlan || !projectName || step === "script" ? "submit" : "button"} onClick={retryPlan && projectName ? requestReplan : step === "assets" ? assetAction : step === "videos" ? () => void (canRebuild ? rebuild() : startVideos()) : undefined} disabled={active || (step !== "script" && step !== "breakdown" && step !== "assets" && step !== "videos") || (step === "breakdown" && !retryPlan && (!review?.content || !!review.quarantine)) || (step === "assets" && (allImagesReady ? !promptsReady && workflow?.operations.author_prompts?.state !== "admitted" : !review?.fingerprint || review.status !== "confirmed")) || (step === "videos" && !canRebuild && (!allImagesReady || !promptsReady || videoTimelineBlocked))}>{t(planning ? "production_breakdown_running" : retryPlan ? "production_breakdown_retry" : step === "script" ? "production_start" : step === "breakdown" ? "production_confirm_assets" : step === "assets" ? allImagesReady ? promptsReady ? "production_review_videos" : "production_confirm_assets_write_prompts" : "production_confirm_image_prompts" : step === "videos" && canRebuild ? "production_confirm_merge" : step === "videos" && retryVideos ? "production_retry_failed" : step === "videos" ? "production_confirm_videos" : "production_download")}</Button>}</footer>
+    <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border bg-card px-4 py-3"><p className="text-sm text-muted-foreground">{loading || (step !== "videos" && refreshing) ? t("common:loading") : operationBusy ? t("production_running") : step === "videos" && error ? error : step === "assets" ? t("production_video_targets", { count: units.length }) : step === "videos" && canRebuild ? t("finish_merge_hint") : t("production_saved")}</p>{step === "output" && outputUrl ? <a className={buttonVariants()} href={outputUrl} download>{t("production_download")}</a> : <Button form={submitForm ? "production-action" : undefined} type={submitForm ? "submit" : "button"} onClick={step === "script" && openSavedBreakdown && projectName && episode ? () => navigate(productionPath(projectName, "breakdown", episode)) : retryPlan && projectName ? requestReplan : step === "assets" ? assetAction : step === "videos" ? () => void (canRebuild ? rebuild() : startVideos()) : undefined} disabled={active || (step !== "script" && step !== "breakdown" && step !== "assets" && step !== "videos") || (step === "breakdown" && !retryPlan && (!review?.content || !!review.quarantine)) || (step === "assets" && (allImagesReady ? !promptsReady && workflow?.operations.author_prompts?.state !== "admitted" : !review?.fingerprint || review.status !== "confirmed")) || (step === "videos" && !canRebuild && (!allImagesReady || !promptsReady || videoTimelineBlocked))}>{t(planning ? "production_breakdown_running" : retryPlan ? "production_breakdown_retry" : step === "script" ? (openSavedBreakdown ? "production_open_saved_breakdown" : "production_start") : step === "breakdown" ? "production_confirm_assets" : step === "assets" ? allImagesReady ? promptsReady ? "production_review_videos" : "production_confirm_assets_write_prompts" : "production_confirm_image_prompts" : step === "videos" && canRebuild ? "production_confirm_merge" : step === "videos" && retryVideos ? "production_retry_failed" : step === "videos" ? "production_confirm_videos" : "production_download")}</Button>}</footer>
     {picker && <WorkPicker onClose={() => setPicker(false)} />}
     <AlertDialog open={confirmReplan} onOpenChange={(open) => { if (!starting) setConfirmReplan(open); }}>
       <AlertDialogContent>

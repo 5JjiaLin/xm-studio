@@ -16,11 +16,16 @@ import json
 import logging
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 from lib.backends.providers import CallPurpose
-from lib.backends.text_backends.base import DEFAULT_MAX_OUTPUT_TOKENS, TextOutputTruncatedError, TextTaskType
+from lib.backends.text_backends.base import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    TextGenerationTimeoutError,
+    TextOutputTruncatedError,
+    TextTaskType,
+)
 from lib.backends.text_backends.base import TextGenerationRequest as BackendTextGenerationRequest
 from lib.backends.text_generator import TextGenerator
 from lib.catalog.errors import ModelNotInCatalogError
@@ -42,12 +47,17 @@ from lib.script.draft_quarantine import (
     read_quarantine,
     violation_entries,
 )
+from lib.script.prompt_policy import prompt_content_validation_enabled
 from lib.script.reference_video.authoring_response import (
     AuthoringCandidateViolation,
     authoring_response_model,
     normalize_authoring_text,
     parse_authoring_json,
     recover_repeated_unit_fields,
+)
+from lib.script.reference_video.source_anchor_repair import (
+    preserve_source_bindings,
+    restore_source_anchor_layout,
 )
 from lib.script.reference_video.dialogue_binding import render_dialogue_catalogue, resolve_dialogue_fragments
 from lib.script.script_review import content_fingerprint, formal_script_filename, script_plan_path
@@ -77,6 +87,8 @@ _DOCUMENTS: dict[str, str] = {
     QUARANTINE_KIND_SCRIPT_PLAN: (
         "参考生视频的脚本规划草稿：`units` 是有序视频单元，`source_text` 逐字摘录源文，"
         "`text` 是单元正文，用 `@[名称]` 引用已登记的资产。"
+        "修复对白时只改 text 中对应的发声记号；未报错的 source_text 保持原值。"
+        "如需改原文锚，直接复制连续原文，保留原有换行，不要自行折行或拼接。"
     ),
     QUARANTINE_KIND_PROMPT_AUTHORING: (
         "参考生视频的提示词编写草稿：`units` 与正式剧本的视频单元一一对应，"
@@ -345,7 +357,7 @@ class DraftRepair:
         """
         try:
             content = await self._repaired_content(episode, doc_type, base_revision, instructions)
-        except (DraftWorkflowError, TextOutputTruncatedError, ModelNotInCatalogError):
+        except (DraftWorkflowError, TextOutputTruncatedError, TextGenerationTimeoutError, ModelNotInCatalogError):
             # 引用的模型已不在供应商清单中是可重选的配置问题：原样抛出，由调用方带「去配置供应商」呈现
             raise
         except Exception as exc:
@@ -360,6 +372,13 @@ class DraftRepair:
         kind, draft = await self.check(episode, doc_type, base_revision)
         if kind == QUARANTINE_KIND_PROMPT_AUTHORING:
             return await self._repair_reference_prompts(episode, draft, instructions)
+        source_text = await self._source_text(episode, kind, draft)
+        repair_layout = kind == QUARANTINE_KIND_SCRIPT_PLAN and prompt_content_validation_enabled()
+        if repair_layout:
+            # Repair only provable layout differences before spending a model call.
+            # Save still checks the original revision and fully revalidates content.
+            content = await asyncio.to_thread(restore_source_anchor_layout, draft.content, source_text)
+            draft = replace(draft, content=content)
         violations = await self._violations(episode, kind, draft)
         if not violations:
             return draft.content
@@ -393,7 +412,15 @@ class DraftRepair:
             project_name=self.ctx.project_name,
             require_complete=True,
         )
-        return merge_repair(draft.content, scope, json.loads(strip_json_code_fences(result.text)))
+        content = merge_repair(draft.content, scope, json.loads(strip_json_code_fences(result.text)))
+        if kind == QUARANTINE_KIND_SCRIPT_PLAN:
+            # Source bindings are server-owned provenance.  A full-draft model
+            # response may echo or rewrite them, so restore the exact baseline
+            # bindings before the strict source validator runs.
+            content = preserve_source_bindings(content, draft.content)
+        if repair_layout:
+            content = await asyncio.to_thread(restore_source_anchor_layout, content, source_text)
+        return content
 
     async def _repair_reference_prompts(
         self, episode: int, draft: QuarantinedDraft, instructions: str | None,

@@ -59,6 +59,7 @@ from lib.db.repositories.usage_repo import bound_provider_response
 from lib.generation.task_failure import encode_failure
 from lib.infra.async_thread import run_noninterruptible_async, run_noninterruptible_sync, run_sync_transaction
 from lib.infra.data_root_layout import DataRootLayout
+from lib.infra.server_runtime import runtime
 
 from .check import STAGES, check_response, stage_report_payload
 from .inputs import EndpointTestCredentials, EndpointTestParameters
@@ -350,7 +351,7 @@ class TrialRunManager:
         # 占位也必须在第一次 await 之前：并发闸靠的是「查 busy」与「占位」之间没有让出点。
         try:
             run_dir = await run_sync_transaction(self._prepare_run_dir, run_id, frozenset(self._runs))
-            task = asyncio.create_task(self._execute(run, run_dir, target, parameters, assets or {}))
+            task = runtime.track_task("endpoint_trial", self._execute(run, run_dir, target, parameters, assets or {}))
         except BaseException:
             await run_sync_transaction(self._discard, run_id, self._release(run_id))
             raise

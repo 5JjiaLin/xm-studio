@@ -1,5 +1,7 @@
 """create_openai_client 客户端工厂行为。"""
 
+import httpx
+
 from lib.backends.openai_shared import create_openai_client
 from lib.config.url_utils import OFFICIAL_OPENAI_BASE_URL
 
@@ -23,3 +25,14 @@ class TestCreateOpenAIClientBaseURL:
         monkeypatch.setenv("OPENAI_BASE_URL", "https://relay.example.com/v1")
         client = create_openai_client(api_key="x", base_url="https://vllm.internal:8000/v1")
         assert str(client.base_url).rstrip("/") == "https://vllm.internal:8000/v1"
+
+
+async def test_client_uses_the_projects_http_transport_and_sdk_defaults():
+    client = create_openai_client(api_key="test", base_url="https://relay.test/v1", max_retries=0)
+    try:
+        assert isinstance(client._client, httpx.AsyncClient)
+        assert client._client.timeout.read == 600
+        assert client._client.timeout.connect == 5
+        assert client._client.follow_redirects is True
+    finally:
+        await client.close()

@@ -19,6 +19,7 @@ from lib.infra.async_thread import run_sync_transaction
 from lib.infra.content_digest import prefixed_canonical_json_digest, prefixed_sha256_file
 from lib.infra.json_io import atomic_write_json, load_json_or_none
 from lib.infra.path_safety import try_safe_join
+from lib.project.archive_context import generation_project
 from lib.project.project_manager import ProjectManager, find_episode
 from lib.project.task_project_claim import current_task_project_claim, ensure_task_project_claim
 from lib.script import script_review
@@ -518,6 +519,7 @@ async def execute_reference_repair_plan(
 
     async def validate(value: dict[str, Any]) -> list[Any]:
         project = await asyncio.to_thread(projects.load_project, project_name)
+        project = await asyncio.to_thread(generation_project, project_path, project, episode=request.episode)
         return await asyncio.to_thread(
             collect_reference_flat_violations,
             value["units"],
@@ -698,6 +700,7 @@ async def execute_reference_repair_plan(
 
         await check()
         project = await asyncio.to_thread(projects.load_project, project_name)
+        project = await asyncio.to_thread(generation_project, project_path, project, episode=request.episode)
         ids = await run_sync_transaction(
             projects.reserve_item_ids, project_name, request.episode, "video_units", len(content["units"])
         )

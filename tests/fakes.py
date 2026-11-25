@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import os
+import subprocess
 import threading
 from collections.abc import AsyncIterator, Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -31,6 +33,16 @@ _STREAM_EOF = object()
 #: ``lib.custom_provider.comfyui.artifacts.container_matches``），裸占位字节会被判容器不符。
 MP4_BYTES = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00mp4-bytes"
 PNG_BYTES = b"\x89PNG\r\n\x1a\npng-bytes"
+
+
+def create_test_directory_link(link: Path, target: Path) -> None:
+    """Use a Windows junction for directory alias tests without symlink privileges."""
+    if os.name == "nt":
+        subprocess.run(
+            ["cmd.exe", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True
+        )
+    else:
+        link.symlink_to(target, target_is_directory=True)
 
 
 @contextmanager

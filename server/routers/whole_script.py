@@ -35,8 +35,9 @@ class StartRequest(BaseModel):
 
 
 class ControlRequest(BaseModel):
-    action: Literal["stop", "continue"]
+    action: Literal["stop", "continue", "resolve_unknown"]
     input_revision: str | None = None
+    confirm_not_submitted: bool = False
 
 
 def _preview(projects, name, body):
@@ -129,7 +130,7 @@ async def start(name: str, body: StartRequest, request: Request, user: CurrentUs
 async def control(name: str, body: ControlRequest, request: Request, user: CurrentUser):
     try:
         return await request.app.state.production_service.script_batch.control(
-            name, body.action, user.id, body.input_revision
+            name, body.action, user.id, body.input_revision, body.confirm_not_submitted
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

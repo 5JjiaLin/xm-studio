@@ -57,19 +57,20 @@ def test_store_db_explicit_returns_store(monkeypatch, tmp_path):
 
 
 def test_store_uses_session_factory_seam(monkeypatch, tmp_path):
-    """SessionManager 的 _session_factory / _user_id 经装配器 provider 现取生效于
-    build_session_store（store 首次构建时按当时属性值取，与析出前时点一致）。"""
+    """Store construction takes an explicit owner and the injected DB factory."""
     monkeypatch.delenv("ARCREEL_SDK_SESSION_STORE", raising=False)
     sm = _build_sm(tmp_path)
 
     sentinel = object()
     sm._session_factory = sentinel
-    sm._user_id = "test-user"
-
-    store = sm._build_session_store()
+    store = sm._build_session_store(user_id="test-user")
     assert isinstance(store, DbSessionStore)
     # Test the user_id seam took effect
     assert store._user_id == "test-user"
+    assert store._session_factory is sentinel
+    assert sm._build_session_store(user_id="test-user") is store
+    assert sm._build_session_store(user_id="other-user") is not store
+    assert sm._build_session_store()._user_id == "default"
 
 
 @pytest.mark.asyncio

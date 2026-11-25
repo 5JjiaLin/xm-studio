@@ -20,7 +20,7 @@ from lib.project.project_manager import ProjectManager, get_project_manager
 from lib.script.source_loader import SourceLoader
 from server.agent_toolset.remote import remote_tools
 from server.agent_toolset.toolset import AGENT_TOOLSET
-from server.auth import API_KEY_PREFIX
+from server.auth import API_KEY_PREFIX, employee_auth_enabled
 from server.auth import verify_api_key as default_verify_api_key
 from server.tool_runtime import Services
 
@@ -43,6 +43,15 @@ class ArcApiKeyVerifier(TokenVerifier):
             return None
         payload = await self._verify_api_key(token)
         if payload is None:
+            return None
+        if employee_auth_enabled():
+            if (
+                not isinstance(payload.get("uid"), str) or type(payload.get("sv")) is not int
+                or type(payload.get("api_key_id")) is not int or not isinstance(payload.get("project_id"), str)
+                or payload.get("project_permission") not in {"read", "write"}
+            ):
+                return None
+        elif "uid" in payload:
             return None
         return AccessToken(token=token, client_id=payload["sub"], scopes=["arcreel"])
 

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import base64
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from instructor import Mode
-from openai import BadRequestError
+from openai import APIConnectionError, BadRequestError
 from openai.types.completion_usage import CompletionUsage, PromptTokensDetails
 from pydantic import BaseModel
 
@@ -21,6 +21,7 @@ from lib.backends.text_backends.base import (
     TextGenerationRequest,
 )
 from tests.fakes import (
+    bounded_poll_clock,
     captured_openai_clients,
     instructor_api_call_exhausted,
     patched_instructor_from_openai,
@@ -54,7 +55,7 @@ def _make_instructor_client() -> AsyncMock:
 
 
 class TestOpenAITextBackend:
-    def test_name_and_model(self):
+    async def test_name_and_model(self):
         with captured_openai_clients() as created:
             from lib.backends.text_backends.openai import OpenAITextBackend
 
@@ -63,6 +64,9 @@ class TestOpenAITextBackend:
             assert backend.model == "gpt-5.4-mini"
 
         # 未给 base_url 时回填官方端点；SDK 内置重试关闭，由 generate() 统一管理重试
+        http_client = created[0].pop("http_client")
+        assert isinstance(http_client, httpx.AsyncClient)
+        await http_client.aclose()
         assert created == [
             {
                 "api_key": "test-key",
@@ -716,6 +720,36 @@ class TestInstructorFallback:
         assert _is_schema_error(_make_bad_request_error()) is True
         assert _is_schema_error(ValueError("other")) is False
         assert _is_schema_error(RuntimeError("test")) is False
+
+    @pytest.mark.parametrize(("phase", "attempts"), [("connect", 4), ("read", 1), ("unknown", 1)])
+    async def test_fallback_connection_error_does_not_replay_native_call(self, phase, attempts):
+        """只重试确认未受理的连接失败，且不重放已成功的原生调用。"""
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=_make_mock_response("非 JSON 散文"))
+        if phase == "unknown":
+            error = ConnectionError("503 service unavailable")
+        else:
+            error = APIConnectionError(request=httpx.Request("POST", "https://example.com/v1/chat/completions"))
+            error.__cause__ = (httpx.ConnectError if phase == "connect" else httpx.ReadError)("connection failed")
+
+        with (
+            captured_openai_clients(mock_client),
+            patch(
+                "lib.backends.text_backends.instructor_support.instructor_fallback_async",
+                new=AsyncMock(side_effect=error),
+            ) as mock_instructor,
+            bounded_poll_clock(),
+        ):
+            from lib.backends.text_backends.openai import OpenAITextBackend
+
+            backend = OpenAITextBackend(api_key="test-key")
+            request = TextGenerationRequest(prompt="Extract info", response_schema=_PersonSchema)
+            with pytest.raises(type(error)):
+                await backend.generate(request)
+
+        # 原生 200 调用只发生一次；无法确定是否受理的降级请求不重放。
+        mock_client.chat.completions.create.assert_awaited_once()
+        assert mock_instructor.await_count == attempts
 
 
 class TestMaxOutputTokens:

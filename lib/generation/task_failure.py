@@ -134,6 +134,8 @@ FAILURE_CODE_KEYS: dict[str, str] = {
     # 上游确定性 4xx 拒绝。params 里的 provider_reason 是脱敏截断后的上游原文，刻意不进
     # 译文模板：它不该被翻译，读侧按独立字段原样展示。
     "provider_rejected": "task_fail_provider_rejected",
+    "text_generation_timeout": "task_fail_text_generation_timeout",
+    "draft_quarantined": "task_fail_draft_quarantined",
     "dispatch_provider_requeue_failed": "task_fail_dispatch_provider_requeue_failed",
     # 项目在任务执行期间被删除：任务放弃落盘，见 lib.project.task_project_claim。
     "project_deleted_during_task": "task_fail_project_deleted_during_task",
