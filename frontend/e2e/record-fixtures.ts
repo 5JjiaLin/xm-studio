@@ -60,7 +60,6 @@ const RECORDINGS: Recording[] = [
   { file: "project-demo-script-review", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/episodes/1/script-review` },
   { file: "project-demo-episode-drafts", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/episodes/1/drafts` },
   { file: "project-demo-production-asset-prompt", method: "POST", path: `/api/v1/projects/${DEMO_PROJECT}/production/asset-prompt`, json: { kind: "character", name: "阿明", description: "青年" } },
-  { file: "project-demo-production-edit", method: "GET", path: `/api/v1/projects/${DEMO_PROJECT}/episodes/1/production/edit`, status: 409 },
   // 工作区与集页的启动请求（项目事件流是 SSE，不录制，场景里按需替换）。
   { file: "tasks", method: "GET", path: "/api/v1/tasks?page_size=200" },
   { file: "project-demo-tasks", method: "GET", path: `/api/v1/tasks?page_size=200&project_name=${DEMO_PROJECT}` },
@@ -344,9 +343,6 @@ journal.parent.mkdir(exist_ok=True)
 atomic_write_json(journal, {"episode": 1, "status": "completed", "timeline_id": timeline.id})
 `], { cwd: REPO_ROOT, env, encoding: "utf8" });
     if (seed.status !== 0) throw new Error(seed.stderr);
-    const editPath = `/api/v1/projects/${DEMO_PROJECT}/episodes/1/production/edit`;
-    const edit = await request(baseUrl, token, { method: "GET", path: editPath });
-    writeFileSync(join(RECORDED_DIR, "project-demo-production-edit.json"), JSON.stringify({ method: "GET", path: editPath, status: edit.status, body: normalize(edit.body, dataDir) }, null, 2) + "\n");
     const promptRecording: Recording = { file: "project-demo-reference-prompt", method: "POST", path: `/api/v1/projects/${DEMO_PROJECT}/reference-videos/episodes/1/units/E1U1/prompt-preview`, json: { prompt: "镜头" } };
     const prompt = await request(baseUrl, token, promptRecording);
     writeFileSync(join(RECORDED_DIR, `${promptRecording.file}.json`), JSON.stringify({ method: promptRecording.method, path: promptRecording.path, status: prompt.status, body: normalize(prompt.body, dataDir) }, null, 2) + "\n");

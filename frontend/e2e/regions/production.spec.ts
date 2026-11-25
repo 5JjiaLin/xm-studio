@@ -1277,77 +1277,6 @@ test("starting breakdown with a saved source submits its displayed revision", as
   expect((await submitted).postDataJSON()).toEqual({ expected_source_revision: revision });
 });
 
-test("manual clip and caption edits persist and export locally", async ({ page, api }) => {
-  const recordedEdit = recorded<import("../../src/types/production.js").ProductionEdit>("project-demo-production-edit.json");
-  let edit = { ...recordedEdit, media: { E1U1: { version: 1, duration_us: 2000000 }, E1U2: { version: 1, duration_us: 2000000 } }, subtitle_drafts: {}, issues: [] };
-  let savedOperations: Record<string, unknown>[] = [];
-  const posts: string[] = [];
-  api.override({ ...productionBase,
-    "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "completed", stage: "render", timeline_id: edit.timeline_id, output: { status: "current", artifact_path: "renders/final.mp4", version: 2 } } },
-    "POST /api/v1/projects/demo/episodes/1/production/render": { status: 200, body: { episode: 1, status: "active", stage: "render" } },
-  });
-  await page.route("**/api/v1/projects/demo/episodes/1/production/edit", async (route) => {
-    if (route.request().method() === "PUT") {
-      const body = route.request().postDataJSON() as { base_revision: number; operations: Record<string, unknown>[] };
-      expect(body.base_revision).toBe(edit.revision);
-      savedOperations = body.operations;
-      const clips = structuredClone(edit.clips);
-      for (const op of body.operations) {
-        const clip = clips.find((c) => c.id === op.clip)!;
-        if (op.op === "set_subtitles") clip.subtitles = op.subtitles as typeof clip.subtitles;
-        if (op.op === "set_volume") clip.source_volume = Number(op.volume);
-        if (op.op === "set_trim") { const trim = op.trim as { source_in: number; source_out: number }; clip.trim = { in_us: trim.source_in * 1e6, out_us: trim.source_out * 1e6, basis_version: 1 }; }
-        if (op.op === "set_included") clip.included = Boolean(op.included);
-        if (op.op === "move") { clips.splice(clips.indexOf(clip), 1); clips.splice(op.after ? clips.findIndex((c) => c.id === op.after) + 1 : 0, 0, clip); }
-      }
-      edit = { ...edit, revision: edit.revision + 1, clips };
-    }
-    await route.fulfill({ json: edit });
-  });
-  // The saved timeline preview uses source audio even if the project once used TTS.
-  await page.route(`**/api/v1/projects/demo/edit-timelines/${edit.timeline_id}`, (route) => route.fulfill({ json: {
-    timeline: { id: edit.timeline_id, name: "人工初剪", episode: 1 }, revision: edit.revision, latest_revision: edit.revision,
-    duration: edit.duration, bgm: [], issues: [], clips: edit.clips.filter((c) => c.included !== false).map((c, index) => ({
-      id: c.id, unit_id: c.unit_id, status: "ready", start: index * 2, duration: 2, source_duration: 2,
-      video_version: 1, trim: null, source_volume: c.source_volume, hold: 0, carries_narration: false,
-      narration: null, reason: null, transition_to_next: null,
-    })),
-  } }));
-  await page.route(`**/api/v1/projects/demo/edit-timelines/${edit.timeline_id}/preview-media?narration=without_narration`, (route) => route.fulfill({ json: {
-    timeline_id: edit.timeline_id, revision: edit.revision, narration: "without_narration", bgm: [],
-    units: edit.clips.map((c) => ({ unit_id: c.unit_id, provider_audio: true, narration_audio: null, subtitles_follow_narration: false, subtitles: [] })),
-  } }));
-  page.on("request", (request) => { if (request.method() === "POST" && !request.url().endsWith("/prompt-preview")) posts.push(new URL(request.url()).pathname); });
-  await page.goto("/app/make/demo?step=output&episode=1");
-  await page.getByRole("button", { name: "编辑成片", exact: true }).click();
-  await expect(page.getByText("配乐（可选）", { exact: true })).toBeVisible();
-  await expect(page.getByText("请先在模型配置中配置 MiniMax API Key。", { exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "增加字幕", exact: true }).click();
-  await page.getByRole("textbox", { name: "字幕 1", exact: true }).fill("人工修改的字幕");
-  await page.getByRole("spinbutton", { name: "开始秒数 1", exact: true }).fill("0.2");
-  await page.getByRole("spinbutton", { name: "结束秒数 1", exact: true }).fill("0.8");
-  await page.getByRole("combobox", { name: "位置 1", exact: true }).selectOption("top");
-  await page.getByRole("button", { name: "静音", exact: true }).click();
-  await page.getByRole("spinbutton", { name: "出点（源视频秒）", exact: true }).fill("1");
-  await page.getByRole("button", { name: "下移", exact: true }).first().click();
-  await page.getByRole("button", { name: "保存剪辑草稿", exact: true }).click();
-  await expect.poll(() => edit.revision).toBe(recordedEdit.revision + 1);
-  expect(savedOperations.map((op) => op.op)).toEqual(expect.arrayContaining(["move", "set_trim", "set_volume", "set_subtitles"]));
-  await page.reload();
-  await page.getByRole("button", { name: "编辑成片", exact: true }).click();
-  await page.getByRole("button", { name: "E1U1", exact: true }).click();
-  await expect(page.getByRole("textbox", { name: "字幕 1", exact: true })).toHaveValue("人工修改的字幕");
-  await expect(page.getByRole("spinbutton", { name: "出点（源视频秒）", exact: true })).toHaveValue("1");
-  await expectReachableLayout(page);
-  await waitForEntrance(page.getByRole("main"));
-  await expectAccessible(page);
-  await page.getByRole("textbox", { name: "字幕 1", exact: true }).fill("直接保存并导出的字幕");
-  await page.getByRole("button", { name: "保存并重新导出", exact: true }).click();
-  await expect.poll(() => posts.includes("/api/v1/projects/demo/episodes/1/production/render")).toBe(true);
-  expect(posts.filter((path) => /\/production\/(videos|assets|music)$/.test(path))).toEqual([]);
-});
-
-
 test("breakdown adds a fully prompted asset and removes visual references without losing dialogue", async ({ page, api }) => {
   let content = { units: [{ ...unit, text: "@[阿明]走入画面。@[阿明]：{你好。}", source_text: "阿明：你好。" }], new_assets: [{ type: "character", name: "阿明", description: "青年", decision: "register", reason: "主角", aliases: [], target: "", asset_name: "", generation_prompt: "" }] };
   api.override({ ...productionBase, "GET /api/v1/projects/demo": { status: 200, body: { ...projectFixture, project: { ...projectFixture.project, generation_mode: "reference_video", characters: {}, scenes: {}, props: {} } } } });
@@ -1885,13 +1814,11 @@ test("late video submission stays on the destination after leaving the episode",
 
 
 test("Jianying handoff is explicit, resumes after exit and keeps MP4 and new versions independent", async ({ page, api }) => {
-  const edit = recorded<import("../../src/types/production.js").ProductionEdit>("project-demo-production-edit.json");
   let delivery: import("../../src/types/jianying-delivery.js").JianyingDelivery | null = null;
   const submitted: Record<string, unknown>[] = [];
   let fail = false;
   api.override({ ...productionBase,
-    "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "completed", stage: "render", timeline_id: edit.timeline_id, output: { status: "current", artifact_path: "renders/final.mp4", version: 2 } } },
-    "GET /api/v1/projects/demo/episodes/1/production/edit": { status: 200, body: edit },
+    "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "completed", stage: "render", timeline_id: "tl-recorded", output: { status: "current", artifact_path: "renders/final.mp4", version: 2 } } },
   });
   await page.route("**/api/v1/projects/demo/episodes/1/production/jianying", async (route) => {
     if (route.request().method() === "POST") {
@@ -1905,6 +1832,9 @@ test("Jianying handoff is explicit, resumes after exit and keeps MP4 and new ver
   await page.goto("/app/make/demo?step=output&episode=1");
   const card = page.getByRole("region", { name: "剪映草稿", exact: true });
   await expect(card.getByRole("button", { name: "在剪映建立草稿", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "编辑成片", exact: true })).toHaveCount(0);
+  await expect(page.getByText("配乐（可选）", { exact: true })).toHaveCount(0);
+  await expect(page.locator("video")).toHaveAttribute("src", /renders\/final\.mp4/);
   await card.getByRole("button", { name: "刷新状态", exact: true }).click();
   expect(submitted).toHaveLength(0);
   await card.getByRole("button", { name: "在剪映建立草稿", exact: true }).click();

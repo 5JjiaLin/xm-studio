@@ -12,7 +12,6 @@ import { EpisodeCost } from "./management/ProductionCosts";
 import { WorkPicker } from "./management/WorkPicker";
 import { ScriptInput } from "./script/ScriptInput";
 import { JianyingDeliveryCard } from "./output/JianyingDeliveryCard";
-import { ProductionEditor } from "./output/ProductionEditor";
 import { ProductionAssetCard } from "./assets/ProductionAssetCard";
 import { ProductionDerivativeCard } from "./assets/ProductionDerivativeCard";
 import { ProductionVideoCard } from "./videos/ProductionVideoCard";
@@ -215,14 +214,13 @@ export function ProductionPage() {
       if (scope?.signal.aborted) reportBackground(errMsg(e), true); else setActionError(errMsg(e));
     } finally { setStarting(false); }
   };
-  const rebuild = async (afterEditSave = false) => {
+  const rebuild = async () => {
     if (!projectName || !episode || active) return;
-    // The editor calls this only after its save succeeds; its leave-guard effect may still hold the previous dirty value.
-    if (!afterEditSave && hasUnsavedChanges()) { setActionError(t("common:unsaved_changes")); return; }
+    if (hasUnsavedChanges()) { setActionError(t("common:unsaved_changes")); return; }
     const scope = actionScope.current;
     setStarting(true); setActionError(null);
     try {
-      if (step === "videos" && !afterEditSave) await enqueueProductionFinish(projectName, episode);
+      if (step === "videos") await enqueueProductionFinish(projectName, episode);
       else await enqueueProductionRender(projectName, episode);
       if (scope?.signal.aborted) { reportBackground(t("production_submitted_background")); return; }
       refresh();
@@ -349,7 +347,6 @@ export function ProductionPage() {
             <p role="status" className="flex items-center gap-2 text-sm">{production?.stage === "render" && production.status === "active" && <Loader2 aria-hidden className="size-4 animate-spin text-primary" />}{t(production?.stage === "render" && production.status === "active" ? "production_videos_rendering" : "production_videos_hint")}</p>
           </section><div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-4">{episode && units.map((u, i) => <ProductionVideoCard key={`${projectName}/${episode}/${u.unit_id}`} referenceRevision={JSON.stringify([videoReferenceRevision, i === 0, handoffRevisions[i - 1], handoffRevisions[i + 1]])} project={projectName} episode={episode} unit={u} index={i} production={production} progress={videoProgress.get(u.unit_id)!} busy={operationBusy} generationSyncing={refreshing} onGenerate={() => startVideos([u.unit_id])} onChanged={refresh} onTimelineValidation={onTimelineValidation} />)}</div></>}</>}
           {step === "output" && (previousOutputUrl ? <><video controls src={previousOutputUrl} className="max-h-[70vh] w-full"><track kind="captions" /></video>{!outputCurrent && <p className="text-sm text-muted-foreground">{t("production_output_changed")}</p>}{!outputCurrent && !active && canRebuild && <Button variant="outline" className="self-start" onClick={() => void rebuild()}>{t("production_rebuild_output")}</Button>}</> : <div className="flex flex-col gap-3"><p className="text-sm text-muted-foreground">{t(output && output.status !== "missing" ? "production_output_changed" : "production_wait_output")}</p>{!active && canRebuild && <Button variant="outline" className="self-start" onClick={() => void rebuild()}>{t("production_rebuild_output")}</Button>}</div>)}
-          {step === "output" && production?.timeline_id && <ProductionEditor project={projectName} episode={episode} units={units} busy={active} onChanged={refresh} onRender={() => rebuild(true)} />}
           {step === "output" && production?.timeline_id && <JianyingDeliveryCard key={`${projectName}/${episode}`} project={projectName} episode={episode} busy={active} revision={JSON.stringify(production)} />}
           {step === "output" && <EpisodeCost project={projectName} episode={episode} revision={JSON.stringify(production)} />}
         </>}
