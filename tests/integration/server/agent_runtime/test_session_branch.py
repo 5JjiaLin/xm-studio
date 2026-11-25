@@ -14,6 +14,7 @@ from claude_agent_sdk import SessionKey, SessionListSubkeysKey, SessionStoreEntr
 
 from lib.agent.agent_session_store import make_project_key
 from lib.agent.agent_session_store.store import DbSessionStore
+from lib.db.models.user import User
 from server.agent_runtime.event_log import EventLogService, EventLogStore
 from server.agent_runtime.sdk_transcript_adapter import SdkTranscriptAdapter
 from server.agent_runtime.session_branch import BranchedSession, SessionBranchError, SessionBranchService
@@ -23,6 +24,14 @@ from tests.factories import make_sdk_transcript_entry
 PROJECT_NAME = "demo"
 FIRST_USER_ENTRY = "user-first"
 SECOND_USER_ENTRY = "user-second"
+
+
+async def _project_key(path):
+    return await asyncio.to_thread(make_project_key, path)
+
+
+async def _project_key(path):
+    return await asyncio.to_thread(make_project_key, path)
 
 
 @pytest.fixture
@@ -39,12 +48,16 @@ async def branching(session_factory, tmp_path):
         resolve_project_cwd=lambda _name: tmp_path,
     )
 
+    async with session_factory() as db:
+        db.add(User(id="employee-1", username="employee-1", role="user"))
+        await db.commit()
+
     session_id = str(uuid4())
-    await meta_store.create(PROJECT_NAME, session_id)
+    await meta_store.create(PROJECT_NAME, session_id, user_id="employee-1")
 
     u1, a1, u2, a2 = (f"m{i}-{uuid4().hex[:8]}" for i in range(4))
     await store.append(
-        {"project_key": make_project_key(tmp_path), "session_id": session_id},
+        {"project_key": await _project_key(tmp_path), "session_id": session_id},
         [
             make_sdk_transcript_entry(u1, None, "user", session_id, "你好"),
             make_sdk_transcript_entry(a1, u1, "assistant", session_id, "在"),
@@ -73,7 +86,7 @@ async def test_branch_copies_the_prefix_under_the_new_session(branching):
 
     branched = await service.branch(session_id, SECOND_USER_ENTRY)
 
-    copied = await store.load({"project_key": make_project_key(tmp_path), "session_id": branched.session_id})
+    copied = await store.load({"project_key": await _project_key(tmp_path), "session_id": branched.session_id})
     assert copied is not None
     assert [e["type"] for e in copied] == ["user", "assistant"]
 
@@ -105,7 +118,7 @@ async def test_editing_the_first_message_yields_a_fresh_session(branching):
     branched = await service.branch(session_id, FIRST_USER_ENTRY)
 
     assert branched.resumable is False
-    assert await store.load({"project_key": make_project_key(tmp_path), "session_id": branched.session_id}) is None
+    assert await store.load({"project_key": await _project_key(tmp_path), "session_id": branched.session_id}) is None
     origin = await meta_store.get(session_id)
     assert origin is not None
     assert origin.superseded_by == branched.session_id
@@ -141,7 +154,7 @@ async def test_unmapped_anchor_is_rejected(branching):
 async def test_anchor_pointing_at_a_non_user_entry_is_rejected(branching):
     """身份映射表若因脏数据指向 Agent 条目，仍按「锚点非用户消息」拒绝。"""
     service, _, store, log_store, session_id, tmp_path = branching
-    main = await store.load({"project_key": make_project_key(tmp_path), "session_id": session_id})
+    main = await store.load({"project_key": await _project_key(tmp_path), "session_id": session_id})
     assert main is not None
     assistant_uuid = next(e["uuid"] for e in main if e["type"] == "assistant")
     await log_store.record_user_message_link(session_id, "user-mislinked", assistant_uuid)
@@ -173,7 +186,7 @@ async def test_rejection_leaves_no_new_session_behind(branching):
 async def test_second_branch_of_the_same_origin_is_refused(branching):
     """已被取代的会话再分叉即冲突：首个指针不被覆盖，冲突分支的元数据与 transcript 都不留。"""
     service, meta_store, store, _, session_id, tmp_path = branching
-    project_key = make_project_key(tmp_path)
+    project_key = await _project_key(tmp_path)
     first = await service.branch(session_id, SECOND_USER_ENTRY)
     sessions_before = {row["session_id"] for row in await store.list_sessions(project_key)}
 
@@ -207,7 +220,7 @@ async def test_deleting_a_middle_branch_keeps_the_origin_pointing_at_the_live_en
     service, meta_store, store, log_store, session_id, tmp_path = branching
     middle = await service.branch(session_id, SECOND_USER_ENTRY)
     # 分支会话被续写后，新消息才有身份映射、才能再被分叉——链由此形成。
-    project_key = make_project_key(tmp_path)
+    project_key = await _project_key(tmp_path)
     copied = await store.load({"project_key": project_key, "session_id": middle.session_id})
     assert copied is not None
     continued = f"m-cont-{uuid4().hex[:8]}"
@@ -281,7 +294,7 @@ async def test_failure_midway_through_copying_leaves_no_trace_of_the_new_session
     store = DbSessionStore(session_factory)
     meta_store = SessionMetaStore(session_factory=session_factory)
     log_store = EventLogStore(session_factory=session_factory)
-    project_key = make_project_key(tmp_path)
+    project_key = await _project_key(tmp_path)
     session_id = await _seed_session_with_a_subagent(store, meta_store, log_store, project_key, tmp_path)
     sessions_before = {row["session_id"] for row in await store.list_sessions(project_key)}
 
@@ -304,7 +317,7 @@ async def test_pointer_is_withdrawn_when_the_caller_is_cancelled_after_it_commit
     store = DbSessionStore(session_factory)
     meta_store = _MetaStoreLosingTheCallerAfterCommit(session_factory=session_factory)
     log_store = EventLogStore(session_factory=session_factory)
-    project_key = make_project_key(tmp_path)
+    project_key = await _project_key(tmp_path)
     session_id = await _seed_session_with_a_subagent(store, meta_store, log_store, project_key, tmp_path)
     sessions_before = {row["session_id"] for row in await store.list_sessions(project_key)}
 
@@ -363,7 +376,7 @@ async def _seed_three_rounds(store, meta_store, project_key):
 async def test_a_prefix_message_without_a_mapping_row_can_still_be_rewritten(branching):
     """AC：分支会话的前缀历史消息没有映射行，靠恒等性仍能作锚点再分叉。"""
     service, meta_store, store, log_store, _, tmp_path = branching
-    project_key = make_project_key(tmp_path)
+    project_key = await _project_key(tmp_path)
     origin, uuids = await _seed_three_rounds(store, meta_store, project_key)
     await log_store.record_user_message_link(origin, "user-third", uuids[4])
 
@@ -380,7 +393,7 @@ async def test_a_prefix_message_without_a_mapping_row_can_still_be_rewritten(bra
 async def test_rewriting_recurses_through_branches_of_branches(branching):
     """AC：分支的分支同样可再改写——uuid 随前缀复制原样保留，恒等性递归成立。"""
     service, meta_store, store, log_store, _, tmp_path = branching
-    project_key = make_project_key(tmp_path)
+    project_key = await _project_key(tmp_path)
     origin, uuids = await _seed_three_rounds(store, meta_store, project_key)
     await log_store.record_user_message_link(origin, "user-third", uuids[4])
 
@@ -396,7 +409,7 @@ async def test_rewriting_recurses_through_branches_of_branches(branching):
 async def test_a_continued_branch_message_is_anchored_through_the_mapping(branching):
     """续写进分支会话的新消息走映射表这一段，与前缀历史消息两类锚点并存。"""
     service, _, store, log_store, session_id, tmp_path = branching
-    project_key = make_project_key(tmp_path)
+    project_key = await _project_key(tmp_path)
     branched = await service.branch(session_id, SECOND_USER_ENTRY)
     copied = await store.load({"project_key": project_key, "session_id": branched.session_id})
     assert copied is not None
@@ -415,7 +428,7 @@ async def test_a_continued_branch_message_is_anchored_through_the_mapping(branch
 async def test_branch_records_where_it_forked_from(branching):
     """分叉血统在 branch 时刻写入：父会话 + transcript 域的锚点 uuid。"""
     service, meta_store, store, _, session_id, tmp_path = branching
-    main = await store.load({"project_key": make_project_key(tmp_path), "session_id": session_id})
+    main = await store.load({"project_key": await _project_key(tmp_path), "session_id": session_id})
     assert main is not None
     anchor_uuid = [e["uuid"] for e in main if e["type"] == "user"][1]
 
@@ -423,6 +436,7 @@ async def test_branch_records_where_it_forked_from(branching):
 
     meta = await meta_store.get(branched.session_id)
     assert meta is not None
+    assert meta.user_id == "employee-1"
     assert meta.fork_parent_session_id == session_id
     assert meta.fork_anchor_uuid == anchor_uuid
     origin = await meta_store.get(session_id)
@@ -433,7 +447,7 @@ async def test_branch_records_where_it_forked_from(branching):
 async def test_a_tool_result_carrying_entry_is_refused_as_an_anchor(branching):
     """transcript 把工具回执也写成 type:"user"；混排 tool_result 的条目作锚会悬空前一轮 tool_use。"""
     service, meta_store, store, _, _, tmp_path = branching
-    project_key = make_project_key(tmp_path)
+    project_key = await _project_key(tmp_path)
     session_id = str(uuid4())
     await meta_store.create(PROJECT_NAME, session_id)
     u1, a1, mixed = (f"m{i}-{uuid4().hex[:8]}" for i in range(3))
@@ -466,7 +480,7 @@ async def test_a_tool_result_carrying_entry_is_refused_as_an_anchor(branching):
 async def test_an_identity_anchor_that_transcript_never_saw_fails_loud(branching):
     """活跃路径条目丢了映射行：恒等回退放行，由前缀切片拒绝，不静默切错位置。"""
     service, meta_store, store, log_store, _, tmp_path = branching
-    project_key = make_project_key(tmp_path)
+    project_key = await _project_key(tmp_path)
     session_id = str(uuid4())
     await meta_store.create(PROJECT_NAME, session_id)
     u1, a1 = (f"m{i}-{uuid4().hex[:8]}" for i in range(2))

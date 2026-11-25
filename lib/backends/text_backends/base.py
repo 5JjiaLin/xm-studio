@@ -91,6 +91,18 @@ class TextOutputTruncatedError(NonRetryableError):
         )
 
 
+class TextGenerationTimeoutError(NonRetryableError):
+    """The caller's total wait budget expired; the provider may still have accepted the request."""
+
+    code = "text_generation_timeout"
+
+    def __init__(self, timeout_seconds: float):
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            f"文本生成等待超过 {timeout_seconds:g} 秒。供应商可能已受理请求；请先核对供应商记录，勿直接重试。"
+        )
+
+
 class StructuredOutputExhaustedError(NonRetryableError):
     """结构化输出降级链已走完，模型仍未产出满足 schema 的内容。
 

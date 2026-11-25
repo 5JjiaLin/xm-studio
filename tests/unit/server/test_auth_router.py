@@ -5,12 +5,15 @@
 """
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import lib.db
+import lib.identity.accounts as accounts
 import server.auth as auth_module
 from server.routers import auth as auth_router
 from tests.auth_deps import AUTH_DEPENDENCIES
@@ -65,6 +68,36 @@ class TestLoginRoute:
         )
         assert resp.status_code == 401
 
+    def test_employee_login_issues_user_bound_token(self, auth_router_client, monkeypatch):
+        class SessionContext:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def begin(self):
+                return self
+
+        async def authenticate(_session, *, username, password):
+            assert (username, password) == ("alice", "long-password")
+            return SimpleNamespace(id="employee-1", username="alice", session_version=3)
+
+        monkeypatch.setenv("EMPLOYEE_AUTH_ENABLED", "true")
+        monkeypatch.setenv("AUTH_ENABLED", "false")
+        monkeypatch.setattr(lib.db, "async_session_factory", SessionContext)
+        monkeypatch.setattr(accounts, "authenticate_employee", authenticate)
+
+        response = auth_router_client.post(
+            "/api/v1/auth/token",
+            data={"username": "alice", "password": "long-password"},
+        )
+
+        assert response.status_code == 200
+        payload = auth_module.verify_token(response.json()["access_token"])
+        assert payload is not None
+        assert (payload["sub"], payload["uid"], payload["sv"]) == ("alice", "employee-1", 3)
+
 
 class TestVerifyRoute:
     def test_verify_valid_token(self, auth_router_client):
@@ -90,9 +123,33 @@ class TestVerifyRoute:
         assert resp.status_code == 401
 
     def test_verify_invalid_token(self, auth_router_client):
-        """无效 token 返回 401"""
-        resp = auth_router_client.get(
-            "/api/v1/auth/verify",
-            headers={"Authorization": "Bearer invalid-token"},
+        response = auth_router_client.get("/api/v1/auth/verify", headers={"Authorization": "Bearer invalid-token"})
+        assert response.status_code == 401
+
+
+class TestEmployeeManagementAuthorization:
+    @pytest.mark.parametrize("auth_enabled", ["true", "false"])
+    @pytest.mark.parametrize(
+        ("method", "path", "body"),
+        [
+            ("GET", "/api/v1/users", None),
+            ("POST", "/api/v1/users", {"username": "newuser", "password": "long-test-password"}),
+            ("PATCH", "/api/v1/users/employee-id", {"role": "viewer"}),
+        ],
+    )
+    def test_employee_management_is_disabled_with_legacy_or_anonymous_auth(
+        self, auth_router_client, monkeypatch, auth_enabled, method, path, body
+    ):
+        monkeypatch.setenv("AUTH_ENABLED", auth_enabled)
+        monkeypatch.setenv("EMPLOYEE_AUTH_ENABLED", "false")
+        token = auth_module.create_token("testuser")
+
+        response = auth_router_client.request(
+            method,
+            path,
+            json=body,
+            headers={"Authorization": f"Bearer {token}"},
         )
-        assert resp.status_code == 401
+
+        assert response.status_code == 403
+        assert response.json()["detail"] == "员工账号管理尚未启用"

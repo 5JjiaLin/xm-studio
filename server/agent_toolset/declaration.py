@@ -20,6 +20,7 @@ from pydantic import BaseModel, ValidationError
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
 from pydantic_core import core_schema
 
+from lib.identity.projects import ProjectAction
 from server.tool_runtime import (
     CallerContext,
     ProjectScope,
@@ -125,6 +126,8 @@ class ToolDeclaration[RequestT: BaseModel, ResultT]:
     projection: Callable[[ResultT], dict[str, Any]] | None = None
     is_error: Callable[[ResultT], bool] | None = None
     images: Callable[[ResultT], Sequence[ToolImage]] | None = None
+    # Unknown/new tools require write access unless explicitly declared read-only.
+    access: ProjectAction = "write"
 
     @property
     def input_schema(self) -> dict[str, Any]:

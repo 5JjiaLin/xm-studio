@@ -35,7 +35,14 @@ from lib.infra.data_root_layout import DataRootLayout
 from lib.prompts.prompt_templates.builtin import builtin_templates
 from server.agent_runtime.agent_access_policy import AgentAccessPolicy
 from server.agent_runtime.arcreel_mcp import build_arcreel_mcp_server
-from server.auth import EMBEDDED_AGENT_SUB, create_token, is_auth_enabled
+from server.agent_runtime.employee_access import EmployeeAgentAccess
+from server.auth import (
+    EMBEDDED_AGENT_SUB,
+    create_employee_agent_token,
+    create_token,
+    employee_auth_enabled,
+    is_auth_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,10 +115,9 @@ class OptionsAssembler:
     ``max_turns_provider``（``refresh_config`` 会改写）。``resolve_project_cwd`` 由
     SessionManager 注入（项目名校验/作用域是会话管理侧职责）。
 
-    ``session_factory_provider`` / ``user_id_provider`` 同样用回调而非构造期快照：
-    store 在首次 ``build_session_store`` 时按当时取值建好并缓存，与析出前
-    ``_build_session_store`` 惰性读 SessionManager 属性的时点一致——避免用量记录
-    （实时读 ``_user_id``）与 transcript store 落到不同的 per-user 命名空间。
+    会话身份由 build 的显式 user_id 传入并在本连接内固定；provider 仅作为
+    共享模式和独立调用的默认值。Transcript store 按用户缓存，记忆提示与
+    文件 hook 使用同一次身份快照，不在异步执行期间读取共享可变用户字段。
     """
 
     def __init__(
@@ -137,9 +143,8 @@ class OptionsAssembler:
         self._provider_env_loader = provider_env_loader
         self._session_factory_provider = session_factory_provider or (lambda: None)
         self._user_id_provider = user_id_provider or (lambda: DEFAULT_USER_ID)
-        # session store 单例缓存：每个 assembler 一份，避免每次 build 都新建 store。
-        self._cached_session_store: DbSessionStore | None = None
-        self._session_store_resolved = False
+        # Each owner gets a separate immutable binding; reuse it across builds.
+        self._session_stores: dict[str, DbSessionStore | None] = {}
 
     async def build_provider_env_overrides(self) -> dict[str, str]:
         """DB 凭证注入入口。默认走模块级 ``load_provider_env_overrides``（现取 module
@@ -147,7 +152,9 @@ class OptionsAssembler:
         loader = self._provider_env_loader or load_provider_env_overrides
         return await loader()
 
-    async def _build_append_prompt(self, project_name: str, locale: str = DEFAULT_LOCALE) -> str:
+    async def _build_append_prompt(
+        self, project_name: str, locale: str = DEFAULT_LOCALE, *, user_id: str | None = None
+    ) -> str:
         """Build the append portion for SystemPromptPreset.
 
         Combines the locale language regulation, the session-invariant project
@@ -164,13 +171,13 @@ class OptionsAssembler:
         if project_context:
             parts.append(project_context)
 
-        user_memory = await self._build_user_memory_section()
+        user_memory = await self._build_user_memory_section(user_id=user_id)
         if user_memory:
             parts.append(user_memory)
 
         return "\n\n".join(parts)
 
-    async def _build_user_memory_section(self) -> str:
+    async def _build_user_memory_section(self, *, user_id: str | None = None) -> str:
         """用户记忆段：目录位置、两级分流规则、读写方式，外加截断后的索引。
 
         原生 auto memory 只知道项目记忆一个目录，用户记忆的存在与两级分流规则是
@@ -182,7 +189,7 @@ class OptionsAssembler:
         ``user_id`` 非法时整段省略，与 ``AgentAccessPolicy`` 的 fail-closed 同向——
         围栏没放行的目录，写入指引也不该给出去。
         """
-        user_id = self._user_id_provider()
+        user_id = user_id if user_id is not None else self._user_id_provider()
         if not is_valid_memory_user_id(user_id):
             logger.error("user_id 不是单个路径段，用户记忆段省略: %r", user_id)
             return ""
@@ -248,15 +255,16 @@ class OptionsAssembler:
         ]
         return "\n".join(parts)
 
-    def build_session_store(self) -> DbSessionStore | None:
+    def build_session_store(self, *, user_id: str | None = None) -> DbSessionStore | None:
         """Return a cached per-user DbSessionStore, or None when env disables it.
 
         Set ARCREEL_SDK_SESSION_STORE=off to roll back to SDK's filesystem path.
-        The result is cached on first call so every session shares one instance
-        instead of allocating a fresh store per ``build`` invocation.
+        Results are cached per owner so sessions of different employees never
+        inherit the first user's store binding.
         """
-        if self._cached_session_store is not None or self._session_store_resolved:
-            return self._cached_session_store
+        user_id = user_id if user_id is not None else self._user_id_provider()
+        if user_id in self._session_stores:
+            return self._session_stores[user_id]
 
         mode = session_store_mode()
         store: DbSessionStore | None
@@ -266,9 +274,8 @@ class OptionsAssembler:
             if not is_known_session_store_mode(mode):
                 logger.warning("Unknown ARCREEL_SDK_SESSION_STORE=%r; defaulting to db", mode)
             factory = self._session_factory_provider() or default_async_session_factory
-            store = DbSessionStore(factory, user_id=self._user_id_provider())
-        self._cached_session_store = store
-        self._session_store_resolved = True
+            store = DbSessionStore(factory, user_id=user_id)
+        self._session_stores[user_id] = store
         return store
 
     async def build(
@@ -279,6 +286,7 @@ class OptionsAssembler:
         locale: str = DEFAULT_LOCALE,
         stderr: Callable[[str], None] | None = None,
         session_id: str | None = None,
+        user_id: str | None = None,
     ) -> Any:
         """Build ClaudeAgentOptions for a session.
 
@@ -294,9 +302,16 @@ class OptionsAssembler:
         if resume_id is not None and session_id is not None:
             raise ValueError("resume_id and session_id are mutually exclusive")
 
+        user_id = user_id if user_id is not None else self._user_id_provider()
+        if not is_valid_memory_user_id(user_id):
+            raise ValueError("invalid session user ID")
         policy = self._access_policy_provider()
 
         project_cwd = await asyncio.to_thread(self._resolve_project_cwd, project_name)
+        employee_access = None
+        if employee_auth_enabled():
+            factory = self._session_factory_provider() or default_async_session_factory
+            employee_access = await EmployeeAgentAccess.bind(user_id, project_cwd, factory)
 
         # Build PreToolUse hooks — file access control MUST use hooks because
         # Read/Glob/Grep are matched by allow rules (step 4 in the SDK
@@ -305,8 +320,10 @@ class OptionsAssembler:
         hooks: dict[HookEvent, list[HookMatcher]] | None = None
         hook_callbacks: list[Any] = [
             self._subagent_tool_hook,
-            self._build_file_access_hook(project_cwd),
+            self._build_file_access_hook(project_cwd, user_id=user_id),
         ]
+        if employee_access is not None:
+            hook_callbacks.insert(0, employee_access.tool_hook)
         if can_use_tool is not None:
             # Official Python SDK guidance: keep stream open when using
             # can_use_tool.
@@ -341,6 +358,11 @@ class OptionsAssembler:
         }
 
         provider_env = await self.build_provider_env_overrides()
+        api_token = ""
+        if employee_access is not None:
+            api_token = create_employee_agent_token(await employee_access.authorize())
+        elif is_auth_enabled():
+            api_token = create_token(EMBEDDED_AGENT_SUB, expiry_seconds=_EMBEDDED_AGENT_TOKEN_EXPIRY_SECONDS)
         provider_env.update(
             {
                 "ARCREEL_EMBEDDED_AGENT": "1",
@@ -348,20 +370,17 @@ class OptionsAssembler:
                 # 与 SDK 判定 run 是否结束的依据相同；会话层据此决定能否断开 CLI。
                 "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1",
                 "ARCREEL_API_BASE": (os.environ.get("ARCREEL_API_BASE") or "http://127.0.0.1:1241/api/v1").rstrip("/"),
-                "ARCREEL_API_TOKEN": (
-                    create_token(EMBEDDED_AGENT_SUB, expiry_seconds=_EMBEDDED_AGENT_TOKEN_EXPIRY_SECONDS)
-                    if is_auth_enabled()
-                    else ""
-                ),
+                "ARCREEL_API_TOKEN": api_token,
             }
         )
-        user_id = self._user_id_provider()
 
         def _build_sandbox_and_mcp_server() -> tuple[dict[str, Any], McpSdkServerConfig]:
             # 两者都会扫盘/建目录（sandbox 敏感路径解析、MCP 服务的 ProjectManager），合并一次卸到线程。
             sandbox = policy.build_sandbox_settings(project_cwd)
             # 内置 ArcReel in-process MCP server — handler 跑在主进程，绕过 sandbox。
-            server = build_arcreel_mcp_server(project_name=project_name, data_root=self.data_root, user_id=user_id)
+            server = build_arcreel_mcp_server(
+                project_name=project_name, data_root=self.data_root, user_id=user_id, employee_access=employee_access
+            )
             return sandbox, server
 
         sandbox_typed, arcreel_server = await asyncio.to_thread(_build_sandbox_and_mcp_server)
@@ -369,6 +388,8 @@ class OptionsAssembler:
         # Windows 回退：sandbox 关闭时 Bash 系列被剥离出 allowed_tools，
         # 让 _can_use_tool 接管 prefix 白名单匹配。
         allowed_tools = policy.filter_allowed_tools(self._allowed_tools)
+        if employee_access is not None:
+            allowed_tools = [tool for tool in allowed_tools if tool not in policy.BASH_TOOLS]
         # 通配符让后续新增 tool 不必同步改 allowed_tools。
         allowed_tools.append("mcp__arcreel__*")
 
@@ -387,7 +408,7 @@ class OptionsAssembler:
             system_prompt=SystemPromptPreset(
                 type="preset",
                 preset="claude_code",
-                append=await self._build_append_prompt(project_name, locale=locale),
+                append=await self._build_append_prompt(project_name, locale=locale, user_id=user_id),
                 # 会话首轮记录系统提示，之后每轮（含 resume）原样沿用：记忆等动态段的变化
                 # 不再打断 prompt cache。代价是 append 在会话内固定，resume 不会按新 locale 重建。
                 snapshot=True,
@@ -402,7 +423,7 @@ class OptionsAssembler:
             can_use_tool=can_use_tool,
             hooks=hooks,
             mcp_servers={"arcreel": arcreel_server},
-            session_store=self.build_session_store(),
+            session_store=self.build_session_store(user_id=user_id),
             session_store_flush=session_store_flush_mode(),
             sandbox=sandbox_typed,  # type: ignore[arg-type]  # SDK 的 SandboxSettings TypedDict 未声明 filesystem 子结构，CLI 按 JSON 透传接受
             env=provider_env,
@@ -469,6 +490,8 @@ class OptionsAssembler:
     def _build_file_access_hook(
         self,
         project_cwd: Path,
+        *,
+        user_id: str | None = None,
     ) -> Callable[..., Any]:
         """Build a PreToolUse hook callback that enforces file access control.
 
@@ -476,6 +499,8 @@ class OptionsAssembler:
         **every** tool call, including Read/Glob/Grep which would otherwise
         be auto-approved by allow rules at step 4.
         """
+
+        user_id = user_id if user_id is not None else self._user_id_provider()
 
         async def _file_access_hook(
             input_data: dict[str, Any],
@@ -498,8 +523,8 @@ class OptionsAssembler:
                     file_path,
                     tool_name,
                     project_cwd,
-                    # 与 policy 同为现取：user_id 决定用户记忆目录，随会话所属用户变化。
-                    user_id=self._user_id_provider(),
+                    # Capture this connection owner; another request cannot change it.
+                    user_id=user_id,
                 )
                 if not allowed:
                     return {

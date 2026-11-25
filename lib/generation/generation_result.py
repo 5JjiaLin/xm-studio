@@ -119,6 +119,7 @@ class GenerationAction(StrEnum):
 
     RETRY = "retry"
     FIX_INPUT = "fix_input"
+    RESOLVE_DRAFT = "resolve_draft"
     GENERATE_DEPENDENCY = "generate_dependency"
     WAIT_FOR_TASK = "wait_for_task"
     REPLAN_UNIT = "replan_unit"
@@ -243,6 +244,9 @@ _TASK_FAILURE_ACTIONS: dict[str, GenerationAction] = {
     "video_reference_audio_unreadable": GenerationAction.GENERATE_DEPENDENCY,
     # 项目已删除，产物无处可落，也没有可重试的对象。
     "project_deleted_during_task": GenerationAction.NONE,
+    # Outcome is ambiguous after a hard timeout; retrying can duplicate a paid provider request.
+    "text_generation_timeout": GenerationAction.NONE,
+    "draft_quarantined": GenerationAction.RESOLVE_DRAFT,
     # 进程重启 / 恢复失败：任务本身没有内在缺陷，重试即可。
     "dispatch_provider_requeue_failed": GenerationAction.RETRY,
     "restart_lost_image": GenerationAction.RETRY,
@@ -1070,6 +1074,7 @@ _STATE_MARKS: dict[GenerationItemState, str] = {
 _ACTION_LABELS: dict[GenerationAction, str] = {
     GenerationAction.RETRY: "可重试",
     GenerationAction.FIX_INPUT: "需修正输入",
+    GenerationAction.RESOLVE_DRAFT: "需打开并修复已保存草稿",
     GenerationAction.GENERATE_DEPENDENCY: "需先生成依赖",
     GenerationAction.WAIT_FOR_TASK: "等待进行中任务完成",
     GenerationAction.REPLAN_UNIT: "需重新规划内容",

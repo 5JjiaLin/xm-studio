@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from lib.infra.api_errors import BadRequestError, NotFoundError
+from server.auth import CurrentUserInfo
 from server.routers import project_events as project_events_router
 
 
@@ -108,7 +109,9 @@ async def test_stream_project_events_emits_snapshot_and_changes():
     resolved = await project_events_router._project_events_service("demo", request)
     assert resolved is service
 
-    stream = project_events_router.stream_project_events("demo", request, service=service)
+    stream = project_events_router.stream_project_events(
+        "demo", request, current_user=CurrentUserInfo(id="user-1", sub="member"), service=service
+    )
 
     snapshot_event = await anext(stream)
     changes_event = await anext(stream)
@@ -131,12 +134,44 @@ async def test_stream_project_events_breaks_on_disconnect_in_idle():
     # 之后第 3 次起(进入 _idle 阶段)返回 True。
     request = _FakeRequest(app, disconnect_after=2)
 
-    stream = project_events_router.stream_project_events("demo", request, service=service)
+    stream = project_events_router.stream_project_events(
+        "demo", request, current_user=CurrentUserInfo(id="user-1", sub="member"), service=service
+    )
 
     assert (await anext(stream)).event == "snapshot"
     assert (await anext(stream)).event == "changes"
     with pytest.raises(StopAsyncIteration):
         await anext(stream)
+    assert service.unsubscribed is True
+
+
+@pytest.mark.asyncio
+async def test_project_events_closes_when_employee_membership_is_revoked(monkeypatch):
+    service = _FakeService()
+    app = SimpleNamespace(state=SimpleNamespace(project_event_service=service))
+    request = _FakeRequest(app)
+    user = CurrentUserInfo(id="user-1", sub="member", role="editor", session_version=3)
+    checks = 0
+
+    def authorizer(request_arg, project_name, original_user):
+        assert request_arg is request
+        assert project_name == "demo"
+        assert original_user is user
+
+        async def check():
+            nonlocal checks
+            checks += 1
+            return checks == 1
+
+        return check
+
+    monkeypatch.setattr(project_events_router, "project_stream_authorizer", authorizer)
+
+    stream = project_events_router.stream_project_events("demo", request, current_user=user, service=service)
+    assert (await anext(stream)).event == "snapshot"
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    assert checks == 2
     assert service.unsubscribed is True
 
 
@@ -173,7 +208,9 @@ async def test_stream_project_events_breaks_on_disconnect_during_continuous_even
     # 第 1 次(snapshot 顶部)False,第 2 次(第一条 changes 顶部)起 True。
     request = _FakeRequest(app, disconnect_after=1)
 
-    stream = project_events_router.stream_project_events("demo", request, service=service)
+    stream = project_events_router.stream_project_events(
+        "demo", request, current_user=CurrentUserInfo(id="user-1", sub="member"), service=service
+    )
 
     # snapshot 通过(第 1 次 is_disconnected 返回 False)
     assert (await anext(stream)).event == "snapshot"
@@ -211,7 +248,9 @@ async def test_stream_project_events_ends_naturally_after_project_deleted_event(
     app = SimpleNamespace(state=SimpleNamespace(project_event_service=service))
     request = _FakeRequest(app)
 
-    stream = project_events_router.stream_project_events("demo", request, service=service)
+    stream = project_events_router.stream_project_events(
+        "demo", request, current_user=CurrentUserInfo(id="user-1", sub="member"), service=service
+    )
 
     assert (await anext(stream)).event == "snapshot"
     deleted_event = await anext(stream)

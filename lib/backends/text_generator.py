@@ -6,18 +6,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
+
+import httpx
+from openai import APIConnectionError
 
 from lib.backends.providers import CallPurpose, require_provider_pair
 from lib.backends.text_backends.base import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     TextGenerationRequest,
     TextGenerationResult,
+    TextGenerationTimeoutError,
     TextOutputTruncatedError,
     TextTaskType,
 )
+from lib.backends.text_backends.connection_errors import TextProviderConnectionError, connection_diagnostics
 from lib.backends.text_backends.factory import create_text_backend_for_task, text_model_output_limit
 from lib.billing.ledger import Ledger
 from lib.db.base import DEFAULT_USER_ID
@@ -26,6 +33,9 @@ if TYPE_CHECKING:
     from lib.backends.text_backends.base import TextBackend
 
 logger = logging.getLogger(__name__)
+
+# A hard wall-clock bound complements HTTP read timeouts, which SSE heartbeats can keep alive.
+TEXT_GENERATION_TOTAL_TIMEOUT_SECONDS = 1800.0
 
 
 def effective_max_output_tokens(registered: int | None) -> int:
@@ -134,10 +144,38 @@ class TextGenerator:
             user_id=self._user_id,
             purpose=self._purpose,
         ) as call:
+            started = time.monotonic()
             try:
-                result = await self.backend.generate(request)
+                deadline = asyncio.timeout(TEXT_GENERATION_TOTAL_TIMEOUT_SECONDS)
+                try:
+                    async with deadline:
+                        result = await self.backend.generate(request)
+                except TimeoutError as exc:
+                    if not deadline.expired():
+                        raise
+                    raise TextGenerationTimeoutError(TEXT_GENERATION_TOTAL_TIMEOUT_SECONDS) from exc
             except TextOutputTruncatedError as exc:
                 raise self._truncation(exc.provider, exc.output_tokens) from exc
+            except (APIConnectionError, httpx.TransportError) as exc:
+                phase, cause_types = connection_diagnostics(exc)
+                try:
+                    failed_request = getattr(exc, "request", None)
+                except RuntimeError:  # httpx errors may be raised without an attached request.
+                    failed_request = None
+                host = getattr(getattr(failed_request, "url", None), "host", "unknown")
+                logger.error(
+                    "文本模型连接失败 provider=%s model=%s host=%s phase=%s causes=%s elapsed_s=%.3f stream=%s",
+                    self._provider_id,
+                    self.backend.model,
+                    host,
+                    phase,
+                    " -> ".join(cause_types),
+                    time.monotonic() - started,
+                    request.prefer_stream,
+                )
+                raise TextProviderConnectionError(
+                    provider_id=self._provider_id, model=self.backend.model, phase=phase, cause_types=cause_types
+                ) from exc
             if result.truncated and require_complete:
                 raise self._truncation(result.provider, result.output_tokens)
             call.success(result)

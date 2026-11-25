@@ -9,6 +9,7 @@ import pytest
 from lib.episode.episode_management import create_episode
 from lib.episode.script_batch_state import require_batch_idle
 from lib.episode.whole_script import divide_script, import_script, project_basis
+from lib.generation.generation_result import GenerationAction, GenerationProblem, encode_generation_problem
 from lib.project.project_manager import ProjectManager
 from lib.script import script_review
 from server.services.project.whole_script_batch import WholeScriptBatchService
@@ -165,6 +166,179 @@ async def test_unknown_submission_remains_blocked_on_refresh_and_stop(setup_batc
     with pytest.raises(ValueError, match="结果未知"):
         await service.control("demo", "continue", "u")
     assert not calls
+
+
+async def test_unknown_submission_requires_explicit_provider_check_before_resubmission(setup_batch):
+    service, import_id, calls = setup_batch
+    await service.start("demo", import_id, "u")
+    state = service._read("demo")
+    state["items"][0].update(status="unknown", attempt="lost")
+    state["status"] = "unknown"
+    await service._write("demo", state)
+    with pytest.raises(ValueError, match="供应商控制台"):
+        await service.control("demo", "resolve_unknown", "u")
+    assert service._read("demo")["status"] == "unknown"
+    await service.control("demo", "resolve_unknown", "u", confirm_not_submitted=True)
+    assert service._read("demo")["status"] == "stopped"
+    assert service._read("demo")["items"][0]["status"] == "pending"
+    await service.control("demo", "continue", "u")
+    await service.advance("demo")
+    assert [episode for episode, _ in calls] == [1]
+
+
+async def test_unknown_submission_query_error_does_not_become_zero_matches(setup_batch):
+    service, import_id, calls = setup_batch
+    await service.start("demo", import_id, "u")
+    state = service._read("demo")
+    state["items"][0].update(status="unknown", attempt="lost")
+    state["status"] = "unknown"
+    await service._write("demo", state)
+    service.services.queue.list_tasks.side_effect = RuntimeError("database unavailable")
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await service.control("demo", "resolve_unknown", "u", confirm_not_submitted=True)
+    assert service._read("demo")["items"][0]["status"] == "unknown"
+    assert not calls
+
+
+@pytest.mark.parametrize("count", [1, 2])
+async def test_explicit_unknown_resolution_binds_unique_task_and_never_clears_duplicates(setup_batch, count):
+    service, import_id, calls = setup_batch
+    await service.start("demo", import_id, "u")
+    state = service._read("demo")
+    state["items"][0].update(status="unknown", attempt="lost")
+    state["status"] = "unknown"
+    await service._write("demo", state)
+    service.services.queue.list_tasks.return_value = {
+        "items": [
+            {
+                "task_id": f"accepted-{index}",
+                "user_id": "u",
+                "payload": {"production_batch_id": state["id"], "production_attempt": "lost", "episode": 1},
+            }
+            for index in range(count)
+        ]
+    }
+    if count == 1:
+        await service.control("demo", "resolve_unknown", "u")
+        assert service._read("demo")["items"][0]["task_id"] == "accepted-0"
+        assert service._read("demo")["items"][0]["status"] == "active"
+    else:
+        with pytest.raises(ValueError, match="无法唯一绑定"):
+            await service.control("demo", "resolve_unknown", "u", confirm_not_submitted=True)
+        assert service._read("demo")["items"][0]["status"] == "unknown"
+    assert not calls
+
+
+@pytest.mark.parametrize("lookup_result", [None, {}, {"items": None}])
+async def test_invalid_queue_lookup_cannot_release_unknown_submission(setup_batch, lookup_result):
+    service, import_id, calls = setup_batch
+    await service.start("demo", import_id, "u")
+    state = service._read("demo")
+    state["items"][0].update(status="unknown", attempt="lost")
+    state["status"] = "unknown"
+    await service._write("demo", state)
+    service.services.queue.list_tasks.return_value = lookup_result
+    with pytest.raises(RuntimeError, match="查询响应无效"):
+        await service.control("demo", "resolve_unknown", "u", confirm_not_submitted=True)
+    assert service._read("demo")["items"][0]["attempt"] == "lost"
+    assert not calls
+
+
+async def test_repaired_draft_is_accepted_on_continue_without_regenerating_it(setup_batch, monkeypatch):
+    service, import_id, calls = setup_batch
+    await service.start("demo", import_id, "u")
+    state = service._read("demo")
+    state["items"][0].update(status="active", task_id="quarantined-task")
+    await service._write("demo", state)
+    service.services.queue.get_task.return_value = {
+        "status": "failed",
+        "error_message": encode_generation_problem(
+            GenerationProblem(
+                code="draft_quarantined",
+                detail="saved draft",
+                action=GenerationAction.RESOLVE_DRAFT,
+                params={"episode_id": 1, "doc_type": "drama_script_plan"},
+            )
+        ),
+    }
+    await service.advance("demo")
+    assert service._read("demo")["items"][0]["requires_draft_repair"] is True
+    with pytest.raises(ValueError, match="草稿仍待修复"):
+        await service.control("demo", "continue", "u")
+    draft(service, 1)
+    await service.control("demo", "continue", "u")
+    await service.advance("demo")
+    assert [episode for episode, _ in calls] == [2]
+    assert service._read("demo")["items"][0]["status"] == "completed"
+
+
+@pytest.mark.parametrize("handle", ["task_id", "batch_id"])
+@pytest.mark.parametrize("code", ["text_generation_timeout", "text_provider_connection_failed"])
+async def test_batch_timeout_requires_provider_check_before_manual_resubmission(setup_batch, handle, code):
+    service, import_id, calls = setup_batch
+    await service.start("demo", import_id, "u")
+    state = service._read("demo")
+    state["items"][0].update(status="active", attempt="old-attempt", **{handle: "timed-out-task"})
+    await service._write("demo", state)
+    problem = GenerationProblem(
+        code=code,
+        detail="provider result unknown",
+        action=GenerationAction.NONE,
+        params={"timeout_seconds": 1800, "may_have_been_accepted": True},
+    )
+    if handle == "task_id":
+        service.services.queue.get_task.return_value = {
+            "status": "failed", "error_message": encode_generation_problem(problem)
+        }
+    else:
+        service.services.queue.get_generation_batch.return_value = SimpleNamespace(
+            done=True,
+            counts=SimpleNamespace(failed=1, cancelled=0, blocked=0),
+            members=[SimpleNamespace(problem=problem, model_dump=lambda **_: {})],
+        )
+    await service.advance("demo")
+    assert service._read("demo")["status"] == "unknown"
+    assert service._read("demo")["items"][0]["status"] == "unknown"
+    with pytest.raises(ValueError, match="核对供应商记录"):
+        await service.control("demo", "continue", "u")
+    restarted = WholeScriptBatchService(service.projects, service.services)
+    service.services.queue.list_tasks.reset_mock()
+    for _ in range(2):
+        await restarted.advance("demo")
+    with pytest.raises(ValueError, match="核对供应商记录"):
+        await restarted.control("demo", "resolve_unknown", "u")
+    service.services.queue.list_tasks.assert_not_awaited()
+    assert not calls
+    await restarted.control("demo", "resolve_unknown", "u", confirm_not_submitted=True)
+    state = restarted._read("demo")
+    assert state["status"] == "stopped"
+    assert state["items"][0] == {"episode": 1, "status": "pending"}
+    await restarted.advance("demo")
+    assert not calls
+    await restarted.control("demo", "continue", "u")
+    await restarted.advance("demo")
+    assert [episode for episode, _ in calls] == [1]
+    assert calls[0][1][1] != "old-attempt"
+
+
+@pytest.mark.parametrize("confirm", [False, True])
+async def test_recheck_known_handle_after_lookup_error_never_discards_original_task(setup_batch, confirm):
+    service, import_id, calls = setup_batch
+    await service.start("demo", import_id, "u")
+    await service.advance("demo")
+    service.services.queue.get_generation_batch.side_effect = RuntimeError("temporarily unavailable")
+    await service.advance("demo")
+    assert service._read("demo")["status"] == "unknown"
+    await service.control("demo", "resolve_unknown", "u", confirm_not_submitted=confirm)
+    state = service._read("demo")
+    assert state["items"][0]["batch_id"] == "b1"
+    assert state["items"][0]["status"] == "active"
+    service.services.queue.get_generation_batch.side_effect = None
+    draft(service, 1)
+    done(service)
+    await service.advance("demo")
+    assert len(calls) == 1
+    assert service._read("demo")["items"][0]["status"] == "completed"
 
 
 async def test_context_change_pauses_before_next_episode_and_is_explicitly_acknowledged(setup_batch):

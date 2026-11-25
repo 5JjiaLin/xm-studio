@@ -99,9 +99,22 @@ from lib.workflow.workflow_state import (
     WorkflowStateService,
     WorkflowStatus,
 )
-from server.auth import CurrentUser, create_download_token, reject_embedded_agent, verify_download_token
+from server.auth import (
+    CurrentUser,
+    create_download_token,
+    employee_auth_enabled,
+    reject_embedded_agent,
+    verify_download_token,
+)
 from server.dependencies import require_project_migration_ok
 from server.i18n import DisplayNamesCatalog, Locale, Translator
+from server.project_access import (
+    authorize_project_download,
+    grant_project_creator,
+    require_core_project_access,
+    resolve_project_id,
+    visible_project_names,
+)
 from server.routers._coalesce import RequestCoalescer
 from server.routers._episode_source_errors import episode_source_http_error
 from server.routers._script_edits import (
@@ -133,7 +146,7 @@ from server.services.tasks.video_caps import (
 )
 from server.tool_runtime import truncation_problem
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_core_project_access)])
 
 # 自带认证端点：浏览器原生下载导航带不了 Authorization header，
 # 端点内 verify_download_token 校验短时效下载 token，注册时不挂 Bearer 依赖。
@@ -507,7 +520,11 @@ async def create_export_token(
 
         diagnostics = await asyncio.to_thread(_sync)
         username = current_user.sub
-        download_token = create_download_token(username, name)
+        if employee_auth_enabled():
+            project_id = await resolve_project_id(name)
+            download_token = create_download_token(username, name, employee=current_user, project_id=project_id)
+        else:
+            download_token = create_download_token(username, name)
         return {
             "download_token": download_token,
             "expires_in": 300,
@@ -536,13 +553,15 @@ async def export_project_archive(
     import jwt as pyjwt
 
     try:
-        verify_download_token(download_token, name)
+        payload = verify_download_token(download_token, name)
     except pyjwt.ExpiredSignatureError as exc:
         raise HTTPException(status_code=401, detail=_t("download_expired")) from exc
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=_t("download_token_mismatch")) from exc
     except pyjwt.InvalidTokenError as exc:
         raise HTTPException(status_code=401, detail=_t("download_token_invalid")) from exc
+
+    await authorize_project_download(payload, name)
 
     # zip 一落盘就登记：打包进行中被取消时返回值随之丢弃，finally 按登记回收；
     # 交给 FileResponse 之后由响应的后台任务回收。
@@ -581,14 +600,17 @@ _NO_ACTIVITY = datetime.min.replace(tzinfo=UTC)
 
 
 @router.get("/projects")
-async def list_projects(summaries: WorkflowStateServiceDep, _t: Translator):
+async def list_projects(summaries: WorkflowStateServiceDep, _t: Translator, current_user: CurrentUser):
     """列出所有项目，最近有活动的在前。"""
+    allowed_names = await visible_project_names(current_user, get_project_manager())
 
     def _sync():
         manager = get_project_manager()
         projects = []
         last_activity: dict[str, datetime] = {}
         for name in manager.list_projects():
+            if allowed_names is not None and name not in allowed_names:
+                continue
             try:
                 # 列举之后被删除的项目不再列出
                 if manager.project_exists(name):
@@ -674,6 +696,7 @@ async def list_projects(summaries: WorkflowStateServiceDep, _t: Translator):
 async def create_project(
     req: CreateProjectRequest,
     _t: Translator,
+    current_user: CurrentUser,
 ):
     """创建新项目"""
     try:
@@ -774,7 +797,10 @@ async def create_project(
                 )
             return {"success": True, "name": project_name, "project": project}
 
-        return await run_sync_transaction(_sync)
+        result = await run_sync_transaction(_sync)
+        if employee_auth_enabled():
+            await grant_project_creator(current_user, result["project"]["project_id"])
+        return result
     except ValueError as e:
         # 项目名 / duration / brief 等配置校验失败，str(e) 只进日志
         logger.warning("创建项目参数错误: name=%s (%s)", req.name or req.title, e)

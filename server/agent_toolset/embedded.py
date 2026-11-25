@@ -9,13 +9,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 from claude_agent_sdk import McpSdkServerConfig
 from mcp import types
 from mcp.server import Server
 
+from lib.identity.projects import ProjectAccessDenied
 from server.agent_toolset.declaration import (
     AgentToolDeclaration,
     UnscopedToolDeclaration,
@@ -24,7 +25,8 @@ from server.agent_toolset.declaration import (
     tool_description,
 )
 from server.agent_toolset.envelope import encode_outcome
-from server.tool_runtime import CallerContext, ProjectScope, Services, ToolOutcome
+from server.auth import employee_auth_enabled
+from server.tool_runtime import CallerContext, ProjectScope, Services, ToolOutcome, ToolProblem
 
 
 def embedded_result(declaration: AgentToolDeclaration, outcome: ToolOutcome[Any]) -> types.CallToolResult:
@@ -49,6 +51,7 @@ def embedded_server(
     scope: ProjectScope,
     caller: CallerContext,
     services: Services,
+    authorize: Callable[[AgentToolDeclaration], Awaitable[CallerContext]] | None = None,
 ) -> McpSdkServerConfig:
     """以会话项目暴露已声明工具的 in-process MCP server。"""
     declared = {declaration.name: declaration for declaration in declarations}
@@ -71,10 +74,20 @@ def embedded_server(
         declaration = declared.get(tool_name)
         if declaration is None:
             raise ValueError(f"Tool '{tool_name}' not found")
+        context = caller
+        try:
+            if authorize is not None:
+                context = await authorize(declaration)
+            elif employee_auth_enabled():
+                raise ProjectAccessDenied("员工助手缺少绑定的项目身份")
+        except ProjectAccessDenied:
+            return embedded_result(
+                declaration, ToolOutcome(problem=ToolProblem("permission_denied", "员工会话或项目权限已失效"))
+            )
         if isinstance(declaration, UnscopedToolDeclaration):
-            outcome = await invoke_unscoped_declaration(declaration, arguments, caller, services)
+            outcome = await invoke_unscoped_declaration(declaration, arguments, context, services)
         else:
-            outcome = await invoke_declaration(declaration, arguments, scope, caller, services)
+            outcome = await invoke_declaration(declaration, arguments, scope, context, services)
         return embedded_result(declaration, outcome)
 
     return McpSdkServerConfig(type="sdk", name=name, instance=server)

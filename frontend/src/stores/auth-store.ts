@@ -12,6 +12,9 @@ interface AuthState {
   setLoading: (loading: boolean) => void;
 }
 
+// A delayed bootstrap must never restore a session after logout or a new login.
+let initializationVersion = 0;
+
 export const useAuthStore = create<AuthState>((set) => ({
   token: null,
   username: null,
@@ -19,9 +22,36 @@ export const useAuthStore = create<AuthState>((set) => ({
   isLoading: true,
 
   initialize: () => {
+    const version = ++initializationVersion;
+    set({ isLoading: true });
     const token = getToken();
     if (token) {
-      set({ token, isAuthenticated: true, isLoading: false });
+      // Restore the HttpOnly media credential before rendering native media.
+      // The server keeps the original Bearer expiry and rechecks revocation.
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      fetch("/api/v1/auth/media-session", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+      })
+        .then((res) => {
+          if (version !== initializationVersion) return;
+          if (!res.ok) {
+            if (res.status === 401) clearToken();
+            throw new Error(`media session ${res.status}`);
+          }
+          set({ token, isAuthenticated: true });
+        })
+        .catch((err) => {
+          if (version !== initializationVersion) return;
+          console.warn("[auth] media session bootstrap failed", err);
+          set({ token: null, isAuthenticated: false });
+        })
+        .finally(() => {
+          clearTimeout(timeoutId);
+          if (version === initializationVersion) set({ isLoading: false });
+        });
       return;
     }
     // 无 token 时先问后端是否启用了鉴权。`AUTH_ENABLED=false` 时后端全链路
@@ -33,6 +63,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       .then(async (res) => {
         if (!res.ok) throw new Error(`status ${res.status}`);
         const payload: unknown = await res.json();
+        if (version !== initializationVersion) return;
         if (
           typeof payload !== "object" ||
           payload === null ||
@@ -50,18 +81,24 @@ export const useAuthStore = create<AuthState>((set) => ({
       })
       .finally(() => {
         clearTimeout(timeoutId);
-        set({ isLoading: false });
+        if (version === initializationVersion) set({ isLoading: false });
       });
   },
 
   login: (token, username) => {
+    ++initializationVersion;
     saveToken(token);
     set({ token, username, isAuthenticated: true, isLoading: false });
   },
 
   logout: () => {
+    ++initializationVersion;
+    // Cookie removal is best-effort on network failure; the server still checks
+    // account/session revocation and membership on every subsequent media GET.
+    fetch("/api/v1/auth/logout", { method: "POST", signal: AbortSignal.timeout(5000) })
+      .catch((err) => console.warn("[auth] media logout failed", err));
     clearToken();
-    set({ token: null, username: null, isAuthenticated: false });
+    set({ token: null, username: null, isAuthenticated: false, isLoading: false });
   },
 
   setLoading: (isLoading) => set({ isLoading }),

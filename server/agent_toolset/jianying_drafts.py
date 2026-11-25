@@ -12,6 +12,7 @@ from server.media_tools.jianying_drafts import (
 
 EXPORT_JIANYING_DRAFT = ToolDeclaration(
     name="export_jianying_draft",
+    access="download",
     description=(
         "把一条剪辑时间线导出成剪映草稿：在本机生成，不付费，登记为产物，创作者在 Web 端填写本机剪映草稿目录后下载。"
         "只在创作者要求导出剪映草稿时调用。草稿有一条视频轨和字幕轨，带旁白版本另有旁白轨；旁白或字幕互相重叠时"

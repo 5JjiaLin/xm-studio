@@ -91,6 +91,76 @@ def test_accepts_full_ordered_coverage_and_original_dialogue():
     assert validate_screenplay_coverage(units, SCRIPT) == []
 
 
+@pytest.mark.parametrize("episode_heading", ["第1集", "**Episode 1**"])
+def test_leading_recap_is_context_without_weakening_episode_coverage(episode_heading):
+    recap = "\n## 【前情提要】\n姜家：人物背景。\n他曾离开。\n\n"
+    action = "△甲推开门。"
+    speech = "ALICE: Stop."
+    source = f"{recap}{episode_heading}\n{action}\n{speech}"
+    units = [
+        {"source_text": action, "text": action},
+        {"source_text": speech, "text": "@[ALICE]{Stop.}"},
+    ]
+
+    assert validate_screenplay_coverage(units, source) == []
+    missing_action = validate_screenplay_coverage(units[1:], source)
+    assert [issue.code for issue in missing_action] == ["screenplay_source_coverage"]
+    assert action in str(missing_action[0]) and "人物背景" not in str(missing_action[0])
+    assert [issue.code for issue in validate_screenplay_coverage(
+        [units[0], {"source_text": speech, "text": "甲站定。"}], source,
+    )] == ["screenplay_dialogue_coverage"]
+
+
+@pytest.mark.parametrize("opening", ["前情提要\n他曾离开。", "△甲进屋。\n前情提要\n他曾离开。\n第1集"])
+def test_recap_exemption_requires_a_leading_recap_and_an_episode_heading(opening):
+    action = "△甲推开门。"
+    issues = validate_screenplay_coverage([{"source_text": action, "text": action}], f"{opening}\n{action}")
+
+    assert [issue.code for issue in issues] == ["screenplay_source_coverage"]
+    assert "他曾离开" in str(issues[0])
+
+
+@pytest.mark.parametrize("title", ["仙侠视觉体系（制作参考）", "**制作参考**"])
+def test_production_reference_requires_only_body_with_original_dialogue_coordinates(title):
+    prefix = f"{title}\n一、场景总览\n布景：雪地。\n四、全剧故事梗概\n旧城风起。\n五、剧本正文\n\n第1集\n"
+    action, speech = "▲她推开木门。", "甲：回来了。"
+    source = prefix + action + "\n" + speech
+    units = [{"source_text": action, "text": action}, {"source_text": speech, "text": "@[甲]{回来了。}"}]
+    assert validate_screenplay_coverage(units, source) == []
+    (line,), _ = screenplay_source_dialogue(source)
+    assert line.id == "D0010" and source[slice(*line.ranges[0])] == "回来了。"
+    assert [issue.code for issue in validate_screenplay_coverage(units[1:], source)] == ["screenplay_source_coverage"]
+    assert [issue.code for issue in validate_screenplay_coverage(
+        [units[0], {"source_text": speech, "text": "她站住。"}], source,
+    )] == ["screenplay_dialogue_coverage"]
+
+
+@pytest.mark.parametrize("prefix", [
+    "制作参考\n雪地。\n第1集",                       # No screenplay body marker.
+    "制作参考\n雪地。\n五、剧本正文",                 # No episode heading.
+    "制作参考\n雪地。\n剧本正文\n未标记的开场。\n第1集",
+    "制作参考\n第1集\n▲雪地。\n剧本正文\n第2集",    # Cannot swallow an earlier episode/scene.
+    "制作参考\n1-1 大殿 夜 内\n雪地。\n剧本正文\n第1集",
+    "制作参考\n▲雪地。\n剧本正文\n第1集",
+    "雪地。\n制作参考\n剧本正文\n第1集",              # Not a leading reference title.
+    "甲：请看制作参考。\n雪地。\n剧本正文\n第1集",   # A mention is not a title.
+])
+def test_production_reference_fails_closed_without_a_bounded_prefix(prefix):
+    action = "▲她推开木门。"
+    issues = validate_screenplay_coverage([{"source_text": action, "text": action}], prefix + "\n" + action)
+    assert any(issue.code == "screenplay_source_coverage" and "雪地" in str(issue) for issue in issues)
+
+
+def test_reference_text_repeated_in_body_is_covered_only_by_body_anchors():
+    repeated = "雪落在门前。"
+    source = f"制作参考\n{repeated}\n剧本正文\n第1集\n{repeated}"
+    unit = {"source_text": repeated, "text": repeated}
+    assert validate_screenplay_coverage([unit], source) == []
+    start = source.index(repeated)
+    only_reference = {**unit, "source_binding": {"start": start, "end": start + len(repeated)}}
+    assert [v.code for v in validate_screenplay_coverage([only_reference], source)] == ["screenplay_source_coverage"]
+
+
 def test_preserves_the_original_dialogue_typo_instead_of_silently_correcting_it():
     units = [
         {
@@ -231,3 +301,13 @@ def test_pure_action_cannot_acquire_dialogue():
     units[0]["text"] += "{关门。}"
     [issue] = validate_screenplay_coverage(units, source)
     assert (issue.code, issue.item_id) == ("screenplay_dialogue_coverage", "E1U01")
+
+
+def test_advisory_reports_every_uncovered_line_but_preserves_dialogue_gate():
+
+    source = "第1集\n▲门开了。\n▲灯熄了。\nALICE: Stop."
+    units = [{"source_text": "ALICE: Stop.", "text": "她停下。"}]
+    assert [v.code for v in validate_screenplay_coverage(units, source)] == ["screenplay_source_coverage", "screenplay_dialogue_coverage"]
+    warnings = []
+    assert [v.code for v in validate_screenplay_coverage(units, source, coverage_advisories=warnings)] == ["screenplay_dialogue_coverage"]
+    assert warnings == ["2: ▲门开了。", "3: ▲灯熄了。"]

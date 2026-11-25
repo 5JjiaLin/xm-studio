@@ -91,6 +91,7 @@ class SessionMeta(BaseModel):
     """Session metadata stored in database."""
 
     id: str  # 对外暴露，填充 sdk_session_id 值
+    user_id: str = "default"
     project_name: str
     title: str = ""
     status: SessionStatus = "idle"

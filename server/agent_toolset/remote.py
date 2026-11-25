@@ -9,6 +9,7 @@ schema 头部追加必填 ``project``，每次调用显式定位项目；任何�
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 from collections.abc import Awaitable, Callable, Iterable
 from copy import deepcopy
@@ -16,6 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from fastapi import HTTPException
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp.tools import Tool as FastMCPTool
 from mcp.types import CallToolResult, ImageContent, TextContent
@@ -32,6 +34,8 @@ from server.agent_toolset.declaration import (
     tool_description,
 )
 from server.agent_toolset.envelope import encode_outcome
+from server.auth import employee_auth_enabled, get_current_user
+from server.project_access import authorize_project
 from server.tool_runtime import CallerContext, ProjectScope, Services, ToolOutcome, ToolProblem
 
 PROJECT_PROPERTY: dict[str, Any] = {
@@ -45,11 +49,16 @@ LONG_TASK_NOTE = (
 )
 
 
-def authenticated_caller() -> CallerContext:
+async def authenticated_caller() -> CallerContext:
     token = get_access_token()
     if token is None:
         raise RuntimeError("authenticated MCP request has no access token")
-    # API-key subjects identify credentials; the supported single-operator model persists queue ownership as default.
+    if employee_auth_enabled():
+        # Revalidate on each invocation, including a multi-call MCP request.
+        user = await get_current_user(token=token.token)
+        if user.api_key_id is None:
+            raise HTTPException(status_code=401, detail="MCP 需要员工项目 API Key")
+        return CallerContext(user_id=user.id, source="mcp", identity=user)
     return CallerContext(user_id=DEFAULT_USER_ID, source="mcp")
 
 
@@ -152,20 +161,36 @@ def remote_tool(
     *,
     projects: ProjectManager,
     services: Services,
-    caller: Callable[[], CallerContext] = authenticated_caller,
+    caller: Callable[[], CallerContext | Awaitable[CallerContext]] = authenticated_caller,
 ) -> FastMCPTool:
     async def invoke(arguments: dict[str, Any]) -> CallToolResult:
-        if isinstance(declaration, UnscopedToolDeclaration):
-            return remote_result(
-                declaration, await invoke_unscoped_declaration(declaration, arguments, caller(), services)
-            )
-        request_arguments = dict(arguments)
-        project = request_arguments.pop("project", None)
         try:
+            caller_result = caller()
+            context = await caller_result if inspect.isawaitable(caller_result) else caller_result
+            employee_mode = employee_auth_enabled()
+            if employee_mode and (
+                context.identity is None or context.identity.id != context.user_id
+                or context.identity.api_key_id is None
+            ):
+                raise HTTPException(status_code=401, detail="MCP 需要员工项目 API Key")
+            if isinstance(declaration, UnscopedToolDeclaration):
+                if employee_mode and declaration.name != "list_projects":
+                    raise HTTPException(status_code=403, detail="项目 API Key 不能创建项目或扩大授权范围")
+                return remote_result(
+                    declaration, await invoke_unscoped_declaration(declaration, arguments, context, services)
+                )
+            request_arguments = dict(arguments)
+            project = request_arguments.pop("project", None)
             scope, spellings = await asyncio.to_thread(_locate_project, project, projects)
+            if employee_mode:
+                await authorize_project(context.identity, scope.project_name, declaration.access, manager=projects)
+        except HTTPException:
+            return remote_result(declaration, ToolOutcome(problem=ToolProblem("permission_denied", "凭据或项目权限无效")))
         except (FileNotFoundError, ValueError) as exc:
+            if employee_auth_enabled():
+                return remote_result(declaration, ToolOutcome(problem=ToolProblem("permission_denied", "凭据或项目权限无效")))
             return remote_result(declaration, ToolOutcome(problem=ToolProblem("invalid_project", str(exc))))
-        outcome = await invoke_declaration(declaration, request_arguments, scope, caller(), services)
+        outcome = await invoke_declaration(declaration, request_arguments, scope, context, services)
         return remote_result(declaration, _project_relative_outcome(outcome, spellings))
 
     async def unused() -> CallToolResult:

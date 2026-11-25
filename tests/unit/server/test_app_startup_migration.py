@@ -5,6 +5,7 @@ import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -100,3 +101,25 @@ async def test_data_root_layout_migration_runs_before_every_project_walk(tmp_pat
     )
     assert not (project_dir / stale_backup.name).exists()
     assert (project_dir / "CLAUDE.md").is_file()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["duplicate", "invalid"])
+async def test_employee_startup_refuses_ambiguous_or_corrupt_project_identity(tmp_path, monkeypatch, kind):
+    data_root = tmp_path / "data"
+    project_id = str(uuid4()) if kind == "duplicate" else "invalid-id"
+    for name in ("first", "second"):
+        project_dir = data_root / "projects" / name
+        project_dir.mkdir(parents=True)
+        (project_dir / "project.json").write_text(
+            json.dumps({"schema_version": CURRENT_SCHEMA_VERSION, "project_id": project_id}), encoding="utf-8"
+        )
+    monkeypatch.setenv("ARCREEL_DATA_DIR", str(data_root))
+    monkeypatch.setenv("EMPLOYEE_AUTH_ENABLED", "true")
+    monkeypatch.setattr(app_module, "migrate_data_root_layout", _noop_async)
+    worker = stub_lifespan_dependencies(monkeypatch)
+    monkeypatch.setattr(app_module.app, "state", SimpleNamespace())
+    with pytest.raises(RuntimeError, match="unique project identities"):
+        async with app_module.lifespan(app_module.app):
+            pytest.fail("must not reach the serving phase")
+    assert not worker.started

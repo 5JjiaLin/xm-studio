@@ -21,6 +21,7 @@ from lib.episode.episode_paths import SCRIPT_PLAN_FILENAMES, episode_drafts_dir,
 from lib.generation.video_request_facts import VideoRequestFactsError, VideoRequestFactsFailure
 from lib.infra.async_thread import run_sync_transaction
 from lib.infra.json_io import atomic_write_json, load_json_or_none
+from lib.project.archive_context import generation_project
 from lib.project.project_activity import record_project_activity
 from lib.project.project_manager import ProjectManager, ScriptWriteConflict
 from lib.script import script_review
@@ -220,6 +221,7 @@ class ReferenceDraftRevalidation(NamedTuple):
     basis: ArtifactBasis | None
     soft_violations: list[SoftViolation]
     new_assets: list[dict[str, Any]]
+    coverage_advisories: tuple[str, ...] = ()
 
     def flat_content(self) -> dict[str, Any]:
         """收编后的扁平草稿内容。"""
@@ -265,6 +267,7 @@ async def revalidate_reference_script_plan_draft(
         episode,
         "reference_video",
     )
+    project = await asyncio.to_thread(generation_project, project_path, project, episode=episode)
     split_caps = await fetch_reference_split_caps(project, config_resolver=config_resolver)
 
     # 修改过的草稿先过产出时那份 schema：拆分侧由 response_schema 与 _parse_script_plan_json 卡住时长
@@ -318,6 +321,7 @@ async def revalidate_reference_script_plan_draft(
         )
 
     source_language = project.get("source_language")
+    coverage_advisories: list[str] = []
     violations = await asyncio.to_thread(
         collect_reference_flat_violations,
         flat_units,
@@ -330,6 +334,7 @@ async def revalidate_reference_script_plan_draft(
         new_assets=new_assets,
         prompt_policy_version=draft.meta.get("prompt_policy_version"),
         record_manual_dialogue_edits=manual and dialogue is None,
+        coverage_advisories=coverage_advisories,
     )
     # 软违约与硬违约在同一次重判里一并产出：有硬违约时也要算，晋升被挡下时的报告同样带着它们，
     # 否则 Agent 修草稿的每一轮都看不见降级提示，直到最后一轮晋升成功才第一次读到。
@@ -348,6 +353,7 @@ async def revalidate_reference_script_plan_draft(
         basis=script_plan_basis,
         soft_violations=soft_violations,
         new_assets=new_assets,
+        coverage_advisories=tuple(coverage_advisories),
     )
 
 
@@ -734,6 +740,7 @@ async def revalidate_drama_script_plan_draft(
         episode,
         "drama",
     )
+    project = await asyncio.to_thread(generation_project, project_path, project, episode=episode)
     _default_duration, supported_durations = await fetch_storyboard_durations(project, config_resolver=config_resolver)
     schema = build_drama_normalized_script_model(supported_durations)
     try:
@@ -911,6 +918,7 @@ async def revalidate_narration_script_plan_draft(
         episode,
         "narration",
     )
+    project = await asyncio.to_thread(generation_project, project_path, project, episode=episode)
     _default_duration, supported_durations = await fetch_storyboard_durations(project, config_resolver=config_resolver)
 
     # 修改过的草稿先过产出时那份 schema：拆分侧由 response_schema 与 _parse_script_plan_json 卡住字段与
@@ -1094,6 +1102,7 @@ class ScriptPlanDraftRevalidation(NamedTuple):
     violations: list[DraftViolation]
     content: dict[str, Any] | None
     soft_violations: tuple[SoftViolation, ...] = ()
+    coverage_advisories: tuple[str, ...] = ()
 
 
 class _SingleScriptPlanRevalidator(Protocol):
@@ -1143,7 +1152,7 @@ async def revalidate_script_plan_draft(
             config_resolver=config_resolver,
         )
         content = None if reference.schema_failed else reference.flat_content()
-        return ScriptPlanDraftRevalidation(reference.violations, content, tuple(reference.soft_violations))
+        return ScriptPlanDraftRevalidation(reference.violations, content, tuple(reference.soft_violations), reference.coverage_advisories)
     revalidator = _SINGLE_SCRIPT_PLAN_REVALIDATORS.get(draft.kind)
     if revalidator is None:
         raise ValueError(f"不是 script_plan 草稿来源，无法重判: {draft.kind}")

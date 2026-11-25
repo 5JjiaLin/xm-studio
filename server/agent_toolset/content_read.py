@@ -22,6 +22,7 @@ _READ_ONLY_FILE = Exempt("只读：按路径直取项目文件，不经产物清
 
 GET_PROJECT_CONTENT = ToolDeclaration(
     name="get_project_content",
+    access="read",
     description=(
         "读取项目 project.json 的完整内容（标题、内容模式、生成模式、风格、分集与资产设定等）"
         "及其 canonical revision。episodes[] 的排列即播出顺序，每项的 episode 是集 ID（内部标识，不是第几集）。"
@@ -35,6 +36,7 @@ GET_PROJECT_CONTENT = ToolDeclaration(
 
 LIST_SOURCE_FILES = ToolDeclaration(
     name="list_source_files",
+    access="read",
     description=(
         "列出项目 source/ 下的源文文件（UTF-8 的 .txt / .md），返回每个文件的项目相对路径、字节数与 etag，"
         "以及整份列表的 revision。只读，无副作用。读取正文用 get_source_text。"
@@ -47,6 +49,7 @@ LIST_SOURCE_FILES = ToolDeclaration(
 
 GET_SOURCE_TEXT = ToolDeclaration(
     name="get_source_text",
+    access="read",
     description=(
         "读取 source/ 下一个 UTF-8 源文文件的全文及其 revision 与 etag。只读，无副作用。"
         "source/ 之外的路径、非文本文件、symlink 与超过大小上限的文件会被拒绝。"
@@ -59,6 +62,7 @@ GET_SOURCE_TEXT = ToolDeclaration(
 
 GET_EPISODE_SCRIPT = ToolDeclaration(
     name="get_episode_script",
+    access="read",
     description=(
         "读取一集剧本的 JSON 正文及其 canonical revision。把返回的 revision 原样作为 "
         "patch_episode_script 的 base_revision；剧本被改动后 revision 随之变化，须重新读取。只读，无副作用。"
@@ -73,6 +77,7 @@ GET_EPISODE_SCRIPT = ToolDeclaration(
 
 GET_SCRIPT_PLAN_CONTENT = ToolDeclaration(
     name="get_script_plan_content",
+    access="read",
     description=(
         "读取指定集当前正式的 script_plan（剧本规划中间态，位于 drafts/episode_{集 ID}/）正文及其 canonical "
         "revision。只读，无副作用。项目不使用 script_plan 时返回 script_plan_not_applicable；"
@@ -86,6 +91,7 @@ GET_SCRIPT_PLAN_CONTENT = ToolDeclaration(
 
 LIST_PROJECT_FILES = ToolDeclaration(
     name="list_project_files",
+    access="read",
     description=(
         "列出可供诊断读取的项目业务文本文件：project.json、source/ 源文、scripts/ 剧本与 drafts/episode_N/ "
         "下的 script_plan，返回路径、字节数与 etag，以及整份列表的 revision。敏感文件、symlink 与其他路径"
@@ -99,6 +105,7 @@ LIST_PROJECT_FILES = ToolDeclaration(
 
 READ_PROJECT_FILE = ToolDeclaration(
     name="read_project_file",
+    access="read",
     description=(
         "读取一个项目业务文本文件的内容及其 revision 与 etag：JSON 文件返回解析后的对象，文本文件返回字符串。"
         "可读范围与 list_project_files 一致，敏感文件、symlink、越界路径与超过大小上限的文件会被拒绝。"

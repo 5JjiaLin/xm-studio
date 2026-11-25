@@ -209,6 +209,8 @@ export interface ScriptOverwrite {
 
 /** script_plan→prompt_authoring 内容确认状态（后端 server/routers/script_review.py 的 GET 响应）。 */
 export interface ScriptReviewState {
+  coverage_advisory_mode?: boolean;
+  coverage_advisories?: string[];
   episode: number;
   content_mode: string | null;
   status: ScriptReviewStatus;

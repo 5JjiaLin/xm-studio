@@ -293,6 +293,74 @@ test("video edits save before generation from the page footer without a quote", 
   await expectReachableLayout(page);
 });
 
+test("background video polling keeps typing and saving available without unlocking generation", async ({ page, api }) => {
+  const initial = { ...unit, text: "初始提示词" };
+  let saved = initial;
+  let holdRefresh = false;
+  let refreshWaiting = false;
+  let videoActive = false;
+  let saveCount = 0;
+  const submissions: string[] = [];
+  let releaseRefresh: () => void = () => {};
+  const pendingRefresh = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [initial] } },
+  });
+  page.on("request", (request) => {
+    if (request.method() === "POST" && /\/(script-plan|production\/videos)$/.test(new URL(request.url()).pathname)) submissions.push(request.url());
+  });
+  await page.route("**/api/v1/projects/demo/workflow-status?episode=1", async (route) => {
+    if (holdRefresh) {
+      refreshWaiting = true;
+      await pendingRefresh;
+    }
+    await route.fulfill({ json: productionWorkflow() });
+  });
+  await page.route("**/api/v1/projects/demo/episodes/1/production", (route) => route.fulfill({ json: videoActive
+    ? { episode: 1, status: "active", stage: "videos", action: "videos", members: [{ unit_id: "E1U1", status: "running" }] }
+    : { episode: 1, status: "idle", stage: null } }));
+  await page.route("**/api/v1/projects/demo/reference-videos/episodes/1/units/E1U1", async (route) => {
+    expect(route.request().method()).toBe("PATCH");
+    saveCount++;
+    saved = { ...initial, text: route.request().postDataJSON().prompt };
+    api.override({ "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [saved] } } });
+    await route.fulfill({ json: { unit: saved } });
+  });
+  await page.goto("/app/make/demo?step=videos&episode=1");
+  const prompt = page.getByRole("textbox", { name: "视频提示词", exact: true });
+  const footer = page.locator("footer");
+  const generate = footer.getByRole("button", { name: "确认生成视频", exact: true });
+  const generateOne = page.getByRole("button", { name: "确认提示词并生成当前视频", exact: true });
+  await expect(generate).toBeEnabled();
+  await expect(generateOne).toBeEnabled();
+  await prompt.fill("正在编辑");
+  await expect(prompt).toBeFocused();
+  holdRefresh = true;
+  try {
+    await expect.poll(() => refreshWaiting, { timeout: 8000 }).toBe(true);
+    await expect(generate).toBeDisabled();
+    await expect(generateOne).toBeDisabled();
+    await expect(footer).not.toContainText("加载中");
+    await expect(prompt).toBeEditable();
+    await expect(prompt).toBeFocused();
+    await prompt.press("End");
+    await prompt.pressSequentially("123");
+    await expect(prompt).toHaveValue("正在编辑123");
+    await page.getByRole("button", { name: "保存", exact: true }).click();
+    await expect.poll(() => saveCount).toBe(1);
+    expect(saved.text).toBe("正在编辑123");
+  } finally {
+    holdRefresh = false;
+    releaseRefresh();
+  }
+  await expect(prompt).toHaveValue("正在编辑123");
+  await expect(generate).toBeEnabled();
+  videoActive = true;
+  await expect(prompt).toBeDisabled({ timeout: 8000 });
+  await expect(generate).toBeDisabled();
+  expect(submissions).toEqual([]);
+});
+
 test("refreshing a running batch never submits paid generation", async ({ page, api }) => {
   const paid: string[] = [];
   page.on("request", (request) => { if (request.method() === "POST" && /\/production\/(videos|assets)$/.test(request.url())) paid.push(request.url()); });
@@ -897,12 +965,12 @@ test("video progress follows existing tasks, refreshes without resubmission and 
   const cards = page.getByRole("article");
   await expect(progress.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "0");
   await expect(progress).toContainText("生成中 2 · 排队 1 · 失败 1 · 待生成 0");
-  await expect(cards.nth(0).getByRole("status")).toContainText("正在生成视频");
-  await expect(cards.nth(0).getByRole("status")).toContainText("已运行");
-  await expect(cards.nth(1).getByRole("status")).toContainText("排队中");
-  await expect(cards.nth(1).getByRole("status")).toContainText("已等待");
+  await expect(cards.nth(0).getByRole("status").filter({ hasText: "正在生成视频" })).toBeVisible();
+  await expect(cards.nth(0).getByRole("status").filter({ hasText: "已运行" })).toBeVisible();
+  await expect(cards.nth(1).getByRole("status").filter({ hasText: "排队中" })).toBeVisible();
+  await expect(cards.nth(1).getByRole("status").filter({ hasText: "已等待" })).toBeVisible();
   await expect(cards.nth(2).locator("video")).toHaveCount(1);
-  await expect(cards.nth(2).getByRole("status")).toContainText("正在生成视频");
+  await expect(cards.nth(2).getByRole("status").filter({ hasText: "正在生成视频" })).toBeVisible();
   await expect(cards.nth(3).getByRole("alert")).toHaveText("供应商生成失败");
   await expectReachableLayout(page);
   await expectAccessible(page);
@@ -913,7 +981,7 @@ test("video progress follows existing tasks, refreshes without resubmission and 
     "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, action: "videos", status: "active", stage: "videos", members: videoTasks.map((task) => ({ unit_id: task.resource_id, task_id: task.task_id, status: "succeeded" })) } },
   });
   await expect(progress.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "4", { timeout: 10000 });
-  await expect(cards.nth(0).getByRole("status")).toHaveText("视频已完成");
+  await expect(cards.nth(0).getByRole("status").filter({ hasText: "视频已完成" })).toBeVisible();
   const completedTasks = videoTasks.map((task) => ({ ...task, status: "succeeded", error_message: null, finished_at: "2026-01-01T08:00:00", updated_at: "2026-01-01T08:00:00" }));
   api.override({
     "GET /api/v1/tasks?page_size=200&project_name=demo": { status: 200, body: { items: completedTasks, total: 4 } },
@@ -921,7 +989,7 @@ test("video progress follows existing tasks, refreshes without resubmission and 
     "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: videoUnits.map((item) => ({ ...item, generated_assets: { video_clip: "reference_videos/E1U1.mp4" } })), unit_capabilities: {} } },
   });
   await expect(progress.getByRole("status")).toHaveText("视频已就绪，正在合成成片…", { timeout: 10000 });
-  await expect(cards.nth(3).getByRole("status")).toContainText("视频已完成", { timeout: 10000 });
+  await expect(cards.nth(3).getByRole("status").filter({ hasText: "视频已完成" })).toBeVisible({ timeout: 10000 });
   await expect(cards.nth(3).getByRole("alert")).toHaveCount(0);
   expect(posts).toEqual([]);
 });
@@ -948,7 +1016,7 @@ test("legacy multi-episode links open episode selection without generation", asy
   await expect(page.getByRole("heading", { name: "第 1 集 · 初遇" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "第 2 集 · 重逢" })).toBeVisible();
   const links = page.getByRole("link", { name: "继续制作", exact: true });
-  await expect(links.nth(1)).toHaveAttribute("href", "/app/make/demo?step=script&episode=2");
+  await expect(links.nth(1)).toHaveAttribute("href", "/app/make/demo?episode=2");
   await waitForEntrance(page.locator("main"));
   await expectAccessible(page);
   await expectReachableLayout(page);
@@ -969,6 +1037,51 @@ test("selected episode source survives reload and all step links preserve identi
   await page.getByRole("link", { name: "项目管理", exact: true }).click();
   await page.getByRole("link", { name: "继续制作", exact: true }).nth(1).click();
   await expect(page.getByRole("textbox", { name: "单集剧本", exact: true })).toHaveValue("第二集：重逢，人物再次相见。");
+});
+
+test("continue production restores a saved unconfirmed breakdown without submitting another task", async ({ page, api }) => {
+  const state = { episode: 1, content_mode: "drama", status: "pending_review", fingerprint: "saved", quarantine: null, content: { units: [{ ...unit, text: "已保存的拆解内容", source_text: "阿明说：你好" }], new_assets: [] } };
+  api.override({ ...multiBase,
+    "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: state },
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: { ...workflowFixture, content: { ...workflowFixture.content, formal_script: "absent" } } },
+  });
+  const writes: string[] = [];
+  page.on("request", (request) => { if (request.method() !== "GET" && request.url().includes("/api/")) writes.push(request.url()); });
+  const reopen = async () => {
+    await page.getByRole("link", { name: "继续制作", exact: true }).first().click();
+    await expect(page.getByRole("heading", { name: "拆解", exact: true })).toBeVisible();
+    await expect(page.getByRole("textbox", { name: "单元 1 内容", exact: true })).toHaveValue("已保存的拆解内容");
+    await expect(page.getByRole("button", { name: "开始拆解", exact: true })).toHaveCount(0);
+  };
+  await page.goto("/app/projects/demo");
+  await reopen();
+  await page.getByRole("link", { name: "项目管理", exact: true }).click();
+  await reopen();
+  await page.reload();
+  await expect(page.getByRole("textbox", { name: "单元 1 内容", exact: true })).toHaveValue("已保存的拆解内容");
+  expect(writes).toEqual([]);
+});
+
+test("continue production and saved script links reuse an already confirmed breakdown", async ({ page, api }) => {
+  const workflow = productionWorkflow();
+  const source = "阿明说：你好";
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: { ...workflow, target: { ...workflow.target, source: "source/episode_1.txt" }, content: { ...workflow.content, episode_source: "present" } } },
+    "GET /api/v1/projects/demo/source/episode_1.txt": { status: 200, body: source },
+    "GET /api/v1/projects/demo/episodes/1/script-review": { status: 200, body: { episode: 1, content_mode: "drama", status: "confirmed", fingerprint: "confirmed", quarantine: null, content: { units: [{ ...unit, source_text: source }], new_assets: [] } } },
+  });
+  const taskWrites: string[] = [];
+  page.on("request", (request) => { if (request.method() === "POST" && /\/(script-plan|prompt-authoring|production\/(source|assets|videos))$/.test(request.url())) taskWrites.push(request.url()); });
+  await page.goto("/app/projects/demo");
+  await page.getByRole("link", { name: "继续制作", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "视频", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "开始拆解", exact: true })).toHaveCount(0);
+  await page.goto("/app/make/demo?step=script&episode=1");
+  await expect(page.getByRole("textbox", { name: "单集剧本", exact: true })).toHaveValue(source);
+  await page.getByRole("button", { name: "查看已有拆解", exact: true }).click();
+  await expect(page).toHaveURL(/step=breakdown&episode=1$/);
+  await expect(page.getByRole("button", { name: "编辑 · 拆解", exact: true })).toBeVisible();
+  expect(taskWrites).toEqual([]);
 });
 
 test("an active video in episode one leaves episode two source editable", async ({ page, api }) => {
@@ -1164,77 +1277,6 @@ test("starting breakdown with a saved source submits its displayed revision", as
   expect((await submitted).postDataJSON()).toEqual({ expected_source_revision: revision });
 });
 
-test("manual clip and caption edits persist and export locally", async ({ page, api }) => {
-  const recordedEdit = recorded<import("../../src/types/production.js").ProductionEdit>("project-demo-production-edit.json");
-  let edit = { ...recordedEdit, media: { E1U1: { version: 1, duration_us: 2000000 }, E1U2: { version: 1, duration_us: 2000000 } }, subtitle_drafts: {}, issues: [] };
-  let savedOperations: Record<string, unknown>[] = [];
-  const posts: string[] = [];
-  api.override({ ...productionBase,
-    "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "completed", stage: "render", timeline_id: edit.timeline_id, output: { status: "current", artifact_path: "renders/final.mp4", version: 2 } } },
-    "POST /api/v1/projects/demo/episodes/1/production/render": { status: 200, body: { episode: 1, status: "active", stage: "render" } },
-  });
-  await page.route("**/api/v1/projects/demo/episodes/1/production/edit", async (route) => {
-    if (route.request().method() === "PUT") {
-      const body = route.request().postDataJSON() as { base_revision: number; operations: Record<string, unknown>[] };
-      expect(body.base_revision).toBe(edit.revision);
-      savedOperations = body.operations;
-      const clips = structuredClone(edit.clips);
-      for (const op of body.operations) {
-        const clip = clips.find((c) => c.id === op.clip)!;
-        if (op.op === "set_subtitles") clip.subtitles = op.subtitles as typeof clip.subtitles;
-        if (op.op === "set_volume") clip.source_volume = Number(op.volume);
-        if (op.op === "set_trim") { const trim = op.trim as { source_in: number; source_out: number }; clip.trim = { in_us: trim.source_in * 1e6, out_us: trim.source_out * 1e6, basis_version: 1 }; }
-        if (op.op === "set_included") clip.included = Boolean(op.included);
-        if (op.op === "move") { clips.splice(clips.indexOf(clip), 1); clips.splice(op.after ? clips.findIndex((c) => c.id === op.after) + 1 : 0, 0, clip); }
-      }
-      edit = { ...edit, revision: edit.revision + 1, clips };
-    }
-    await route.fulfill({ json: edit });
-  });
-  // The saved timeline preview uses source audio even if the project once used TTS.
-  await page.route(`**/api/v1/projects/demo/edit-timelines/${edit.timeline_id}`, (route) => route.fulfill({ json: {
-    timeline: { id: edit.timeline_id, name: "人工初剪", episode: 1 }, revision: edit.revision, latest_revision: edit.revision,
-    duration: edit.duration, bgm: [], issues: [], clips: edit.clips.filter((c) => c.included !== false).map((c, index) => ({
-      id: c.id, unit_id: c.unit_id, status: "ready", start: index * 2, duration: 2, source_duration: 2,
-      video_version: 1, trim: null, source_volume: c.source_volume, hold: 0, carries_narration: false,
-      narration: null, reason: null, transition_to_next: null,
-    })),
-  } }));
-  await page.route(`**/api/v1/projects/demo/edit-timelines/${edit.timeline_id}/preview-media?narration=without_narration`, (route) => route.fulfill({ json: {
-    timeline_id: edit.timeline_id, revision: edit.revision, narration: "without_narration", bgm: [],
-    units: edit.clips.map((c) => ({ unit_id: c.unit_id, provider_audio: true, narration_audio: null, subtitles_follow_narration: false, subtitles: [] })),
-  } }));
-  page.on("request", (request) => { if (request.method() === "POST" && !request.url().endsWith("/prompt-preview")) posts.push(new URL(request.url()).pathname); });
-  await page.goto("/app/make/demo?step=output&episode=1");
-  await page.getByRole("button", { name: "编辑成片", exact: true }).click();
-  await expect(page.getByText("配乐（可选）", { exact: true })).toBeVisible();
-  await expect(page.getByText("请先在模型配置中配置 MiniMax API Key。", { exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "增加字幕", exact: true }).click();
-  await page.getByRole("textbox", { name: "字幕 1", exact: true }).fill("人工修改的字幕");
-  await page.getByRole("spinbutton", { name: "开始秒数 1", exact: true }).fill("0.2");
-  await page.getByRole("spinbutton", { name: "结束秒数 1", exact: true }).fill("0.8");
-  await page.getByRole("combobox", { name: "位置 1", exact: true }).selectOption("top");
-  await page.getByRole("button", { name: "静音", exact: true }).click();
-  await page.getByRole("spinbutton", { name: "出点（源视频秒）", exact: true }).fill("1");
-  await page.getByRole("button", { name: "下移", exact: true }).first().click();
-  await page.getByRole("button", { name: "保存剪辑草稿", exact: true }).click();
-  await expect.poll(() => edit.revision).toBe(recordedEdit.revision + 1);
-  expect(savedOperations.map((op) => op.op)).toEqual(expect.arrayContaining(["move", "set_trim", "set_volume", "set_subtitles"]));
-  await page.reload();
-  await page.getByRole("button", { name: "编辑成片", exact: true }).click();
-  await page.getByRole("button", { name: "E1U1", exact: true }).click();
-  await expect(page.getByRole("textbox", { name: "字幕 1", exact: true })).toHaveValue("人工修改的字幕");
-  await expect(page.getByRole("spinbutton", { name: "出点（源视频秒）", exact: true })).toHaveValue("1");
-  await expectReachableLayout(page);
-  await waitForEntrance(page.getByRole("main"));
-  await expectAccessible(page);
-  await page.getByRole("textbox", { name: "字幕 1", exact: true }).fill("直接保存并导出的字幕");
-  await page.getByRole("button", { name: "保存并重新导出", exact: true }).click();
-  await expect.poll(() => posts.includes("/api/v1/projects/demo/episodes/1/production/render")).toBe(true);
-  expect(posts.filter((path) => /\/production\/(videos|assets|music)$/.test(path))).toEqual([]);
-});
-
-
 test("breakdown adds a fully prompted asset and removes visual references without losing dialogue", async ({ page, api }) => {
   let content = { units: [{ ...unit, text: "@[阿明]走入画面。@[阿明]：{你好。}", source_text: "阿明：你好。" }], new_assets: [{ type: "character", name: "阿明", description: "青年", decision: "register", reason: "主角", aliases: [], target: "", asset_name: "", generation_prompt: "" }] };
   api.override({ ...productionBase, "GET /api/v1/projects/demo": { status: 200, body: { ...projectFixture, project: { ...projectFixture.project, generation_mode: "reference_video", characters: {}, scenes: {}, props: {} } } } });
@@ -1306,6 +1348,7 @@ test("manual video text survives body edits and reload until explicitly restored
   await expect.poll(() => savedUnit.generation_prompt).toBe("");
   expect(savedUnit.text).toBe("@[阿明]抬头。@[阿明]{你好}");
   expect(writes).toEqual([]);
+  await page.mouse.move(0, 0);
   await expectReachableLayout(page);
   await expectAccessible(page);
 });
@@ -1629,6 +1672,52 @@ test("character angle crop uploads only the selected pixels with no generation c
   expect(paid).toEqual([]);
 });
 
+test("16 video cards bound preview concurrency and reuse previews across unchanged polling", async ({ page, api }) => {
+  const units = Array.from({ length: 16 }, (_, i) => ({ ...unit, unit_id: `E1U${i + 1}` }));
+  api.override({ ...productionBase,
+    "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units } },
+  });
+  let reads = 0;
+  let activePreviews = 0;
+  let maxActivePreviews = 0;
+  let projectChange = false;
+  const calls: string[] = [];
+  const writes: string[] = [];
+  page.on("request", (request) => {
+    if (request.method() === "POST" && /\/(script-plan|production\/videos)$/.test(new URL(request.url()).pathname)) writes.push(request.url());
+  });
+  await page.route("**/api/v1/projects/demo/workflow-status?episode=1", async (route) => {
+    reads++;
+    await route.fulfill({ json: { ...productionWorkflow(), project_revision: projectChange ? "changed" : "original" } });
+  });
+  await page.route("**/api/v1/projects/demo", (route) => route.fulfill({ json: {
+    ...projectFixture,
+    project: { ...projectFixture.project, content_mode: "drama", generation_mode: "reference_video" },
+    asset_fingerprints: reads % 2 === 0 ? { "characters/a.png": 10, "characters/b.png": 20 } : { "characters/b.png": 20, "characters/a.png": 10 },
+  } }));
+  await page.route("**/reference-videos/episodes/1/units/*/prompt-preview", async (route) => {
+    calls.push(route.request().url().split("/").at(-2)!);
+    maxActivePreviews = Math.max(maxActivePreviews, ++activePreviews);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    activePreviews--;
+    await route.fulfill({ json: { text: unit.text, creative_text: unit.text, references: [], unavailable: null, problems: [] } });
+  });
+  await page.goto("/app/make/demo?step=videos&episode=1");
+  await expect(page.getByRole("textbox", { name: "视频提示词", exact: true })).toHaveCount(16);
+  await expect.poll(() => calls.length).toBe(16);
+  await expect.poll(() => reads, { timeout: 12_000 }).toBeGreaterThanOrEqual(3);
+  await expect(page.getByRole("button", { name: "确认生成视频", exact: true })).toBeEnabled();
+  expect(calls).toHaveLength(16);
+  expect(new Set(calls).size).toBe(16);
+  expect(maxActivePreviews).toBeLessThanOrEqual(3);
+
+  // Actual project/model/reference changes still invalidate the saved previews.
+  projectChange = true;
+  await expect.poll(() => calls.length, { timeout: 12_000 }).toBe(32);
+  expect(maxActivePreviews).toBeLessThanOrEqual(3);
+  expect(writes).toEqual([]);
+});
+
 test("creative prompt typing retains focus and preview failures stay visible", async ({ page, api }) => {
   api.override({ ...productionBase,
     "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [{ ...unit, text: "原始框架" }] } },
@@ -1643,6 +1732,7 @@ test("creative prompt typing retains focus and preview failures stay visible", a
   await page.goto("/app/make/demo?step=videos&episode=1");
   const creative = page.getByRole("textbox", { name: "视频提示词", exact: true });
   await expect(creative).toHaveValue("原始框架");
+  await expect.poll(() => calls).toBe(1);
   await creative.focus();
   await creative.evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(node.value.length, node.value.length));
   for (const key of ["a", "b", "c"]) {
@@ -1659,6 +1749,10 @@ test("creative prompt typing retains focus and preview failures stay visible", a
   await expect(page.getByRole("alert").filter({ hasText: "预览暂不可用" })).toBeVisible();
   await expect(page.getByRole("button", { name: "确认提示词并生成当前视频", exact: true })).toBeDisabled();
   await expect(creative).toBeVisible();
+  fail = false;
+  await page.getByRole("article").getByRole("button", { name: "重试", exact: true }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "预览暂不可用" })).toHaveCount(0);
+  await expect(creative).toHaveValue("原始框架d");
 });
 
 test("replanning confirms the listed overwrite revision and refreshes conflicts before retry", async ({ page, api }) => {
@@ -1720,13 +1814,11 @@ test("late video submission stays on the destination after leaving the episode",
 
 
 test("Jianying handoff is explicit, resumes after exit and keeps MP4 and new versions independent", async ({ page, api }) => {
-  const edit = recorded<import("../../src/types/production.js").ProductionEdit>("project-demo-production-edit.json");
   let delivery: import("../../src/types/jianying-delivery.js").JianyingDelivery | null = null;
   const submitted: Record<string, unknown>[] = [];
   let fail = false;
   api.override({ ...productionBase,
-    "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "completed", stage: "render", timeline_id: edit.timeline_id, output: { status: "current", artifact_path: "renders/final.mp4", version: 2 } } },
-    "GET /api/v1/projects/demo/episodes/1/production/edit": { status: 200, body: edit },
+    "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "completed", stage: "render", timeline_id: "tl-recorded", output: { status: "current", artifact_path: "renders/final.mp4", version: 2 } } },
   });
   await page.route("**/api/v1/projects/demo/episodes/1/production/jianying", async (route) => {
     if (route.request().method() === "POST") {
@@ -1740,6 +1832,9 @@ test("Jianying handoff is explicit, resumes after exit and keeps MP4 and new ver
   await page.goto("/app/make/demo?step=output&episode=1");
   const card = page.getByRole("region", { name: "剪映草稿", exact: true });
   await expect(card.getByRole("button", { name: "在剪映建立草稿", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "编辑成片", exact: true })).toHaveCount(0);
+  await expect(page.getByText("配乐（可选）", { exact: true })).toHaveCount(0);
+  await expect(page.locator("video")).toHaveAttribute("src", /renders\/final\.mp4/);
   await card.getByRole("button", { name: "刷新状态", exact: true }).click();
   expect(submitted).toHaveLength(0);
   await card.getByRole("button", { name: "在剪映建立草稿", exact: true }).click();
@@ -1795,6 +1890,7 @@ test("timeline problems keep manual text editable and block generation until exp
   await expect.poll(() => saved.generation_prompt).toBe("");
   await expect(page.getByRole("button", { name: "确认生成视频", exact: true })).toBeEnabled();
   expect(writes).toEqual([]);
+  await page.mouse.move(0, 0);
   await expectReachableLayout(page);
   await expectAccessible(page);
 });

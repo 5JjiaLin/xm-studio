@@ -55,7 +55,7 @@ from lib.script.script_editor import ScriptEditError, new_item_id
 from lib.speech.speech_composition import admit_script_unit, refresh_video_unit_replan_state
 from server.auth import CurrentUser
 from server.error_handlers import script_edit_detail
-from server.i18n import DisplayNamesCatalog, Translator
+from server.i18n import DisplayNamesCatalog, Translator, request_display_names
 from server.routers._batch_admission import enqueue_failure_payload, localized_admission_payload
 from server.routers._script_edits import execute_current_episode_edit, require_script_edit_result
 from server.routers._validators import reject_retired_query_params
@@ -531,7 +531,7 @@ async def preview_unit_prompt(
     unit_id: str,
     req: UnitPromptPreviewRequest,
     _t: Translator,
-    names: DisplayNamesCatalog,
+    request: Request,
 ) -> dict[str, Any]:
     """按草稿正文投影并渲染，不保存、不入队。"""
     project, script, _sf = await _read_episode_script(project_name, episode, _t)
@@ -545,6 +545,10 @@ async def preview_unit_prompt(
         unit=unit,
         project_path=project_path,
     )
+    # Projection queries model/provider facts in its own sessions. Load names
+    # afterwards in a short session so parallel previews never hold a connection
+    # for localization while waiting for a second one for projection.
+    names = await request_display_names(request)
     return await asyncio.to_thread(
         render_reference_prompt_preview,
         project=project,

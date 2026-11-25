@@ -19,3 +19,7 @@ class ApiKey(TimestampMixin, UserOwnedMixin, Base):
     key_prefix: Mapped[str] = mapped_column(String, nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # NULL marks a legacy shared credential; never promote it into an employee key.
+    employee_session_version: Mapped[int | None] = mapped_column(Integer)
+    project_id: Mapped[str | None] = mapped_column(String)
+    project_permission: Mapped[str | None] = mapped_column(String)

@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import httpx
 from openai import OpenAI
 from volcenginesdkarkruntime._exceptions import ArkAPIConnectionError, ArkAPIStatusError
 
 from lib.backends.ark_shared import ark_base_url, create_ark_client, resolve_ark_api_key
+from lib.backends.openai_shared import OPENAI_TEXT_TIMEOUT
 from lib.backends.providers import PROVIDER_ARK
 from lib.backends.text_backends.base import (
     TextCapability,
@@ -60,7 +62,13 @@ class ArkTextBackend:
         resolved_key = resolve_ark_api_key(api_key)
         effective_base_url = ark_base_url(base_url)
         self._client = create_ark_client(api_key=resolved_key, base_url=effective_base_url, max_retries=0)
-        self._openai_client = OpenAI(base_url=effective_base_url, api_key=resolved_key, max_retries=0)
+        # Keep SDK 3 on the project's httpx transport so fallback errors use the
+        # same retry classification and outbound interception as native calls.
+        self._openai_client = OpenAI(
+            base_url=effective_base_url, api_key=resolved_key, max_retries=0,
+            timeout=OPENAI_TEXT_TIMEOUT,
+            http_client=httpx.Client(timeout=OPENAI_TEXT_TIMEOUT, follow_redirects=True),
+        )
         self._model = model or DEFAULT_MODEL
         self._capabilities: set[TextCapability] = self._resolve_capabilities()
 

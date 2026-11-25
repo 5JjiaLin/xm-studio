@@ -14,6 +14,7 @@ from server.tool_runtime import (
 
 GET_WORKFLOW_PLAN = ToolDeclaration(
     name="get_workflow_plan",
+    access="read",
     description=(
         "读取项目的权威制作计划：内容现状、各 AI 操作的准入 status.operations、有序步骤、阻断原因、数据问题、"
         "活动任务观测、视频准入与建议的下一动作 next_action。每一步动手前先读它：用户点名的操作在 "
@@ -30,6 +31,7 @@ GET_WORKFLOW_PLAN = ToolDeclaration(
 
 GET_VIDEO_CAPABILITIES = ToolDeclaration(
     name="get_video_capabilities",
+    access="read",
     description=(
         "查询项目当前视频模型的能力（model 粒度：供应商、模型、支持的时长等）与项目偏好，并给出按项目生成模式"
         "定轴的时长约束 duration_constraints；全项目同一口径，无需指定剧集。参考生视频项目另含 "
@@ -44,6 +46,7 @@ GET_VIDEO_CAPABILITIES = ToolDeclaration(
 
 GET_PROMPT_PREVIEW = ToolDeclaration(
     name="get_prompt_preview",
+    access="read",
     description=(
         "读取一个分镜条目最终会送进图像 / 视频模型的提示词文本，与执行路径同一渲染出口，逐字等于生成时实际"
         "发出的提示词；某一侧提示词尚待生成或为空时，该侧带稳定的 unavailable 原因码而不是文本。"

@@ -613,9 +613,12 @@ class TestConfirmMaterializesScript:
         assert unit["source_text"] == planned["source_text"]
         assert unit["pending_authoring"] is True
 
-    async def test_screenplay_confirm_rejects_incomplete_video_unit_coverage(self, tmp_path, video_request_facts):
+    @pytest.mark.parametrize("missing_dialogue", [False, True])
+    async def test_screenplay_coverage_is_advisory_but_dialogue_still_blocks(self, tmp_path, video_request_facts, missing_dialogue):
         pm = _make_project(tmp_path, "drama", generation_mode="reference_video")
-        source = "Episode 1\n\n1-1 NIGHT — INT. HALL\n\n△阿离推开石门。\n\n阿离：你是谁？\n\n△阿离退到柱边。"
+        source = "Episode 1\n\n1-1 NIGHT — INT. HALL\n\n△阿离推开石门。\n\n△阿离退到柱边。"
+        if missing_dialogue:
+            source += "\n阿离：你是谁？"
         set_episode_source_text(pm, "demo", 1, source, source_kind="screenplay")
         _write_rv_script_plan(
             pm,
@@ -631,8 +634,15 @@ class TestConfirmMaterializesScript:
             },
         )
 
-        with pytest.raises(ScriptReviewError, match="拆解原文锚遗漏"):
-            await _service(pm).confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
+        service = _service(pm)
+        state = await service.get_state("demo", 1)
+        assert state["coverage_advisory_mode"] and "7: △阿离退到柱边。" in state["coverage_advisories"]
+        if missing_dialogue:
+            with pytest.raises(ScriptReviewError, match="对白"):
+                await service.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
+        else:
+            confirmed = await service.confirm("demo", 1, plan_fingerprint=_review_fingerprint(pm))
+            assert confirmed["status"] == "confirmed" and confirmed["coverage_advisories"] == state["coverage_advisories"]
 
     @pytest.mark.parametrize("decision", ["register", "merge", "derivative", "skip"])
     async def test_screenplay_confirm_checks_speakers_using_final_new_asset_identity(

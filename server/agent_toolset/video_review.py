@@ -16,6 +16,7 @@ from server.media_tools.video_review import (
 
 INSPECT_VIDEO_UNITS = ToolDeclaration(
     name="inspect_video_units",
+    access="read",
     description=(
         "看视频单元的画面：为每个视频单元的一个视频版本抽帧、拼成联系表，联系表作为图片内容块附在结果后面。"
         "只读，不收费。用来判断素材能否使用、哪里崩坏、候选版本孰优，以及入出点落在哪一帧。"

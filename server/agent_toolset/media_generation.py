@@ -84,6 +84,7 @@ def generation_tool(
 
 LIST_PENDING_ASSETS = ToolDeclaration(
     name="list_pending_assets",
+    access="read",
     description=(
         "列出项目中尚无资产图的角色、场景、道具与商品（名称与描述摘要）；type 省略则汇总全部类型。只读，无副作用。"
         "项目数据升级失败时返回 project_migration_failed problem；按其明细修复后调用 retry_project_migration。"

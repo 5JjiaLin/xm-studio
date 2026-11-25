@@ -7,7 +7,7 @@
 凭证只经 ``Authorization`` header 传递，不接受 query param 形态的会话凭证。
 浏览器原生请求（``<img>`` / ``<video>`` src 与原生下载导航）带不了该 header：
 - 导出下载端点使用短时效下载 token（``purpose=download``）作为 query param 唯一认证方式
-- 静态媒体文件不要求认证
+- 共享模式静态媒体文件不要求认证；员工模式由 server.media_auth 校验专用媒体 Cookie 和项目成员
 SSE 由前端以 fetch 带 header 消费，与普通受保护端点走同一依赖（见 ``docs/adr/0071``）。
 """
 
@@ -20,7 +20,7 @@ import time
 from collections import OrderedDict
 from datetime import UTC
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import jwt
 from fastapi import Depends, HTTPException
@@ -41,6 +41,14 @@ class CurrentUserInfo(BaseModel):
     id: str
     sub: str
     role: str = "admin"
+    session_version: int | None = None
+    api_key_id: int | None = None
+    project_id: str | None = None
+    project_permission: Literal["read", "write"] | None = None
+
+    @property
+    def project_scoped(self) -> bool:
+        return self.api_key_id is not None or (self.sub == "embedded-agent" and self.project_id is not None)
 
     model_config = ConfigDict(frozen=True)
 
@@ -64,7 +72,14 @@ def is_auth_enabled() -> bool:
 
     ``false`` / ``0`` / ``no`` / ``off`` 一律视为关闭（不区分大小写）。
     """
+    if employee_auth_enabled():
+        return True
     return os.environ.get("AUTH_ENABLED", "true").strip().lower() not in _AUTH_DISABLED_VALUES
+
+
+def employee_auth_enabled() -> bool:
+    """Whether database-backed employee login is the active session mode."""
+    return os.environ.get("EMPLOYEE_AUTH_ENABLED", "false").strip().lower() not in _AUTH_DISABLED_VALUES
 
 
 def warn_if_auth_disabled() -> None:
@@ -192,6 +207,34 @@ def create_token(username: str, *, expiry_seconds: int = TOKEN_EXPIRY_SECONDS) -
     return jwt.encode(payload, get_token_secret(), algorithm="HS256")
 
 
+def create_employee_token(user_id: str, username: str, session_version: int) -> str:
+    """Issue a session bound to one database employee and its revocation version."""
+    now = time.time()
+    payload = {
+        "sub": username,
+        "uid": user_id,
+        "sv": session_version,
+        "iat": now,
+        "exp": now + TOKEN_EXPIRY_SECONDS,
+    }
+    return jwt.encode(payload, get_token_secret(), algorithm="HS256")
+
+
+def create_employee_agent_token(user: CurrentUserInfo, *, expiry_seconds: int = 900) -> str:
+    """Delegate one employee/project to an embedded connection; never a login."""
+    from lib.project.identity import validate_project_id
+
+    validate_project_id(user.project_id)
+    if type(user.session_version) is not int:
+        raise ValueError("employee session version required")
+    now = time.time()
+    return jwt.encode(
+        {"sub": EMBEDDED_AGENT_SUB, "via": "embedded", "uid": user.id, "sv": user.session_version,
+         "project_id": user.project_id, "iat": now, "exp": now + expiry_seconds},
+        get_token_secret(), algorithm="HS256",
+    )
+
+
 def verify_token(token: str) -> dict | None:
     """验证会话 JWT token
 
@@ -215,7 +258,9 @@ def verify_token(token: str) -> dict | None:
 DOWNLOAD_TOKEN_EXPIRY_SECONDS = 300  # 5 分钟
 
 
-def create_download_token(username: str, project_name: str) -> str:
+def create_download_token(
+    username: str, project_name: str, *, employee: CurrentUserInfo | None = None, project_id: str | None = None
+) -> str:
     """签发短时效下载 token，用于浏览器原生下载认证"""
     now = time.time()
     payload = {
@@ -225,6 +270,12 @@ def create_download_token(username: str, project_name: str) -> str:
         "iat": now,
         "exp": now + DOWNLOAD_TOKEN_EXPIRY_SECONDS,
     }
+    if employee is not None:
+        if employee.session_version is None or project_id is None:
+            raise ValueError("employee downloads require a session version and stable project identity")
+        payload.update(uid=employee.id, sv=employee.session_version, project_id=project_id)
+        if employee.api_key_id is not None:
+            payload["api_key_id"] = employee.api_key_id
     return jwt.encode(payload, get_token_secret(), algorithm="HS256")
 
 
@@ -410,6 +461,8 @@ async def verify_api_key(token: str) -> dict | None:
     内部先查缓存，缓存未命中再查数据库。
     查库成功后更新 last_used_at（后台异步，不阻塞响应）。
     """
+    if employee_auth_enabled():
+        return await _verify_employee_api_key(token)
     key_hash = hash_api_key(token)
 
     # 缓存查询
@@ -427,6 +480,10 @@ async def verify_api_key(token: str) -> dict | None:
 
     if row is None:
         _set_api_key_cache(key_hash, None)
+        return None
+
+    if any(row.get(field) is not None for field in ("employee_session_version", "project_id", "project_permission")):
+        # Employee credentials must not gain shared-admin rights on a mode switch.
         return None
 
     # 检查过期
@@ -465,6 +522,50 @@ async def verify_api_key(token: str) -> dict | None:
     _touch_task.add_done_callback(lambda _: None)  # suppress "never retrieved" warning
 
     return payload
+
+
+async def _verify_employee_api_key(token: str) -> dict | None:
+    """Re-read employee keys without a positive or negative authorization cache."""
+    from datetime import datetime
+
+    from sqlalchemy import select
+
+    from lib.db import async_session_factory
+    from lib.db.models import ApiKey, User
+    from lib.identity.accounts import EMPLOYEE_ROLES
+    from lib.project.identity import validate_project_id
+
+    async with async_session_factory() as session:
+        record = (await session.execute(
+            select(ApiKey, User).join(User, User.id == ApiKey.user_id).where(ApiKey.key_hash == hash_api_key(token))
+        )).one_or_none()
+        if record is None:
+            return None
+        key, user = record
+        if (
+            type(key.employee_session_version) is not int
+            or key.employee_session_version != user.session_version
+            or key.project_permission not in {"read", "write"}
+            or not user.is_active
+            or user.password_hash is None
+            or user.role not in EMPLOYEE_ROLES
+        ):
+            return None
+        try:
+            validate_project_id(key.project_id)
+        except (TypeError, ValueError):
+            return None
+        if key.expires_at is not None:
+            expires = key.expires_at
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=UTC)
+            if datetime.now(UTC) >= expires:
+                return None
+        return {
+            "sub": f"apikey:{key.name}", "via": "apikey", "uid": user.id,
+            "sv": key.employee_session_version, "api_key_id": key.id,
+            "project_id": key.project_id, "project_permission": key.project_permission,
+        }
 
 
 def _verify_and_get_payload(token: str) -> dict:
@@ -519,7 +620,50 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     payload = await _verify_and_get_payload_async(token)
+    if employee_auth_enabled() or "uid" in payload:
+        user = await resolve_employee_user(payload)
+        if payload.get("via") == "apikey":
+            return user.model_copy(update={
+                "sub": payload["sub"], "api_key_id": payload["api_key_id"],
+                "project_id": payload["project_id"], "project_permission": payload["project_permission"],
+            })
+        if payload.get("via") == "embedded":
+            from lib.project.identity import validate_project_id
+
+            try:
+                project_id = validate_project_id(payload.get("project_id"))
+            except ValueError as exc:
+                raise HTTPException(status_code=401, detail="助手项目凭据无效") from exc
+            return user.model_copy(update={
+                "sub": EMBEDDED_AGENT_SUB, "project_id": project_id, "project_permission": "write",
+            })
+        return user
     return _payload_to_user(payload)
+
+
+async def resolve_employee_user(payload: dict) -> CurrentUserInfo:
+    """Resolve an already signature-verified employee credential against current state."""
+    user_id = payload.get("uid")
+    version = payload.get("sv")
+    if not isinstance(user_id, str) or type(version) is not int:
+        raise HTTPException(status_code=401, detail="员工会话无效或已失效")
+    from sqlalchemy import select
+
+    from lib.db import async_session_factory
+    from lib.db.models import User
+    from lib.identity.accounts import EMPLOYEE_ROLES
+
+    async with async_session_factory() as session:
+        user = await session.scalar(select(User).where(User.id == user_id))
+    if (
+        user is None
+        or not user.is_active
+        or user.password_hash is None
+        or user.role not in EMPLOYEE_ROLES
+        or user.session_version != version
+    ):
+        raise HTTPException(status_code=401, detail="员工会话无效或已失效")
+    return CurrentUserInfo(id=user.id, sub=user.username, role=user.role, session_version=user.session_version)
 
 
 # Type aliases for FastAPI dependency injection

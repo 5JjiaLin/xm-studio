@@ -55,6 +55,7 @@ from lib.generation.restart_recovery import InterruptedCallSettler, RestartRecov
 from lib.generation.task_failure import encode_failure
 from lib.generation.task_failure_encoding import encode_task_failure_message
 from lib.generation.video_resume import ResumeExecutor, VideoResumeRunner, fail_task_of_deleted_project
+from lib.infra.server_runtime import runtime
 from lib.project.project_manager import get_project_manager
 from lib.project.task_project_claim import TaskProjectClaim, claim_task_project
 
@@ -496,6 +497,8 @@ class GenerationWorker:
         self._constructed_at = datetime.now(UTC)
         self._startup_settled: bool = False
         self._lease_lost_monotonic: float | None = None
+        self._last_cycle = 0.0
+        self._dispatching = False
 
         self._resume = VideoResumeRunner(
             queue=self.queue,
@@ -539,6 +542,19 @@ class GenerationWorker:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    @property
+    def active_count(self) -> int:
+        return len(self._slots.all_active_tasks()) + int(self._dispatching)
+
+    @property
+    def healthy(self) -> bool:
+        return bool(
+            self._main_task
+            and not self._main_task.done()
+            and self._owns_lease
+            and time.monotonic() - self._last_cycle < max(60, self.lease_ttl * 3)
+        )
+
     async def start(self) -> None:
         if self._main_task and not self._main_task.done():
             return
@@ -570,6 +586,7 @@ class GenerationWorker:
     async def _run_loop(self) -> None:
         try:
             while not self._stop_event.is_set():
+                self._last_cycle = time.monotonic()
                 had_lease = self._owns_lease
                 self._owns_lease = await self.queue.acquire_or_renew_worker_lease(
                     name=self.lease_name,
@@ -583,6 +600,12 @@ class GenerationWorker:
                     logger.warning("失去 worker lease (owner=%s)", self.owner_id)
 
                 await self._drain_finished_tasks()
+
+                # Keep renewing the lease and collecting results while paused. In
+                # particular, restart recovery must not resume paid work here.
+                if runtime.paused:
+                    await self._wait_for_wake(self.poll_interval)
+                    continue
 
                 # Lease 状态变化跟踪：首次失去 lease 时打点；重夺 lease 后判断
                 # 「真切换 owner」（>= 3× ttl）→ 重置开关；「续约 flap」（< 3× ttl）→ 保持。
@@ -603,13 +626,14 @@ class GenerationWorker:
                 # 一次性扫描：进程持 lease 后只扫一次 orphan；后续主循环不再重扫。
                 # 单 lease 互斥保证不会与另一个 worker 同时扫；跨进程接管由上述阈值兜底。
                 if self._owns_lease and not self._orphan_handled_once:
-                    await self._recovery.handle_orphans()
-                    # 首次收口是进程启动：构造时刻之前发起的无任务 pending 行（文本调用、端点试跑）
-                    # 没人接续，一并翻终态。lease 长时间丢失触发的重扫发生在进程存活期间，无任务行
-                    # 可能正在本进程里跑，只收口绑定了任务的行。
-                    await self._recovery.settle_interrupted_calls(
-                        taskless_started_before=None if self._startup_settled else self._constructed_at
-                    )
+                    with runtime.activity("worker_recovery"):
+                        await self._recovery.handle_orphans()
+                        # 首次收口是进程启动：构造时刻之前发起的无任务 pending 行（文本调用、端点试跑）
+                        # 没人接续，一并翻终态。lease 长时间丢失触发的重扫发生在进程存活期间，无任务行
+                        # 可能正在本进程里跑，只收口绑定了任务的行。
+                        await self._recovery.settle_interrupted_calls(
+                            taskless_started_before=None if self._startup_settled else self._constructed_at
+                        )
                     self._startup_settled = True
                     self._orphan_handled_once = True
 
@@ -617,7 +641,11 @@ class GenerationWorker:
                     await self._wait_for_wake(self.heartbeat_interval)
                     continue
 
-                claimed_any = await self._claim_tasks()
+                self._dispatching = True
+                try:
+                    claimed_any = await self._claim_tasks()
+                finally:
+                    self._dispatching = False
 
                 if claimed_any:
                     await asyncio.sleep(0.05)
@@ -661,13 +689,23 @@ class GenerationWorker:
 
         for media_type in self._lanes:
             while True:
+                if runtime.paused or self._stop_event.is_set():
+                    return claimed_any
                 # 每轮重算池满集合：刚 claim 的任务可能让某 provider 进入满状态
                 pool_full = self._pool_full_providers(media_type)
                 task = await self.queue.claim_next_task(media_type=media_type, pool_full_providers=pool_full)
                 if not task:
                     break
 
+                # A pause may have arrived during the queue's database await.
+                if runtime.paused or self._stop_event.is_set():
+                    await self._requeue_single_task(task["task_id"])
+                    return claimed_any
+
                 provider_id, recorded = await self._slot_provider(task, media_type)
+                if runtime.paused or self._stop_event.is_set():
+                    await self._requeue_single_task(task["task_id"])
+                    return claimed_any
                 cap = self._capacity.get(provider_id, media_type)
 
                 if cap <= 0:

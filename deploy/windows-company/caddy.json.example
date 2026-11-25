@@ -1,0 +1,8 @@
+{
+  "executable": "D:/XMStudio/tools/caddy.exe",
+  "sha256": "2622e239c79df700b0eb92cbd950d1edee365e155a7859f358f0e55f002df591",
+  "site_address": "https://xm.internal",
+  "bind_ip": "REPLACE_WITH_CONFIRMED_SERVER_IP",
+  "admin_address": "127.0.0.1:2019",
+  "backend_port": 1242
+}

@@ -269,6 +269,25 @@ describe("ReferenceScriptPlanPreviewPanel", () => {
     expect(screen.queryByText("raw agent message")).not.toBeInTheDocument();
   });
 
+  it("keeps the draft and repair action visible when a violation points to source dialogue", async () => {
+    const state = quarantinedState();
+    state.quarantine!.violations = [{
+      code: "screenplay_speaker_attribution",
+      label: "unit E1U01",
+      message: "unit E1U01：原文第 24 行 D0024 应由群众乙发声，当前为无主旁白。",
+      line: null,
+      locations: [{ source_line: 24, dialogue_id: "D0024" }],
+      item_index: 0,
+    }];
+    vi.spyOn(API, "getScriptReview").mockResolvedValue(state);
+
+    render(<ReferenceScriptPlanPreviewPanel projectName="p" episode={1} lookup={LOOKUP} />);
+
+    expect(await screen.findByText(/视频单元 1：原文第 24 行 D0024/)).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "视频单元 1" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "AI 修复" })).toBeEnabled();
+  });
+
   // 场景引用提示：与解析预览面板同判据，落在 unit 卡内，不阻断确认。
   it("warns on units that reference no scene while the project registers scene assets", async () => {
     const state = pendingState();

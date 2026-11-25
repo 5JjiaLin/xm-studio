@@ -2,6 +2,7 @@
 
 import pytest
 
+from lib.db.models.user import User
 from server.agent_runtime.session_store import SessionMetaStore
 
 
@@ -75,3 +76,13 @@ class TestSessionMetaStore:
         """SessionMeta.id 应直接映射 sdk_session_id 值。"""
         session = await store.create(project_name="demo", sdk_session_id="my-sdk-session-42")
         assert session.id == "my-sdk-session-42"
+
+    async def test_owner_is_preserved(self, store):
+        async with store._session_factory() as db:
+            db.add(User(id="employee-1", username="employee-1", role="user"))
+            await db.commit()
+
+        session = await store.create(project_name="demo", sdk_session_id="sdk-owned", user_id="employee-1")
+
+        assert session.user_id == "employee-1"
+        assert (await store.get(session.id)).user_id == "employee-1"

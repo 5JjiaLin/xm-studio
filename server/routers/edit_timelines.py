@@ -45,6 +45,7 @@ from server.auth import CurrentUser, verify_download_token
 from server.dependencies import require_project_migration_ok
 from server.i18n import Translator
 from server.media_tools.final_cuts import final_cut_download_url
+from server.project_access import authorize_project_download
 from server.services.presentation.timeline_preview import TimelinePreviewMedia, TimelinePreviewService
 from server.services.tasks.render_tasks import (
     final_cut_task_request,
@@ -544,13 +545,14 @@ async def download_jianying_draft(
 ) -> FileResponse:
     """下载已登记的剪映草稿：本机草稿目录与剪映版本在此代入，过期的草稿照常可下载。"""
     try:
-        verify_download_token(download_token, project_name)
+        payload = verify_download_token(download_token, project_name)
     except jwt.ExpiredSignatureError as exc:
         raise HTTPException(status_code=401, detail=_t("download_expired")) from exc
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=_t("download_token_mismatch")) from exc
     except jwt.InvalidTokenError as exc:
         raise HTTPException(status_code=401, detail=_t("download_token_invalid")) from exc
+    await authorize_project_download(payload, project_name)
     root = _draft_root(draft_path, _t)
     try:
         package, name = await service.package_download(

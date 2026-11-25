@@ -38,6 +38,9 @@ _INLINE_SPEECH = re.compile(r"(?P<cue>[^:：]+)[:：]\s*(?P<text>\S.*)")
 _NON_SPEAKERS = frozenset({"人物", "出场人物", "角色", "场景", "时间", "地点", "镜头", "动作", "画面"})
 _RECAP_HEADING = re.compile(r"(?:【前情提要】|前情提要)[:：]?")
 _EPISODE_HEADING = re.compile(r"(?:Episode\s+\d+|第[\d一二三四五六七八九十百]+集)", re.IGNORECASE)
+# Require an explicitly labelled production prefix and a paired body/episode boundary.
+_PRODUCTION_HEADING = re.compile(r"(?:制作参考|【制作参考】|[\w· -]{1,60}(?:（制作参考）|\(制作参考\)))[:：]?")
+_BODY_HEADING = re.compile(r"(?:[一二三四五六七八九十百\d]+[、.．]\s*)?剧本正文[:：]?")
 _ACTION = re.compile(r"^(?:[△▲【#]|\s*(?:动作|画面)\s*[:：])")
 
 
@@ -66,20 +69,34 @@ def _cue(raw: str) -> tuple[str, Literal["onscreen", "offscreen", "narration"]] 
     return cue["speaker"].strip(), "offscreen" if re.search(_OFFSCREEN, delivery) else "onscreen"
 
 
+def _leading_context_line_count(lines: Sequence[str]) -> int:
+    """Find a bounded preamble without changing absolute source or dialogue coordinates."""
+    headings = [line.strip().strip("#* ") for line in lines]
+    first = next((heading for heading in headings if heading), "")
+    if _RECAP_HEADING.fullmatch(first):
+        return next((i for i, heading in enumerate(headings) if _EPISODE_HEADING.fullmatch(heading)), 0)
+    if _PRODUCTION_HEADING.fullmatch(first):
+        for i, heading in enumerate(headings):
+            if heading == first:
+                continue
+            if _BODY_HEADING.fullmatch(heading):
+                episode = next((j for j in range(i + 1, len(headings)) if headings[j]), None)
+                return episode if episode is not None and _EPISODE_HEADING.fullmatch(headings[episode]) else 0
+            # Never scan past a prior episode, scene slug or staged action looking for a later boundary.
+            if _ACTION.match(heading) or _METADATA.fullmatch(heading):
+                break
+    return 0
+
+
 def screenplay_source_dialogue(
     source: str, *, include_recap: bool = False
 ) -> tuple[list[SourceDialogue], list[int]]:
     """Extract exact speech fragments; bare Chinese cues need cast or inline evidence."""
     lines = source.splitlines(keepends=True)
-    recap_lines = 0
-    if not include_recap:
-        headings = [line.strip().strip("#* ") for line in lines]
-        first = next((heading for heading in headings if heading), "")
-        if _RECAP_HEADING.fullmatch(first):
-            recap_lines = next((i for i, heading in enumerate(headings) if _EPISODE_HEADING.fullmatch(heading)), 0)
+    context_lines = 0 if include_recap else _leading_context_line_count(lines)
     inlines = [_INLINE_SPEECH.fullmatch(line.strip().lstrip("# ")) for line in lines]
     known = set()
-    for line, match in zip(lines[recap_lines:], inlines[recap_lines:], strict=True):
+    for line, match in zip(lines[context_lines:], inlines[context_lines:], strict=True):
         bare = line.strip()
         if cast := re.fullmatch(r"(?:出场人物|人物|角色)\s*[:：]\s*(.*)", bare):
             known.update(name.strip() for name in re.split(r"[、,，/／]", cast[1]))
@@ -96,7 +113,7 @@ def screenplay_source_dialogue(
         start = offset + len(line) - len(line.lstrip())
         end = start + len(bare)
         offset += len(line)
-        if line_number <= recap_lines:
+        if line_number <= context_lines:
             continue
         if not bare or _ACTION.match(bare) or _METADATA.fullmatch(bare):
             pending = None
@@ -172,14 +189,20 @@ def screenplay_speaker_aliases(
 
 def validate_screenplay_coverage(
     units: Sequence[dict], source: str, *, speaker_aliases: dict[str, str] | None = None, check_dialogue: bool = True,
+    coverage_advisories: list[str] | None = None,
 ) -> list[DraftViolation]:
     """Require narrative anchors and the original ordered dialogue across the episode."""
     from lib.script.prompt_policy import prompt_content_validation_enabled
 
     if not prompt_content_validation_enabled():
         return []
-    lines = [_normal(line) for line in source.splitlines() if _normal(line)]
-    normalized = " ".join(lines)
+    source_lines = source.splitlines(keepends=True)
+    context_lines = _leading_context_line_count(source_lines)
+    lines = [(index, line) for index, raw in enumerate(source_lines) if (line := _normal(raw))]
+    # Keep the full source for locating anchors; only the required coverage changes.
+    normalized = " ".join(line for _, line in lines)
+    raw_body_start = sum(map(len, source_lines[:context_lines]))
+    body_start = sum(len(line) + 1 for i, line in lines if i < context_lines)
     covered = bytearray(len(normalized))
     previous_start = previous_end = 0
     for unit in units:
@@ -187,9 +210,20 @@ def validate_screenplay_coverage(
         if not anchor:
             continue
         # Prefer the next occurrence; overlapping anchors may still share a passage.
-        start = normalized.find(anchor, previous_end)
+        floor = body_start
+        if body_start and (binding := unit.get("source_binding")):
+            if binding.get("end", raw_body_start + 1) <= raw_body_start:
+                continue  # An explicitly bound reference cannot cover an identical body passage.
+            if binding.get("start", raw_body_start) < raw_body_start:
+                floor = 0  # This bound anchor straddles the heading.
+        start = normalized.find(anchor, max(previous_end, floor))
         if start < 0:
-            start = normalized.find(anchor, previous_start)
+            start = normalized.find(anchor, max(previous_start, floor))
+        if start < 0 and body_start and not unit.get("source_binding"):
+            # A legacy, unbound anchor may itself include the end of the preamble.
+            crossing = normalized.find(anchor, previous_start)
+            if 0 <= crossing < body_start < crossing + len(anchor):
+                start = crossing
         if start < 0:
             continue  # The ordinary anchor/order validator reports this separately.
         end = start + len(anchor)
@@ -198,12 +232,15 @@ def validate_screenplay_coverage(
 
     missing: list[str] = []
     offset = 0
-    for line in lines:
+    for index, line in lines:
         bare = line.strip("# *")
-        if not _METADATA.fullmatch(bare) and any(
+        if index >= context_lines and not _METADATA.fullmatch(bare) and any(
             char.isalnum() and not covered[offset + index] for index, char in enumerate(line)
         ):
-            missing.append(line)
+            if coverage_advisories is not None:
+                coverage_advisories.append(f"{index + 1}: {source_lines[index].strip()}")
+            else:
+                missing.append(line)
         offset += len(line) + 1
     issues: list[DraftViolation] = []
     if missing:
@@ -211,7 +248,7 @@ def validate_screenplay_coverage(
         issues.append(
             DraftViolation(
                 f"拆解原文锚遗漏 {len(missing)} 段剧本内容：{excerpts}。"
-                "请按原文顺序补齐对应的视频单元及动作、对白；标题、场次标题和人物名单可不入镜。",
+                "请按原文顺序补齐对应的视频单元及动作、对白；有明确边界的制作参考及集前前情提要、集标题、场次标题和人物名单可不入镜。",
                 code="screenplay_source_coverage",
             )
         )

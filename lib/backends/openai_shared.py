@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 
 import httpx
-from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+from openai import DEFAULT_CONNECTION_LIMITS, DEFAULT_TIMEOUT, AsyncOpenAI
 
 from lib.backends.transport_layer import TransportLayer, layer_async_client
 from lib.config.url_utils import OFFICIAL_OPENAI_BASE_URL
@@ -68,7 +68,8 @@ def create_openai_client(
 
     base_url 为空（None/空白）时显式回填官方端点：AsyncOpenAI 对空 base_url
     会回落读取 OPENAI_BASE_URL 环境变量，环境残留将静默覆盖 DB 配置。base_url
-    的唯一来源是 DB，此处兜死显式值断掉该回落路径。``transport_layer`` 叠在 SDK 默认客户端之上。
+    的唯一来源是 DB，此处兜死显式值断掉该回落路径。显式使用项目的 httpx 客户端，
+    保证 transport 注入、出站测试拦截和连接异常分类使用同一套类型；SDK 3 支持此兼容入口。
     """
     kwargs: dict = {"base_url": (base_url or "").strip() or OFFICIAL_OPENAI_BASE_URL}
     if api_key:
@@ -77,7 +78,14 @@ def create_openai_client(
         kwargs["max_retries"] = max_retries
     if timeout is not None:
         kwargs["timeout"] = timeout
-    if transport_layer is not None:
-        http_client = DefaultAsyncHttpxClient(timeout=timeout) if timeout is not None else DefaultAsyncHttpxClient()
-        kwargs["http_client"] = layer_async_client(http_client, transport_layer)
+    http_client = httpx.AsyncClient(
+        timeout=timeout if timeout is not None else httpx.Timeout(**DEFAULT_TIMEOUT.as_dict()),
+        limits=httpx.Limits(
+            max_connections=DEFAULT_CONNECTION_LIMITS.max_connections,
+            max_keepalive_connections=DEFAULT_CONNECTION_LIMITS.max_keepalive_connections,
+            keepalive_expiry=DEFAULT_CONNECTION_LIMITS.keepalive_expiry,
+        ),
+        follow_redirects=True,
+    )
+    kwargs["http_client"] = layer_async_client(http_client, transport_layer)
     return AsyncOpenAI(**kwargs)

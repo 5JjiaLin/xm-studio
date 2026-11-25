@@ -6,15 +6,18 @@ import json
 
 import httpx
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from lib.backends.text_backends.base import TextCapability, TextGenerationRequest, TextOutputTruncatedError
 from lib.backends.text_backends.openai import OpenAITextBackend
 from lib.backends.text_backends.openai_responses import OpenAIResponsesTextBackend
+from lib.script.script_models import build_reference_units_script_plan_model
 from tests.http_capture import PathPrefixRewrite, capture_http, only_request, request_json
 
 
 class _Script(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     text: str
 
 
@@ -263,5 +266,93 @@ async def test_authoring_raw_response_is_not_retried_or_overwritten(native):
             assert '"minItems": 3' in body['messages'][-1]['content']
         assert result.text.count('"text"') == 2
         assert result.output_tokens == 20
+    finally:
+        await backend._client.close()
+
+
+async def test_plan_with_optional_fields_uses_one_stream_and_preserves_its_schema():
+    schema = build_reference_units_script_plan_model([8], use_source_spans=True)
+    payload = {
+        "units": [{"duration_seconds": 8, "source_span_start": "S001", "source_span_end": "S001", "text": "画面"}]
+    }
+    events = _chat_events()
+    events[1]["choices"][0]["delta"]["content"] = json.dumps(payload, ensure_ascii=False)
+    events[2]["choices"][0]["delta"]["content"] = ""
+    backend = OpenAITextBackend(api_key="test", model="gpt-6.1-sol", base_url="https://relay.test/v1")
+    try:
+        with capture_http() as router:
+            route = router.post("https://relay.test/v1/chat/completions").mock(return_value=_sse(events))
+            result = await backend.generate(
+                TextGenerationRequest(prompt="拆解剧本", response_schema=schema, prefer_stream=True)
+            )
+        body = request_json(only_request(route))
+        assert body["stream"] is True
+        assert "response_format" not in body
+        assert "tools" not in body
+        assert "source_span_start" in body["messages"][0]["content"]
+        content = json.loads(result.text)
+        assert content["new_assets"] == []  # Optional fields keep their business defaults.
+        assert content["units"][0]["source_span_start"] == "S001"
+        assert (result.input_tokens, result.output_tokens) == (50, 20)
+    finally:
+        await backend._client.close()
+
+
+
+async def test_explicit_schema_rejection_keeps_the_fallback_streaming():
+    class ClosedScript(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        text: str
+
+    backend = OpenAITextBackend(api_key="test", model="gpt-6.1-sol", base_url="https://relay.test/v1")
+    try:
+        with capture_http() as router:
+            route = router.post("https://relay.test/v1/chat/completions").mock(
+                side_effect=[
+                    httpx.Response(
+                        400,
+                        json={
+                            "error": {"message": "Invalid schema for response_format", "type": "invalid_request_error"}
+                        },
+                    ),
+                    _sse(_chat_events()),
+                ]
+            )
+            result = await backend.generate(
+                TextGenerationRequest(prompt="拆解", response_schema=ClosedScript, prefer_stream=True)
+            )
+        assert route.call_count == 2
+        bodies = [request_json(call.request) for call in route.calls]
+        assert all(body["stream"] for body in bodies)
+        assert bodies[0]["response_format"]["json_schema"]["strict"] is True
+        assert "response_format" not in bodies[1]
+        assert "tools" not in bodies[1]
+        assert json.loads(result.text) == {"text": "完整提示词"}
+    finally:
+        await backend._client.close()
+
+
+
+async def test_broken_plan_stream_does_not_replay_an_accepted_request():
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b": thinking\n\n"
+            raise httpx.ReadError("upstream disconnected")
+
+    backend = OpenAITextBackend(api_key="test", model="gpt-6.1-sol", base_url="https://relay.test/v1")
+    try:
+        with capture_http() as router:
+            route = router.post("https://relay.test/v1/chat/completions").mock(
+                return_value=httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    stream=BrokenStream(),
+                )
+            )
+            with pytest.raises(httpx.ReadError):
+                await backend.generate(
+                    TextGenerationRequest(prompt="拆解", response_schema=_Script, prefer_stream=True)
+                )
+        assert route.call_count == 1
     finally:
         await backend._client.close()

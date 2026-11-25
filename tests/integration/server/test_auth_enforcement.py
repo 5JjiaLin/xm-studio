@@ -24,6 +24,7 @@ PUBLIC_OPERATIONS = frozenset(
         "GET /health",
         "GET /api/v1/auth/status",
         "POST /api/v1/auth/token",
+        "POST /api/v1/auth/logout",
         "GET /api/v1/files/{project_name}/{path}",
         "GET /api/v1/global-assets/{asset_type}/{filename}",
     }
@@ -131,6 +132,7 @@ def test_public_endpoints_stay_reachable(auth_coverage_client):
     """公开端点不被 router 级依赖误伤。"""
     assert auth_coverage_client.get("/health").status_code == 200
     assert auth_coverage_client.get("/api/v1/auth/status").status_code == 200
+    assert auth_coverage_client.post("/api/v1/auth/logout").status_code == 204
     assert (
         auth_coverage_client.post(
             "/api/v1/auth/token",

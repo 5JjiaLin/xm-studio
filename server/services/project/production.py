@@ -26,6 +26,7 @@ from lib.generation.generation_result import GenerationBatchResult
 from lib.infra.async_thread import run_sync_transaction
 from lib.infra.data_root_layout import list_project_dirs
 from lib.infra.json_io import atomic_write_json
+from lib.infra.server_runtime import runtime
 from lib.jianying_draft.basis import WITHOUT_NARRATION
 from lib.project.project_manager import ProjectManager
 from server.media_tools.assets import GenerateAssetsRequest, generate_assets
@@ -486,24 +487,31 @@ class ProductionService:
 
     async def _run(self):
         while True:
-            batch_projects = await asyncio.to_thread(
-                lambda: [
-                    d.name
-                    for d in list_project_dirs(self.projects.projects_dir)
-                    if (d / "production" / "script_batch.json").is_file()
-                ]
-            )
-            for batch_project in batch_projects:
-                try:
-                    await self.script_batch.advance(batch_project)
-                except Exception:
-                    logger.exception("Cannot advance screenplay batch project=%s", batch_project)
-            for project, episode in await asyncio.to_thread(self._journals):
-                try:
-                    await self.advance(project, episode)
-                except Exception:
-                    logger.exception("Cannot read production journal project=%s episode=%s", project, episode)
+            if runtime.paused:
+                await asyncio.sleep(1)
+                continue
+            with runtime.activity("production_continuation"):
+                await self._advance_journals()
             await asyncio.sleep(2)
+
+    async def _advance_journals(self):
+        batch_projects = await asyncio.to_thread(
+            lambda: [
+                d.name
+                for d in list_project_dirs(self.projects.projects_dir)
+                if (d / "production" / "script_batch.json").is_file()
+            ]
+        )
+        for batch_project in batch_projects:
+            try:
+                await self.script_batch.advance(batch_project)
+            except Exception:
+                logger.exception("Cannot advance screenplay batch project=%s", batch_project)
+        for project, episode in await asyncio.to_thread(self._journals):
+            try:
+                await self.advance(project, episode)
+            except Exception:
+                logger.exception("Cannot read production journal project=%s episode=%s", project, episode)
 
     def start(self):
         self._runner = asyncio.create_task(self._run())

@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 
 from lib.db import safe_session_factory
 from lib.db.base import DEFAULT_USER_ID, utc_now
+from lib.db.models.session import AgentSession
 from lib.db.models.session_event import AgentSessionEventLogEntry
 from lib.db.models.session_message_link import AgentSessionUserMessageLink
 from server.agent_runtime.failure_observation import build_turn_failure_observation
@@ -650,6 +651,12 @@ class EventLogStore:
         self._session_factory = session_factory or safe_session_factory
         self._user_id = user_id
 
+    def for_user(self, user_id: str) -> EventLogStore:
+        """Bind writes to an owner without mutating the shared store."""
+        if user_id == self._user_id:
+            return self
+        return EventLogStore(session_factory=self._session_factory, user_id=user_id)
+
     async def append(
         self,
         session_id: str,
@@ -758,7 +765,9 @@ class EventLogStore:
             return None
         return {"seq": int(row.seq), **row.payload}
 
-    async def find_new_session_by_client_key(self, client_key: str) -> tuple[str, dict[str, Any]] | None:
+    async def find_new_session_by_client_key(
+        self, client_key: str, *, project_name: str | None = None, user_id: str | None = None
+    ) -> tuple[str, dict[str, Any]] | None:
         """跨会话按幂等键定位新会话的受理条目（seq 0），返回 (session_id, 权威条目)。
 
         client_key 唯一索引按 (session_id, client_key) 分区，覆盖不到
@@ -767,13 +776,21 @@ class EventLogStore:
         新会话的首条用户条目落在该位置，常规消息的幂等键不参与匹配。
         """
         async with self._session_factory() as session:
+            stmt = select(
+                AgentSessionEventLogEntry.session_id,
+                AgentSessionEventLogEntry.seq,
+                AgentSessionEventLogEntry.payload,
+            )
+            if project_name is not None:
+                stmt = stmt.join(AgentSession, AgentSession.sdk_session_id == AgentSessionEventLogEntry.session_id)
+            if project_name is not None:
+                stmt = stmt.where(AgentSession.project_name == project_name)
+            if user_id is not None:
+                stmt = stmt.where(AgentSessionEventLogEntry.user_id == user_id)
+                if project_name is not None:
+                    stmt = stmt.where(AgentSession.user_id == user_id)
             result = await session.execute(
-                select(
-                    AgentSessionEventLogEntry.session_id,
-                    AgentSessionEventLogEntry.seq,
-                    AgentSessionEventLogEntry.payload,
-                )
-                .where(
+                stmt.where(
                     AgentSessionEventLogEntry.client_key == client_key,
                     AgentSessionEventLogEntry.seq == 0,
                 )

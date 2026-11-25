@@ -128,7 +128,9 @@ export function useProductionProject(projectName: string | null, requestedEpisod
         setFailure({ projectName, requestedEpisode, message: i18n.t("dashboard:production_project_deleted") });
       },
     });
-    const timer = setInterval(requestRefresh, 3000);
+    // Periodic reads are best effort; don't keep the page in a continuous refresh
+    // loop if one round is slow. Explicit refreshes and events still requeue.
+    const timer = setInterval(() => { if (!running) requestRefresh(); }, 3000);
     return () => {
       clearInterval(timer); controller.abort(); stream.close();
       if (refreshRef.current === requestRefresh) refreshRef.current = () => {};

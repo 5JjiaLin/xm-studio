@@ -4,6 +4,7 @@ Assistant session APIs.
 
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import aclosing
 from typing import Literal
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,9 @@ from server.agent_runtime.session_manager import (
     SessionCapacityError,
     UnrecordedMessageError,
 )
+from server.auth import CurrentUser, CurrentUserInfo, employee_auth_enabled
 from server.i18n import Translator, get_locale
+from server.sse_auth import project_stream_authorizer
 
 router = APIRouter()
 
@@ -77,13 +80,13 @@ def agent_startup_failure_detail(
 
 
 async def _validate_session_ownership(
-    service: AssistantService, session_id: str, project_name: str, _t: Callable[..., str]
+    service: AssistantService, session_id: str, project_name: str, _t: Callable[..., str], current_user: CurrentUserInfo
 ) -> "SessionMeta":
-    """Validate session belongs to the specified project and return it."""
+    """Check project and employee owner before exposing any session state."""
     session = await service.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=_t("session_not_found", session_id=session_id))
-    if session.project_name != project_name:
+    if session.project_name != project_name or (employee_auth_enabled() and session.user_id != current_user.id):
         raise HTTPException(status_code=404, detail=_t("session_not_found", session_id=session_id))
     return session
 
@@ -91,10 +94,11 @@ async def _validate_session_ownership(
 async def _assistant_service_for_stream(
     project_name: str,
     session_id: str,
+    current_user: CurrentUser,
     _t: Translator,
 ) -> tuple[AssistantService, SessionMeta]:
     service = get_assistant_service()
-    meta = await _validate_session_ownership(service, session_id, project_name, _t)
+    meta = await _validate_session_ownership(service, session_id, project_name, _t, current_user)
     return service, meta
 
 
@@ -155,8 +159,11 @@ async def send_message(
     project_name: str,
     req: SendRequest,
     request: Request,
+    current_user: CurrentUser,
     _t: Translator,
 ):
+    if employee_auth_enabled() and req.session_id:
+        await _validate_session_ownership(get_assistant_service(), req.session_id, project_name, _t, current_user)
     try:
         service = get_assistant_service()
         return await service.send_or_create(
@@ -166,6 +173,7 @@ async def send_message(
             images=req.images,
             locale=get_locale(request),
             client_key=req.client_key,
+            **({"user_id": current_user.id} if employee_auth_enabled() else {}),
         )
     except SessionSupersededError as exc:
         raise ConflictError("session_already_superseded") from exc
@@ -202,6 +210,7 @@ async def rewrite_message(
     session_id: str,
     req: RewriteRequest,
     request: Request,
+    current_user: CurrentUser,
     _t: Translator,
 ):
     """改写会话中某条历史用户消息：分叉出新会话并在其上重跑。
@@ -209,6 +218,8 @@ async def rewrite_message(
     ``session_id`` 是被改写的原会话；响应里的 ``session_id`` 是承接改写的新会话，
     前端据此整体切换过去。运行中的会话由端点自动中断，调用方不必先停止。
     """
+    if employee_auth_enabled() and session_id:
+        await _validate_session_ownership(get_assistant_service(), session_id, project_name, _t, current_user)
     try:
         service = get_assistant_service()
         return await service.rewrite_message(
@@ -262,6 +273,7 @@ async def rewrite_message(
 @router.get("/sessions")
 async def list_sessions(
     project_name: str,
+    current_user: CurrentUser,
     _t: Translator,
     status: Literal["idle", "running", "completed", "error", "interrupted"] | None = None,
     limit: int = Query(default=50, ge=1, le=200),
@@ -269,7 +281,11 @@ async def list_sessions(
 ):
     try:
         sessions = await get_assistant_service().list_sessions(
-            project_name=project_name, status=status, limit=limit, offset=offset
+            project_name=project_name,
+            status=status,
+            limit=limit,
+            offset=offset,
+            **({"user_id": current_user.id} if employee_auth_enabled() else {}),
         )
         return {"sessions": [s.model_dump() for s in sessions]}
     except HTTPException:
@@ -280,10 +296,10 @@ async def list_sessions(
 
 
 @router.get("/sessions/{session_id}")
-async def get_session(project_name: str, session_id: str, _t: Translator):
+async def get_session(project_name: str, session_id: str, current_user: CurrentUser, _t: Translator):
     try:
         service = get_assistant_service()
-        session = await _validate_session_ownership(service, session_id, project_name, _t)
+        session = await _validate_session_ownership(service, session_id, project_name, _t, current_user)
         return session.model_dump()
     except HTTPException:
         raise
@@ -293,10 +309,10 @@ async def get_session(project_name: str, session_id: str, _t: Translator):
 
 
 @router.delete("/sessions/{session_id}")
-async def delete_session(project_name: str, session_id: str, _t: Translator):
+async def delete_session(project_name: str, session_id: str, current_user: CurrentUser, _t: Translator):
     try:
         service = get_assistant_service()
-        await _validate_session_ownership(service, session_id, project_name, _t)
+        await _validate_session_ownership(service, session_id, project_name, _t, current_user)
         deleted = await service.delete_session(session_id)
         if not deleted:
             raise HTTPException(status_code=404, detail=_t("session_not_found", session_id=session_id))
@@ -328,13 +344,14 @@ async def get_snapshot(project_name: str, session_id: str, _t: Translator):
 async def list_entries(
     project_name: str,
     session_id: str,
+    current_user: CurrentUser,
     _t: Translator,
     after: int = Query(default=-1, ge=-1),
 ):
     """冷读会话事件日志（历史回放；``after`` 为 seq 游标）。"""
     try:
         service = get_assistant_service()
-        meta = await _validate_session_ownership(service, session_id, project_name, _t)
+        meta = await _validate_session_ownership(service, session_id, project_name, _t, current_user)
         return await service.list_session_entries(session_id, meta=meta, after_seq=after)
     except HTTPException:
         raise
@@ -350,6 +367,7 @@ async def stream_entries(
     project_name: str,
     session_id: str,
     request: Request,
+    current_user: CurrentUser,
     _t: Translator,
     after: int = Query(default=-1, ge=-1),
     deps: tuple[AssistantService, SessionMeta] = Depends(_assistant_service_for_stream),
@@ -367,9 +385,23 @@ async def stream_entries(
             cursor = int(last_event_id)
         except ValueError:
             logger.debug("忽略无效的 Last-Event-ID: %r，回退到游标 %s", last_event_id, cursor)
+    authorization_check = project_stream_authorizer(request, project_name, current_user)
     try:
-        async for event in service.stream_entry_events(session_id, meta=meta, request=request, after_seq=cursor):
-            yield event
+        async with aclosing(
+            service.stream_entry_events(
+                session_id,
+                meta=meta,
+                request=request,
+                after_seq=cursor,
+                authorization_check=authorization_check,
+            )
+        ) as stream:
+            async for event in stream:
+                # Snapshot/history reads and status refreshes can await between
+                # events, so also check immediately before each event leaves.
+                if authorization_check is not None and not await authorization_check():
+                    break
+                yield event
     except HTTPException:
         raise
     except AgentStartupError as exc:
@@ -380,6 +412,8 @@ async def stream_entries(
             title=_t("agent_startup_failed_title"),
         )
         async for event in service.stream_startup_failure_events(session_id, detail["failure"]):
+            if authorization_check is not None and not await authorization_check():
+                break
             yield event
     except Exception as exc:
         logger.exception("请求处理失败")
@@ -387,10 +421,10 @@ async def stream_entries(
 
 
 @router.post("/sessions/{session_id}/interrupt")
-async def interrupt_session(project_name: str, session_id: str, _t: Translator):
+async def interrupt_session(project_name: str, session_id: str, current_user: CurrentUser, _t: Translator):
     try:
         service = get_assistant_service()
-        meta = await _validate_session_ownership(service, session_id, project_name, _t)
+        meta = await _validate_session_ownership(service, session_id, project_name, _t, current_user)
         return await service.interrupt_session(session_id, meta=meta)
     except HTTPException:
         raise
@@ -405,14 +439,21 @@ async def interrupt_session(project_name: str, session_id: str, _t: Translator):
 
 
 async def _act_on_queued_message(
-    project_name: str, session_id: str, action: Callable[[AssistantService], Awaitable[dict]], _t: Translator
+    project_name: str,
+    session_id: str,
+    action: Callable[[AssistantService], Awaitable[dict]],
+    _t: Translator,
+    current_user: CurrentUserInfo,
 ) -> dict:
     """排队消息操作（编辑、删除、重新发送、立即发送）共用的错误映射。
 
     重新发送与对「未发送」消息的立即发送会在 CLI 已退出时重建会话连接，可能遇到容量已满或启动失败。
     """
+    service = get_assistant_service()
+    if employee_auth_enabled():
+        await _validate_session_ownership(service, session_id, project_name, _t, current_user)
     try:
-        return await action(get_assistant_service())
+        return await action(service)
     except QueuedMessageNotFoundError as exc:
         raise NotFoundError("queued_message_not_found") from exc
     except QueuedMessageWithdrawalPendingError as exc:
@@ -437,44 +478,59 @@ async def _act_on_queued_message(
 
 
 async def _withdraw_queued_message(
-    project_name: str, session_id: str, message_id: str, intent: WithdrawalIntent, _t: Translator
+    project_name: str,
+    session_id: str,
+    message_id: str,
+    intent: WithdrawalIntent,
+    _t: Translator,
+    current_user: CurrentUserInfo,
 ) -> dict:
     return await _act_on_queued_message(
         project_name,
         session_id,
         lambda service: service.withdraw_queued_message(project_name, session_id, message_id, intent=intent),
         _t,
+        current_user,
     )
 
 
 @router.post("/sessions/{session_id}/queued-messages/{message_id}/edit")
-async def edit_queued_message(project_name: str, session_id: str, message_id: str, _t: Translator):
+async def edit_queued_message(
+    project_name: str, session_id: str, message_id: str, current_user: CurrentUser, _t: Translator
+):
     """把一条排队消息退回输入框：撤回成功时响应带回它的内容（``message``）。
 
     ``outcome`` 为 ``withdrawn`` 时消息已移出排队；为 ``accepted`` 时 Agent 已接收它，消息照常进入对话。
     """
-    return await _withdraw_queued_message(project_name, session_id, message_id, "edit", _t)
+    return await _withdraw_queued_message(project_name, session_id, message_id, "edit", _t, current_user)
 
 
 @router.delete("/sessions/{session_id}/queued-messages/{message_id}")
-async def delete_queued_message(project_name: str, session_id: str, message_id: str, _t: Translator):
+async def delete_queued_message(
+    project_name: str, session_id: str, message_id: str, current_user: CurrentUser, _t: Translator
+):
     """删除一条排队消息：撤回成功即丢弃。响应形状同编辑端点，``message`` 恒为 null。"""
-    return await _withdraw_queued_message(project_name, session_id, message_id, "delete", _t)
+    return await _withdraw_queued_message(project_name, session_id, message_id, "delete", _t, current_user)
 
 
 @router.post("/sessions/{session_id}/queued-messages/{message_id}/resend")
-async def resend_queued_message(project_name: str, session_id: str, message_id: str, request: Request, _t: Translator):
+async def resend_queued_message(
+    project_name: str, session_id: str, message_id: str, request: Request, current_user: CurrentUser, _t: Translator
+):
     """把一条「未发送」消息重新交给 Agent，会话已中断时先重建连接。响应带回这条排队消息（``queued_message``）。"""
     return await _act_on_queued_message(
         project_name,
         session_id,
         lambda service: service.resend_queued_message(project_name, session_id, message_id, locale=get_locale(request)),
         _t,
+        current_user,
     )
 
 
 @router.post("/sessions/{session_id}/queued-messages/{message_id}/send-now")
-async def send_queued_message_now(project_name: str, session_id: str, message_id: str, _t: Translator):
+async def send_queued_message_now(
+    project_name: str, session_id: str, message_id: str, current_user: CurrentUser, _t: Translator
+):
     """立即发送一条排队消息：Agent 打断当前轮先处理它。
 
     ``outcome`` 为 ``sent`` 时已重新送入，消息仍留在托盘里直到被接纳；为 ``accepted`` 时 Agent 已接收它，不再重发。
@@ -484,6 +540,7 @@ async def send_queued_message_now(project_name: str, session_id: str, message_id
         session_id,
         lambda service: service.send_queued_message_now(project_name, session_id, message_id),
         _t,
+        current_user,
     )
 
 
@@ -493,13 +550,14 @@ async def answer_question(
     session_id: str,
     question_id: str,
     req: AnswerQuestionRequest,
+    current_user: CurrentUser,
     _t: Translator,
 ):
     if not req.answers:
         raise HTTPException(status_code=400, detail=_t("answers_required"))
     try:
         service = get_assistant_service()
-        meta = await _validate_session_ownership(service, session_id, project_name, _t)
+        meta = await _validate_session_ownership(service, session_id, project_name, _t, current_user)
         return await service.answer_user_question(
             session_id=session_id,
             question_id=question_id,

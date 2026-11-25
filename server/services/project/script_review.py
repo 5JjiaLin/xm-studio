@@ -151,7 +151,9 @@ class ScriptReviewService:
         """
         if script_review.find_episode(project, episode) is None:
             raise ScriptReviewError("episode_not_found")
-        return project
+        from lib.project.archive_context import generation_project
+
+        return generation_project(self.pm.get_project_path(project_name), project, episode=episode)
 
     async def _resolve_supported_durations(self, project: dict[str, Any]) -> list[int] | None:
         """结构收编用的时长全集：参考路线取 r2v 与 i2v 两桶视频请求事实声明全集的并集。
@@ -204,7 +206,7 @@ class ScriptReviewService:
             update_project=lambda mutate: self.pm.update_project(project_name, mutate),
             supported_durations=supported_durations,
         )
-        return content, updated or project
+        return content, self._require_episode(project_name, updated or project, episode)
 
     async def get_state(self, project_name: str, episode: int) -> dict[str, Any]:
         """返回该集内容确认状态 + 结构化中间态内容（供 web 渲染）。
@@ -302,7 +304,23 @@ class ScriptReviewService:
                 status = script_review.review_status(project_path, project, episode)
         else:
             status = script_review.review_status(project_path, project, episode)
+        from lib.episode.source_kinds import episode_source_kind
+        advisory_mode = (script_review.script_plan_kind(project) == "reference_video"
+                         and episode_source_kind(project, episode) == "screenplay")
+        coverage_advisories: list[str] = []
+        if advisory_mode and content and content.get("units"):
+            from lib.script.reference_video.screenplay_coverage import validate_screenplay_coverage
+            from server.text_generation import load_novel_source
+            try:
+                source = load_novel_source(project_path, None, episode=episode)
+            except ValueError:
+                # Confirmation still verifies source availability independently.
+                pass
+            else:
+                validate_screenplay_coverage(content["units"], source, check_dialogue=False, coverage_advisories=coverage_advisories)
         return {
+            "coverage_advisory_mode": advisory_mode,
+            "coverage_advisories": coverage_advisories,
             "episode": episode,
             "content_mode": project.get("content_mode"),
             "status": status,
@@ -405,6 +423,7 @@ class ScriptReviewService:
             logger.warning("草稿重算失败 project=%s episode=%s：%s", project_name, episode, exc)
             view["violations"] = [_unreadable_violation("草稿的产出上下文缺失或损坏，无法重新校验")]
             return view
+        view["coverage_advisories"] = list(revalidation.coverage_advisories)
         view["violations"] = violation_entries(revalidation.violations)
         if (
             quarantine_kind == script_review.script_plan_quarantine_kind(project)
@@ -768,6 +787,7 @@ class ScriptReviewService:
                             source,
                             speaker_aliases=aliases,
                             check_dialogue=not has_dialogue_bindings(dumped["units"]),
+                            coverage_advisories=[],  # Source coverage is advisory; dialogue remains blocking.
                         ))
                     if coverage_issues:
                         raise ScriptReviewError("invalid_content", "；".join(str(issue) for issue in coverage_issues))

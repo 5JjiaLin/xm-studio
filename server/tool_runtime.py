@@ -16,14 +16,15 @@ import tempfile
 from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Any, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
 from lib.agent.profile_manifest import ContentMode
 from lib.artifacts.artifact_activation import ArtifactCurrencyResolver, active_artifact_currency_resolver
-from lib.backends.text_backends.base import TextOutputTruncatedError
+from lib.backends.text_backends.base import TextGenerationTimeoutError, TextOutputTruncatedError
+from lib.backends.text_backends.connection_errors import TextProviderConnectionError
 from lib.catalog.errors import ModelNotInCatalogError
 from lib.config.resolver import ConfigResolver, caps_generation_mode, video_bucket_for_generation_mode
 from lib.db import async_session_factory
@@ -228,6 +229,7 @@ from server.text_generation import (
     OperationNotAdmittedError,
     PromptAuthoringInputError,
     PromptOverwriteRequiredError,
+    QuarantinedDraftError,
     ScriptOverwriteRequiredError,
     TextGenerationError,
     TextGenerationRequest,
@@ -249,6 +251,9 @@ from server.text_generation import (
 from server.text_generation import (
     generate_episode_script as generate_episode_script_handler,
 )
+
+if TYPE_CHECKING:
+    from server.auth import CurrentUserInfo
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +281,7 @@ class CallerContext:
     user_id: str
     source: Literal["embedded", "mcp", "webui"]
     batch_waiter: BatchWaiter | None = None
+    identity: CurrentUserInfo | None = None
     production_batch_id: str | None = None
 
     def waiting_with(self, **options: Any) -> CallerContext:
@@ -671,6 +677,15 @@ def _script_overwrite_problem(exc: ScriptOverwriteRequiredError) -> ToolProblem:
     return ToolProblem("script_overwrite_required", str(exc), params={"script_overwrite": exc.overwrite})
 
 
+def text_timeout_problem(exc: TextGenerationTimeoutError) -> ToolProblem:
+    return ToolProblem(
+        exc.code,
+        str(exc),
+        action=GenerationAction.NONE,
+        params={"timeout_seconds": exc.timeout_seconds, "may_have_been_accepted": True},
+    )
+
+
 async def _run_text_generation(
     operation: str,
     call: Awaitable[TextGenerationResult],
@@ -694,11 +709,37 @@ async def _run_text_generation(
         return ToolOutcome(problem=_not_admitted_problem(exc))
     except TextOutputTruncatedError as exc:
         return ToolOutcome(problem=truncation_problem(exc))
+    except TextGenerationTimeoutError as exc:
+        return ToolOutcome(problem=text_timeout_problem(exc))
     except VideoRequestFactsUnavailableError as exc:
         return ToolOutcome(problem=video_facts_problem(exc.failure, str(exc)))
     except PromptAuthoringInputError as exc:
         return ToolOutcome(
             problem=ToolProblem(exc.code, str(exc), action=GenerationAction.FIX_INPUT, params=dict(exc.params))
+        )
+    except TextProviderConnectionError as exc:
+        return ToolOutcome(
+            problem=ToolProblem(
+                "text_provider_connection_failed",
+                str(exc),
+                action=GenerationAction.NONE if exc.may_have_been_accepted else GenerationAction.RETRY,
+                params={
+                    "provider_id": exc.provider_id,
+                    "model": exc.model,
+                    "phase": exc.phase,
+                    "cause_types": list(exc.cause_types),
+                    "may_have_been_accepted": exc.may_have_been_accepted,
+                },
+            )
+        )
+    except QuarantinedDraftError as exc:
+        return ToolOutcome(
+            problem=ToolProblem(
+                exc.code,
+                str(exc),
+                action=GenerationAction.RESOLVE_DRAFT,
+                params=exc.params,
+            )
         )
     except TextGenerationError as exc:
         return ToolOutcome(problem=ToolProblem("generation_refused", str(exc)))
@@ -1644,6 +1685,8 @@ async def _run_draft(
         return ToolOutcome(problem=ToolProblem(exc.code, exc.detail))
     except TextOutputTruncatedError as exc:
         return ToolOutcome(problem=truncation_problem(exc))
+    except TextGenerationTimeoutError as exc:
+        return ToolOutcome(problem=text_timeout_problem(exc))
     except ModelNotInCatalogError as exc:
         return ToolOutcome(problem=model_not_in_catalog_problem(exc))
     except Exception as exc:
@@ -1897,9 +1940,20 @@ async def list_projects(
     _caller: CallerContext,
     services: Services,
 ) -> ToolOutcome[list[dict[str, Any]]]:
+    from server.auth import employee_auth_enabled
+    from server.project_access import visible_project_names
+
+    allowed_names = None
+    if employee_auth_enabled():
+        if _caller.identity is None or _caller.identity.id != _caller.user_id:
+            return ToolOutcome(problem=ToolProblem("permission_denied", "需要员工身份"))
+        allowed_names = await visible_project_names(_caller.identity, services.projects)
+
     def _list() -> list[dict[str, Any]]:
         result = []
         for name in sorted(services.projects.list_projects()):
+            if allowed_names is not None and name not in allowed_names:
+                continue
             try:
                 project = services.projects.load_project(name)
             except (FileNotFoundError, ValueError):
@@ -3008,6 +3062,8 @@ async def _execute_plan_episodes(
             )
     except TextOutputTruncatedError as exc:
         return ToolOutcome(problem=truncation_problem(exc))
+    except TextGenerationTimeoutError as exc:
+        return ToolOutcome(problem=text_timeout_problem(exc))
     except ModelNotInCatalogError as exc:
         return ToolOutcome(problem=model_not_in_catalog_problem(exc))
     except NoCutPointError as exc:
@@ -3299,6 +3355,8 @@ async def _draft_replan_window(
         )
     except TextOutputTruncatedError as exc:
         return ToolOutcome(problem=truncation_problem(exc))
+    except TextGenerationTimeoutError as exc:
+        return ToolOutcome(problem=text_timeout_problem(exc))
     except ModelNotInCatalogError as exc:
         return ToolOutcome(problem=model_not_in_catalog_problem(exc))
     except NoCutPointError as exc:
@@ -3402,13 +3460,10 @@ async def execute_queued_text_task(
         services = services or Services.defaults(await asyncio.to_thread(ProjectManager, scope.data_root))
     task_type = task["task_type"]
     if task_type == TEXT_DRAFT_REPAIR_TASK_TYPE:
-        # GenerationQueue attaches these private journal fields to every eligible
-        # task payload. They belong to worker-side audit, not the strict domain request.
-        repair_payload = {
-            key: value for key, value in payload.items()
-            if key not in {"_production_feedback", "_production_feedback_replan"}
-        }
-        outcome = await _execute_draft_repair(RepairDraftRequest.model_validate(repair_payload), scope, services)
+        # Queue-owned production feedback metadata travels with the durable task,
+        # but strict business request models must only see caller fields.
+        business_payload = text_task_request_facts(payload)
+        outcome = await _execute_draft_repair(RepairDraftRequest.model_validate(business_payload), scope, services)
     elif task_type == _TEXT_EPISODE_PLAN and isinstance(payload.get("replan"), str):
         outcome = await _execute_replan_window(
             str(payload["replan"]),

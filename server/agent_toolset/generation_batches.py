@@ -7,6 +7,7 @@ from server.tool_runtime import GenerationBatchToolRequest, cancel_generation_ba
 
 GET_GENERATION_BATCH = ToolDeclaration(
     name="get_generation_batch",
+    access="read",
     description=(
         "查询一个生成批次：成员逐个的任务状态、计数、建议轮询间隔 poll_after_seconds、是否已终结 done，"
         "终结后另附终态 generation_result（逐 ID 的成功 / 失败 / 阻断结局）。未终结时按 poll_after_seconds "

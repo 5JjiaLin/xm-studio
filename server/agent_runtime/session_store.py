@@ -7,6 +7,7 @@ Wraps SessionRepository with a convenience class.
 from __future__ import annotations
 
 from lib.db import safe_session_factory
+from lib.db.base import DEFAULT_USER_ID
 from lib.db.repositories.session_repo import SessionRepository
 from server.agent_runtime.models import SessionMeta, SessionStatus
 
@@ -15,6 +16,7 @@ def _dict_to_session(d: dict) -> SessionMeta:
     """Convert a repository dict to a SessionMeta dataclass."""
     return SessionMeta(
         id=d["sdk_session_id"],  # DB 内部 id 不暴露，对外统一用 sdk_session_id
+        user_id=d.get("user_id", DEFAULT_USER_ID),
         project_name=d["project_name"],
         title=d.get("title") or "",
         status=d["status"],
@@ -37,6 +39,7 @@ class SessionMetaStore:
         project_name: str,
         sdk_session_id: str,
         *,
+        user_id: str = DEFAULT_USER_ID,
         fork_parent_session_id: str | None = None,
         fork_anchor_uuid: str | None = None,
     ) -> SessionMeta:
@@ -46,6 +49,7 @@ class SessionMetaStore:
             d = await repo.create(
                 project_name=project_name,
                 sdk_session_id=sdk_session_id,
+                user_id=user_id,
                 fork_parent_session_id=fork_parent_session_id,
                 fork_anchor_uuid=fork_anchor_uuid,
             )
@@ -66,6 +70,7 @@ class SessionMetaStore:
         status: SessionStatus | None = None,
         limit: int = 50,
         offset: int = 0,
+        user_id: str | None = None,
     ) -> list[SessionMeta]:
 
         async with self._session_factory() as session:
@@ -75,6 +80,7 @@ class SessionMetaStore:
                 status=status,
                 limit=limit,
                 offset=offset,
+                user_id=user_id,
             )
         return [_dict_to_session(d) for d in result]
 

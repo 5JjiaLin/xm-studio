@@ -437,3 +437,22 @@ class TestGetCurrentUser:
             with pytest.raises(HTTPException) as exc_info:
                 await auth_module.get_current_user("invalid-token")
             assert exc_info.value.status_code == 401
+
+    async def test_employee_mode_rejects_legacy_shared_session(self, monkeypatch):
+        monkeypatch.setenv("AUTH_TOKEN_SECRET", "test-secret-key-that-is-at-least-32-bytes")
+        monkeypatch.setenv("EMPLOYEE_AUTH_ENABLED", "true")
+        monkeypatch.setenv("AUTH_ENABLED", "true")
+        token = auth_module.create_token("admin")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await auth_module.get_current_user(token)
+
+        assert exc_info.value.status_code == 401
+
+    def test_employee_token_carries_user_and_session_version(self, monkeypatch):
+        monkeypatch.setenv("AUTH_TOKEN_SECRET", "test-secret-key-that-is-at-least-32-bytes")
+        token = auth_module.create_employee_token("user-123", "alice", 7)
+
+        payload = auth_module.verify_token(token)
+        assert payload is not None
+        assert (payload["sub"], payload["uid"], payload["sv"]) == ("alice", "user-123", 7)

@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NoReturn
+from uuid import uuid4
 
 from arcreel_market_core.validation_messages import MessageRef, ValidationMessage
 from lib.artifacts.artifact_activation import (
@@ -38,7 +39,7 @@ from lib.catalog import query as catalog
 from lib.config.resolver import VideoGenerationType, project_video_backend_ids
 from lib.episode.episode_ledger import parse_positive_episode_num
 from lib.infra.content_digest import digest_stream, sha256_file
-from lib.infra.json_io import load_json
+from lib.infra.json_io import atomic_write_json, load_json
 from lib.infra.path_safety import PathTraversalError, safe_join, try_safe_join
 from lib.infra.validation_messages import ValidationResult, default_translate
 from lib.project import deleted_projects
@@ -2219,6 +2220,12 @@ class ProjectArchiveService:
 
         try:
             shutil.move(str(staging_dir), str(prepared_dir))
+            # Every import installs a new project, including overwrite (which retires the old one).
+            # Archive IDs must never inherit another project's memberships.
+            project_file = prepared_dir / self.project_manager.PROJECT_FILE
+            project = self._load_project_file(project_file)
+            project["project_id"] = str(uuid4())
+            atomic_write_json(project_file, project)
             # profile sync 是安装的一部分，在项目目录旁做完：它失败时现有项目与其记录都还没动过。
             self.project_manager.sync_agent_profile(prepared_dir)
             if overwrite and target_dir.exists():

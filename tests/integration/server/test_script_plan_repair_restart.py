@@ -74,6 +74,8 @@ async def test_restart_does_not_replay_and_explicit_recovery_reuses_persisted_re
     before_assets = projects.load_project(project_name)["characters"]
     env = {key: os.environ[key] for key in ("PATH", "PYTHONPATH", "SYSTEMROOT") if key in os.environ}
     env.update(
+        PYTHONUTF8="1", USERPROFILE=str(tmp_path / "fixture-profile"), HOME=str(tmp_path / "fixture-profile"),
+        ARCREEL_PROFILE_DIR=str(tmp_path / "fixture-profile" / "agent"),
         PYTHON_DOTENV_DISABLED="1",
         ARCREEL_DATA_DIR=str(projects.data_root),
         DATABASE_URL=file_db_factory.kw["bind"].url.render_as_string(hide_password=False),

@@ -88,6 +88,7 @@ from server.tool_runtime import (
     get_generation_batch,
 )
 from tests.factories import install_current_video, make_test_clip
+from tests.fakes import create_test_directory_link
 
 _ABSENT_REVISION = "sha256-v1:" + "0" * 64
 
@@ -192,7 +193,7 @@ def seeded_projects(tmp_path: Path) -> ProjectManager:
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "project.json").write_text("{}", encoding="utf-8")
-    (root / "escape").symlink_to(outside, target_is_directory=True)
+    create_test_directory_link(root / "escape", outside)
     return manager
 
 
@@ -525,7 +526,13 @@ async def test_patch_episode_script_reports_a_missing_script_as_script_not_found
 def _twin_services(seeded_projects: ProjectManager, tmp_path: Path) -> Services:
     """同一初始状态的另一份项目根，让写入类工具在两宿主各跑一次、互不影响。"""
     root = tmp_path / "twin"
-    shutil.copytree(seeded_projects.data_root, root, symlinks=True)
+    # copytree follows Windows junctions even with symlinks=True. Recreate the
+    # deliberate escape alias instead of copying its target into a valid project.
+    shutil.copytree(
+        seeded_projects.data_root, root, symlinks=True,
+        ignore=lambda directory, _names: ["escape"] if Path(directory) == seeded_projects.projects_dir else [],
+    )
+    create_test_directory_link(root / "projects" / "escape", (seeded_projects.projects_dir / "escape").resolve())
     twin = ProjectManager(root)
     return Services(
         projects=twin, workflow_planner=WorkflowPlanner(twin), capabilities=ConfigResolver(async_session_factory)

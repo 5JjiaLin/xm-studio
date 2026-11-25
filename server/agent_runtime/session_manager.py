@@ -21,6 +21,7 @@ from lib.i18n import DEFAULT_LOCALE
 from lib.infra.data_root_layout import DataRootLayout
 from lib.infra.logging_utils import redact_diagnostic_text
 from lib.infra.path_safety import PathTraversalError, safe_join
+from lib.infra.server_runtime import runtime
 from server.agent_runtime.agent_access_policy import AgentAccessPolicy
 from server.agent_runtime.entry_pipeline import SessionEntryPipeline
 from server.agent_runtime.event_log import (
@@ -301,6 +302,7 @@ class ManagedSession:
     actor: "SessionActor"  # per-session actor owning the SDK client
     status: SessionStatus = "idle"
     project_name: str = ""  # 用于 _register_new_session
+    user_id: str = DEFAULT_USER_ID  # connection owner, never taken from a later request
     sdk_id_event: asyncio.Event = field(default_factory=asyncio.Event)
     resolved_sdk_id: str | None = None  # consumer 设置，send_new_session 读取
     channel: SseChannel = field(default_factory=_make_session_channel)
@@ -620,6 +622,7 @@ class SessionManager:
         )
         self.layout = DataRootLayout(self.data_root)
         self.meta_store = meta_store
+        self._session_factory = getattr(meta_store, "_session_factory", None)
         self.sessions: dict[str, ManagedSession] = {}
         # 会话订阅广播通道，按 sdk_session_id 登记。entry 流的生命周期跟随会话面板而非
         # CLI 进程：会话被驱逐后通道随订阅者留下，复活的会话接着往同一个通道广播。
@@ -654,12 +657,8 @@ class SessionManager:
         )
         self._load_config()
         self.ledger = Ledger(session_factory=getattr(meta_store, "_session_factory", None))
-        # Options 装配器：持依赖、允许 I/O，异步 build 产出 SDK options。access_policy /
-        # max_turns / session_factory / user_id 一律用 provider 回调现取——前两者
-        # configure_sandbox_runtime / refresh_config 换新后对后续会话立即生效；后两者
-        # 保持析出前惰性读 self 属性的时点，与用量记录侧 _finalize_turn 实时读 _user_id
-        # 同源，避免 store 与用量落到不同 per-user 命名空间。_resolve_project_cwd
-        # （项目名校验/作用域）留在会话管理侧，作为依赖注入。
+        # Process configuration stays lazy; session identity is always passed
+        # explicitly from the new request or persisted metadata at resume.
         self._options_assembler = OptionsAssembler(
             data_root=self.data_root,
             allowed_tools=self.DEFAULT_ALLOWED_TOOLS,
@@ -668,7 +667,6 @@ class SessionManager:
             max_turns_provider=lambda: self.max_turns,
             resolve_project_cwd=self._resolve_project_cwd,
             session_factory_provider=lambda: getattr(self, "_session_factory", None),
-            user_id_provider=lambda: getattr(self, "_user_id", DEFAULT_USER_ID),
         )
 
     def configure_sandbox_runtime(self, *, in_docker: bool, sandbox_enabled: bool) -> None:
@@ -717,6 +715,7 @@ class SessionManager:
         locale: str = DEFAULT_LOCALE,
         stderr: Callable[[str], None] | None = None,
         session_id: str | None = None,
+        user_id: str = DEFAULT_USER_ID,
     ) -> Any:
         """委派给 ``OptionsAssembler.build``——SessionManager 不再直接构建 options 与
         hook，仅调用装配器；凭证注入、prompt 装配、hook 工厂均由装配器持有。"""
@@ -727,12 +726,12 @@ class SessionManager:
             locale=locale,
             stderr=stderr,
             session_id=session_id,
+            user_id=user_id,
         )
 
-    def _build_session_store(self):
-        """委派给装配器的 session store 单例。AssistantService 经此拿到与 SDK options
-        同一份 store 实例（同一 per-user 命名空间），读写共享缓存。"""
-        return self._options_assembler.build_session_store()
+    def _build_session_store(self, *, user_id: str = DEFAULT_USER_ID):
+        """Return the same owner-bound store used by that owner's SDK options."""
+        return self._options_assembler.build_session_store(user_id=user_id)
 
     def _resolve_project_cwd(self, project_name: str) -> Path:
         """Resolve and validate per-session project working directory."""
@@ -751,7 +750,7 @@ class SessionManager:
         管道自动跳过（该窗口内只有 init 系统消息，本就不入日志）。
         """
         return SessionEntryPipeline(
-            self.event_log_store,
+            self.event_log_store.for_user(managed.user_id),
             session_id_provider=lambda: managed.resolved_sdk_id,
             project_name_provider=lambda: managed.project_name,
             broadcast=managed.channel.broadcast,
@@ -860,6 +859,7 @@ class SessionManager:
         locale: str = DEFAULT_LOCALE,
         user_entry: dict[str, Any] | None = None,
         client_key: str | None = None,
+        user_id: str = DEFAULT_USER_ID,
     ) -> str:
         """Create a new session via send-first: start actor, send query, wait for sdk_session_id.
 
@@ -883,6 +883,7 @@ class SessionManager:
             options = await self._build_options(
                 project_name,
                 resume_id=None,
+                user_id=user_id,
                 can_use_tool=await self._build_can_use_tool_callback(temp_id, managed_ref),
                 locale=locale,
                 stderr=startup_stderr,
@@ -907,6 +908,7 @@ class SessionManager:
             actor=actor,
             status="running",
             project_name=project_name,
+            user_id=user_id,
             agent_pricing=agent_pricing_of(options),
         )
         if user_entry is not None:
@@ -1207,6 +1209,8 @@ class SessionManager:
         if cached is not None and session_id not in self._disconnecting and not cached.actor_exited:
             return cached
 
+        runtime.require_admission()
+
         while True:
             # Per-session lock prevents concurrent connect() for the same session_id.
             lock = self._connect_locks.setdefault(session_id, asyncio.Lock())
@@ -1283,6 +1287,7 @@ class SessionManager:
                 locale=locale,
                 stderr=startup_stderr,
                 session_id=None if resumable else meta.id,
+                user_id=meta.user_id,
             )
         except Exception as exc:
             sdk_stderr = startup_stderr.render()
@@ -1307,6 +1312,7 @@ class SessionManager:
             actor=actor,
             status=resumed_status,
             project_name=meta.project_name,
+            user_id=meta.user_id,
             agent_pricing=agent_pricing_of(options),
             # 恢复会话的 CLI 带着此前的累计用量，差分以恢复后第一条结果为起点
             usage_meter=TurnUsageMeter(resumed=resumable),
@@ -1890,7 +1896,7 @@ class SessionManager:
             project_name=managed.project_name,
             session_id=managed.session_id,
             prompt=managed.last_user_prompt,
-            user_id=getattr(self, "_user_id", DEFAULT_USER_ID),
+            user_id=managed.user_id,
             provider=agent_provider_id(credential_id) if credential_id is not None else PROVIDER_ANTHROPIC,
             pricing=pricing,
             status=status,
@@ -2254,7 +2260,7 @@ class SessionManager:
             if registered:
                 self._channels[sdk_id] = managed.channel
             try:
-                await self.meta_store.create(managed.project_name, sdk_id)
+                await self.meta_store.create(managed.project_name, sdk_id, user_id=managed.user_id)
             except BaseException:
                 if registered and self._channels.get(sdk_id) is managed.channel:
                     del self._channels[sdk_id]
@@ -2267,7 +2273,7 @@ class SessionManager:
             if pending_user is not None:
                 managed.pending_initial_user_entry = None
                 try:
-                    authoritative, _created = await self.event_log_store.append_user_entry(
+                    authoritative, _created = await self.event_log_store.for_user(managed.user_id).append_user_entry(
                         sdk_id,
                         pending_user["entry"],
                         client_key=pending_user.get("client_key"),

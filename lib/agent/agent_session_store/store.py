@@ -117,6 +117,17 @@ class DbSessionStore:
     ) -> None:
         now_dt = utc_now()
         async with self._session_factory() as session:
+            other_owner = await session.scalar(
+                select(AgentSessionEntry.user_id)
+                .where(
+                    AgentSessionEntry.project_key == project_key,
+                    AgentSessionEntry.session_id == session_id,
+                    AgentSessionEntry.user_id != self._user_id,
+                )
+                .limit(1)
+            )
+            if other_owner is not None:
+                raise PermissionError("transcript belongs to a different owner")
             seq_start_row = await session.execute(
                 select(func.coalesce(func.max(AgentSessionEntry.seq), -1) + 1).where(
                     AgentSessionEntry.project_key == project_key,
@@ -188,6 +199,8 @@ class DbSessionStore:
         if prev_row is None:
             prev: SessionSummaryEntry | None = None
         else:
+            if prev_row.user_id != self._user_id:
+                raise PermissionError("transcript summary belongs to a different owner")
             prev = {
                 "session_id": session_id,
                 "mtime": int(prev_row.mtime_ms),
@@ -250,6 +263,7 @@ class DbSessionStore:
                 select(AgentSessionEntry.payload)
                 .where(
                     AgentSessionEntry.project_key == project_key,
+                    AgentSessionEntry.user_id == self._user_id,
                     AgentSessionEntry.session_id == session_id,
                     AgentSessionEntry.subpath == subpath,
                 )
@@ -271,6 +285,7 @@ class DbSessionStore:
                 )
                 .where(
                     AgentSessionEntry.project_key == project_key,
+                    AgentSessionEntry.user_id == self._user_id,
                     AgentSessionEntry.subpath == "",
                 )
                 .group_by(AgentSessionEntry.session_id)
@@ -282,6 +297,7 @@ class DbSessionStore:
         async with self._session_factory() as session:
             stmt = select(AgentSessionSummary).where(
                 AgentSessionSummary.project_key == project_key,
+                AgentSessionSummary.user_id == self._user_id,
             )
             result = await session.execute(stmt)
             return [
@@ -295,6 +311,7 @@ class DbSessionStore:
         async with self._session_factory() as session:
             entry_stmt = sa_delete(AgentSessionEntry).where(
                 AgentSessionEntry.project_key == project_key,
+                AgentSessionEntry.user_id == self._user_id,
                 AgentSessionEntry.session_id == session_id,
             )
             if "subpath" in key and key["subpath"] != "":
@@ -307,6 +324,7 @@ class DbSessionStore:
                 sum_result = await session.execute(
                     sa_delete(AgentSessionSummary).where(
                         AgentSessionSummary.project_key == project_key,
+                        AgentSessionSummary.user_id == self._user_id,
                         AgentSessionSummary.session_id == session_id,
                     )
                 )
@@ -328,6 +346,7 @@ class DbSessionStore:
                 select(AgentSessionEntry.subpath)
                 .where(
                     AgentSessionEntry.project_key == project_key,
+                    AgentSessionEntry.user_id == self._user_id,
                     AgentSessionEntry.session_id == session_id,
                     AgentSessionEntry.subpath != "",
                 )

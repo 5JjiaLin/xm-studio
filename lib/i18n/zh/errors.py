@@ -78,6 +78,10 @@ MESSAGES = {
     # 任务失败原因（GenerationWorker 写入错误码 + 参数，tasks API 读取时按语言渲染）
     "task_fail_provider_unsupported_media": "供应商 {provider_id} 不支持 {media_type} 生成",
     "task_fail_provider_rejected": "供应商拒绝了这次生成请求（HTTP {status}）",
+    "task_fail_text_generation_timeout": "文本生成等待超过 {timeout_seconds} 秒。供应商可能已受理请求，请先核对供应商记录，不要直接重试。",
+    "task_fail_draft_quarantined": "生成结果已保存为待修复草稿。请打开本集草稿并修复，不要重新生成。",
+    "draft_quarantined": "生成结果已保存为待修复草稿。请打开本集草稿并修复，不要重新生成。",
+    "text_generation_timeout": "文本生成等待超过 {timeout_seconds} 秒。供应商可能已受理请求，请先核对供应商记录，不要直接重试。",
     "task_fail_dispatch_provider_requeue_failed": "任务供应商从 {claimed_provider_id} 变为 {actual_provider_id}，但无法回队重新认领，请重试",
     "task_fail_project_deleted_during_task": "项目已在任务执行期间删除，本次生成结果未保存",
     "task_fail_restart_lost_image": "图片任务在服务重启时中断且无法接续，请手动重试以避免重复计费",

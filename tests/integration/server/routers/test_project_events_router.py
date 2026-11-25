@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from lib.project.project_manager import ProjectManager
+from server.auth import CurrentUserInfo
 from server.draft_workflow import DraftContext, DraftWorkflow
 from server.routers import project_events as project_events_router
 from server.services.project.project_events import ProjectEventService
@@ -52,7 +53,12 @@ async def project_stream(tmp_path: Path):
 
     service = ProjectEventService(tmp_path, poll_interval=0.1)
     await service.start()
-    stream = project_events_router.stream_project_events("demo", _ConnectedRequest(service), service=service)
+    stream = project_events_router.stream_project_events(
+        "demo",
+        _ConnectedRequest(service),
+        current_user=CurrentUserInfo(id="test-user", sub="test-user"),
+        service=service,
+    )
     assert (await anext(stream)).event == "snapshot"
     workflow = DraftWorkflow(DraftContext(project_name="demo", data_root=pm.data_root, pm=pm))
     try:

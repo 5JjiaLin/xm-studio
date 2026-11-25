@@ -1,15 +1,12 @@
-"""SDK-based transcript adapter using public SessionStore helpers.
+"""SDK transcript reads with synchronous work isolated from the event loop.
 
-Reads conversation history via ``get_session_messages_from_store`` when a
-SessionStore is wired in, or falls back to ``get_session_messages``
-(filesystem) when ``ARCREEL_SDK_SESSION_STORE=off`` is set.
-
-The store path eliminates the previous dependency on the private
-``_internal._read_session_file`` symbol. SDK 0.1.71's reconstructed
-``SessionMessage`` does not carry a ``timestamp`` field, so the adapter
-backfills timestamps by re-reading payloads via ``store.load(key)`` and
-joining on ``uuid`` — keeps optimistic-turn dedup stable across rounds
-without reaching into SDK internals.
+The SDK's public async store helpers also normalize filesystem paths and
+decode conversation chains synchronously. The local compatibility helpers
+keep async database reads on their original loop and offload the SDK's pure
+decoders. Tests compare this boundary with the locked SDK's public helpers;
+SDK upgrades must run those tests. Filesystem rollback still uses the public
+``get_session_messages`` reader. Raw payload fields retain timestamps and
+structured tool results omitted by SDK SessionMessage.
 """
 
 from __future__ import annotations
@@ -17,19 +14,145 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Collection
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
-from claude_agent_sdk import (
-    get_session_messages,
-    get_session_messages_from_store,
-    get_subagent_messages_from_store,
-    list_subagents_from_store,
+from claude_agent_sdk import SDKSessionInfo, get_session_messages
+from claude_agent_sdk._internal.session_summary import summary_entry_to_sdk_info
+from claude_agent_sdk._internal.sessions import (
+    _canonicalize_path,
+    _entries_to_jsonl,
+    _entries_to_session_messages,
+    _entries_to_subagent_messages,
+    _filter_transcript_entries,
+    _jsonl_to_lite,
+    _parent_ids_from_agent_metadata,
+    _parse_session_info_from_lite,
+    _split_agent_metadata,
 )
 
 SDK_AVAILABLE = True
+
+
+async def _store_key(session_id: str, directory: Path | str | None) -> dict[str, str] | None:
+    try:
+        UUID(session_id)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    from lib.agent.agent_session_store import make_project_key
+
+    return {"project_key": await asyncio.to_thread(make_project_key, directory or "."), "session_id": session_id}
+
+
+def _decode_main(entries: list[Any]) -> list[Any]:
+    return _entries_to_session_messages(_filter_transcript_entries(entries), None, 0)
+
+
+def _decode_subagent(entries: list[Any]) -> list[Any]:
+    meta, transcript = _split_agent_metadata(entries)
+    parent_tool_use_id, parent_agent_id = _parent_ids_from_agent_metadata(meta)
+    return _entries_to_subagent_messages(
+        _filter_transcript_entries(transcript), None, 0, parent_tool_use_id, parent_agent_id
+    )
+
+
+async def get_session_messages_from_store(store: Any, session_id: str, directory: str | None = None) -> list[Any]:
+    key = await _store_key(session_id, directory)
+    if key is None:
+        return []
+    return await asyncio.to_thread(_decode_main, await store.load(key) or [])
+
+
+async def list_subagents_from_store(store: Any, session_id: str, directory: str | None = None) -> list[str]:
+    key = await _store_key(session_id, directory)
+    if key is None:
+        return []
+    subpaths = await store.list_subkeys(key)
+    return list(
+        dict.fromkeys(
+            subpath.rsplit("/", 1)[-1][len("agent-") :]
+            for subpath in subpaths
+            if subpath.startswith("subagents/") and subpath.rsplit("/", 1)[-1].startswith("agent-")
+        )
+    )
+
+
+async def get_subagent_messages_from_store(
+    store: Any, session_id: str, agent_id: str, directory: str | None = None
+) -> list[Any]:
+    key = await _store_key(session_id, directory)
+    if key is None or not agent_id:
+        return []
+    subpath = f"subagents/agent-{agent_id}"
+    if callable(getattr(store, "list_subkeys", None)):
+        subpaths = await store.list_subkeys(key)
+        subpath = next(
+            (
+                path
+                for path in subpaths
+                if path.startswith("subagents/") and path.rsplit("/", 1)[-1] == f"agent-{agent_id}"
+            ),
+            "",
+        )
+        if not subpath:
+            return []
+    return await asyncio.to_thread(_decode_subagent, await store.load({**key, "subpath": subpath}) or [])
+
+
+async def list_sessions_from_store(store: Any, directory: str | None = None) -> list[SDKSessionInfo]:
+    """List SDK summaries with filesystem work and decoding off-loop.
+
+    Authorized metadata is paginated separately. Fresh sidecars avoid transcript
+    reads; missing/stale ones use the locked SDK's JSONL lite decoder, just
+    like its public listing helper (including its file-size semantics).
+    """
+    from lib.agent.agent_session_store import make_project_key
+
+    project_path = await asyncio.to_thread(_canonicalize_path, directory or ".")
+    project_key = await asyncio.to_thread(make_project_key, directory or ".")
+    listing = await store.list_sessions(project_key)
+    summaries = {}
+    if callable(getattr(store, "list_session_summaries", None)):
+        with suppress(NotImplementedError):
+            summaries = {entry["session_id"]: entry for entry in await store.list_session_summaries(project_key)}
+    limiter = asyncio.Semaphore(16)
+
+    def decode(entries, sid, mtime):
+        parsed = _parse_session_info_from_lite(sid, _jsonl_to_lite(_entries_to_jsonl(entries), mtime), project_path)
+        if parsed is not None:
+            parsed.last_modified = mtime
+        return parsed
+
+    async def info(entry):
+        sid, mtime = entry["session_id"], entry["mtime"]
+        summary = summaries.get(sid)
+        if summary is None or summary["mtime"] < mtime:
+            async with limiter:
+                try:
+                    key = {"project_key": project_key, "session_id": sid}
+                    entries = await store.load(key)
+                    if not entries:
+                        return None
+                    return await asyncio.to_thread(decode, entries, sid, mtime)
+                except Exception:
+                    return SDKSessionInfo(session_id=sid, summary="", last_modified=mtime)
+        return await asyncio.to_thread(summary_entry_to_sdk_info, summary, project_path)
+
+    results = await asyncio.gather(*(info(entry) for entry in listing))
+    return sorted(
+        (result for result in results if result is not None), key=lambda item: item.last_modified, reverse=True
+    )
+
+
+async def delete_session_via_store(store: Any, session_id: str, directory: str | None = None) -> None:
+    key = await _store_key(session_id, directory)
+    if key is None:
+        raise ValueError("invalid session ID")
+    await store.delete(key)
 
 
 class SdkTranscriptAdapter:
@@ -55,7 +178,7 @@ class SdkTranscriptAdapter:
         """Read raw messages from the SDK transcript."""
         if not sdk_session_id or not SDK_AVAILABLE:
             return []
-        if self._store is not None and get_session_messages_from_store is not None:
+        if self._store is not None:
             return await self._read_via_store(sdk_session_id, project_cwd)
         return await self._read_via_legacy(sdk_session_id)
 
@@ -66,9 +189,7 @@ class SdkTranscriptAdapter:
     ) -> list[dict[str, Any]]:
         try:
             messages = await get_session_messages_from_store(
-                self._store,
-                sdk_session_id,
-                directory=self._coerce_cwd(project_cwd),
+                self._store, sdk_session_id, directory=self._coerce_cwd(project_cwd)
             )
         except Exception:
             logger.warning(
@@ -86,6 +207,36 @@ class SdkTranscriptAdapter:
         payload_by_uuid = await self._load_payload_index_from_store(sdk_session_id, project_cwd)
         return [self._adapt(msg, payload_by_uuid) for msg in (messages or [])]
 
+    async def _load_store_entries(
+        self,
+        sdk_session_id: str,
+        project_cwd: Path | str | None,
+        subpath: str = "",
+    ) -> list[dict[str, Any]]:
+        """Read transcript rows while keeping SDK path normalization off-loop."""
+        if project_cwd is None:
+            return []
+        from lib.agent.agent_session_store import make_project_key
+
+        project_key = await asyncio.to_thread(make_project_key, project_cwd)
+        key: dict[str, Any] = {"project_key": project_key, "session_id": sdk_session_id}
+        if subpath:
+            key["subpath"] = subpath
+        entries = await self._store.load(key)
+        if (
+            not entries
+            and subpath.startswith("subagents/agent-")
+            and callable(getattr(self._store, "list_subkeys", None))
+        ):
+            subpaths = await self._store.list_subkeys({"project_key": project_key, "session_id": sdk_session_id})
+            leaf = subpath.rsplit("/", 1)[-1]
+            nested = next(
+                (path for path in subpaths if path.startswith("subagents/") and path.rsplit("/", 1)[-1] == leaf), None
+            )
+            if nested is not None and nested != subpath:
+                entries = await self._store.load({**key, "subpath": nested})
+        return [entry for entry in entries or [] if isinstance(entry, dict)]
+
     async def _load_raw_payloads(
         self,
         sdk_session_id: str,
@@ -101,15 +252,7 @@ class SdkTranscriptAdapter:
             )
             return []
         try:
-            from lib.agent.agent_session_store import make_project_key
-
-            key: dict[str, Any] = {
-                "project_key": make_project_key(project_cwd),
-                "session_id": sdk_session_id,
-            }
-            if subpath:
-                key["subpath"] = subpath
-            payloads = await self._store.load(key)
+            payloads = await self._load_store_entries(sdk_session_id, project_cwd, subpath)
         except Exception:
             logger.warning(
                 "Failed to load raw payloads for session %s subpath=%s",
@@ -133,7 +276,7 @@ class SdkTranscriptAdapter:
         toolUseResult fields. We re-fetch raw payloads via store.load() and join
         on uuid so downstream consumers keep getting stable timestamps and
         structured tool results (e.g. AskUserQuestion 的 answers) without
-        touching SDK private APIs. Works for both the main transcript
+        reparsing the chain. Works for both the main transcript
         (subpath="") and subagent subpaths.
         """
         payloads = await self._load_raw_payloads(sdk_session_id, project_cwd, subpath)
@@ -170,9 +313,7 @@ class SdkTranscriptAdapter:
             return {}
         try:
             agent_ids = await list_subagents_from_store(
-                self._store,
-                sdk_session_id,
-                directory=self._coerce_cwd(project_cwd),
+                self._store, sdk_session_id, directory=self._coerce_cwd(project_cwd)
             )
         except Exception:
             logger.warning(
@@ -204,10 +345,7 @@ class SdkTranscriptAdapter:
             return None, None
         try:
             messages = await get_subagent_messages_from_store(
-                self._store,
-                sdk_session_id,
-                agent_id,
-                directory=self._coerce_cwd(project_cwd),
+                self._store, sdk_session_id, agent_id, directory=self._coerce_cwd(project_cwd)
             )
         except Exception:
             logger.warning(
@@ -220,9 +358,7 @@ class SdkTranscriptAdapter:
         if not messages:
             return None, None
         payload_by_uuid = await self._load_payload_index_from_store(
-            sdk_session_id,
-            project_cwd,
-            subpath=f"subagents/agent-{agent_id}",
+            sdk_session_id, project_cwd, subpath=f"subagents/agent-{agent_id}"
         )
         return tool_use_id, [self._adapt(msg, payload_by_uuid) for msg in messages]
 

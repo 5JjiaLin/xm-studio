@@ -40,12 +40,10 @@ export const ENQUEUE_METHODS = [
   "regenerateGrid",
   "renderFinalCut",
   "repairEpisodeDraft",
-  "recoverProductionMusic",
   "startEpisodeReplan",
   "startProductionAssets",
   "startProductionVideos",
   "startProductionRender",
-  "submitProductionMusic",
   "submitAssetSheetBatch",
   "submitStoryboardBatch",
 ];

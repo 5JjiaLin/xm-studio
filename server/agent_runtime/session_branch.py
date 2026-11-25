@@ -91,7 +91,7 @@ class SessionBranchService:
         # SDK 以 session_id 作路径分量并校验 UUID 形态，非 UUID 会被静默当作
         # 无此会话；新 id 必须是规范 uuid4 字符串。
         new_session_id = str(uuid4())
-        project_key = make_project_key(project_cwd)
+        project_key = await asyncio.to_thread(make_project_key, project_cwd)
         # 从这里到落指针为止是一次要么整体成立、要么整体撤回的转换：store 的每次
         # append 各自提交，中途失败会留下半份 transcript，而 transcript 行不依赖
         # 元数据行就能被 store 的会话枚举看见。
@@ -109,6 +109,7 @@ class SessionBranchService:
             await self._meta_store.create(
                 meta.project_name,
                 new_session_id,
+                user_id=meta.user_id,
                 fork_parent_session_id=session_id,
                 fork_anchor_uuid=anchor_uuid,
             )
@@ -146,7 +147,7 @@ class SessionBranchService:
         project_cwd = (
             await asyncio.to_thread(self._resolve_project_cwd, meta.project_name) if meta is not None else None
         )
-        project_key = make_project_key(project_cwd) if project_cwd is not None else None
+        project_key = await asyncio.to_thread(make_project_key, project_cwd) if project_cwd is not None else None
         await self._discard(store, project_key, origin_session_id, new_session_id)
 
     async def _discard(

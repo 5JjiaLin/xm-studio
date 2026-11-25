@@ -16,7 +16,10 @@ import { errMsg } from "@/utils/async";
 import { WholeScriptPanel } from "../script/WholeScriptPanel";
 import { ScriptInput } from "../script/ScriptInput";
 import { FeedbackExportButton } from "../feedback/FeedbackExportButton";
-import { productionPath, projectPath } from "../production-paths";
+import { productionPath, projectPath, resumeProductionPath } from "../production-paths";
+import { DeleteProjectDialog } from "@/components/pages/lobby/ProjectDialogs";
+import { DeletedProjectsDialog } from "@/components/pages/lobby/DeletedProjectsDialog";
+import type { RefreshProjectResult } from "@/stores/projects-store";
 
 function ManagementLayout({ title, projects, loading = false, children }: { title: string; projects: Pick<ProjectSummary, "name" | "title">[]; loading?: boolean; children: React.ReactNode }) {
   const { t } = useTranslation("dashboard");
@@ -54,6 +57,8 @@ function ProjectList() {
   const [archived, setArchived] = useState(false);
   const [creating, setCreating] = useState(false);
   const [renaming, setRenaming] = useState<ProjectSummary | null>(null);
+  const [deleting, setDeleting] = useState<ProjectSummary | null>(null);
+  const [showDeleted, setShowDeleted] = useState(false);
   const [busy, setBusy] = useState(false);
   const [revision, setRevision] = useState(0);
   useEffect(() => {
@@ -70,9 +75,20 @@ function ProjectList() {
   const rename = useCallback(async (title: string) => {
     if (renaming) { await API.updateProject(renaming.name, { title }); setRevision((r) => r + 1); }
   }, [renaming]);
+  const reloadRestored = useCallback(async (): Promise<RefreshProjectResult> => {
+    try {
+      const result = await API.listProjects();
+      setProjects(result.projects); setError(null);
+      return "success";
+    } catch (cause) {
+      setError(errMsg(cause));
+      return "failed";
+    }
+  }, []);
   return <ManagementLayout title={t("management_projects")} projects={projects} loading={loading}>
     <div className="flex flex-wrap items-center gap-3"><h1 className="flex-1 text-xl font-semibold">{t("management_projects")}</h1>
       <Button variant="outline" onClick={() => { setArchived((v) => !v); setCreating(false); }}>{t(archived ? "management_active" : "management_archived")}</Button>
+      <Button variant="outline" onClick={() => setShowDeleted(true)}>{t("lobby_deleted_projects")}</Button>
       <Button onClick={() => setCreating((v) => !v)}>{t(creating ? "common:cancel" : "management_new_project")}</Button>
     </div>
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
@@ -82,11 +98,13 @@ function ProjectList() {
         <h2 className="wrap-break-word font-semibold">{project.title || t("management_untitled_project")}</h2>
         <p className="text-sm text-muted-foreground">{t("management_episode_count", { count: project.episode_count ?? 0 })}</p>
         {project.last_activity_at && <p className="text-sm text-muted-foreground">{t("management_updated")} {new Date(project.last_activity_at).toLocaleString()}</p>}
-        <div className="flex flex-wrap gap-2"><Link href={projectPath(project.name)} className={buttonVariants()}>{t("management_open")}</Link><Button variant="outline" disabled={busy || archived} onClick={() => setRenaming(project)}>{t("management_rename")}</Button><Button variant="ghost" disabled={busy} onClick={() => void archive(project)}>{t(archived ? "management_restore" : "management_archive")}</Button></div>
+        <div className="flex flex-wrap gap-2"><Link href={projectPath(project.name)} className={buttonVariants()}>{t("management_open")}</Link><Button variant="outline" disabled={busy || archived} onClick={() => setRenaming(project)}>{t("management_rename")}</Button><Button variant="ghost" disabled={busy} onClick={() => void archive(project)}>{t(archived ? "management_restore" : "management_archive")}</Button>{archived && <Button variant="destructive" disabled={busy} onClick={() => setDeleting(project)}>{t("delete_project")}</Button>}</div>
       </article>)}
       {!projects.some((p) => !!p.production_management?.archived === archived) && <p className="text-sm text-muted-foreground">{t("management_empty")}</p>}
     </div>}
     {renaming && <NameDialog title={t("management_rename")} initial={renaming.title} save={rename} onClose={() => setRenaming(null)} />}
+    <DeleteProjectDialog project={deleting} onClose={() => setDeleting(null)} onDone={() => setRevision((r) => r + 1)} />
+    <DeletedProjectsDialog open={showDeleted} onClose={() => setShowDeleted(false)} onRestored={reloadRestored} />
   </ManagementLayout>;
 }
 
@@ -149,7 +167,7 @@ function EpisodeList({ name }: { name: string }) {
         <p className="text-sm text-muted-foreground">{t(ep.status === "completed" ? "production_step_output" : ep.script_status === "generated" ? "production_step_videos" : ep.script_status === "segmented" ? "production_step_breakdown" : "production_step_script")}{ep.videos && ep.videos.total > 0 ? ` · ${ep.videos.available - ep.videos.stale}/${ep.videos.total}` : ""}</p>
         {costs.data?.episodes.find((item) => item.episode === ep.episode) ? <ProductionCosts cost={costs.data.episodes.find((item) => item.episode === ep.episode)!} /> : <p className="text-sm text-muted-foreground">{t(costs.error ? "production_cost_load_failed" : "common:loading")}</p>}
         <div className="flex flex-wrap gap-2">
-          {!showArchived && !projectArchived && <><Link href={productionPath(name, "script", ep.episode)} className={buttonVariants()}>{t("management_continue")}</Link><EpisodeOutput key={`${ep.episode}/${revision}`} project={name} episode={ep.episode} /></>}
+          {!showArchived && !projectArchived && <><Link href={resumeProductionPath(name, ep.episode)} className={buttonVariants()}>{t("management_continue")}</Link><EpisodeOutput key={`${ep.episode}/${revision}`} project={name} episode={ep.episode} /></>}
           <Button variant="outline" disabled={busy || batchActive || showArchived || projectArchived} onClick={() => setEditing(ep)}>{t("management_rename")}</Button>
           {!showArchived && !projectArchived && <><Button variant="outline" aria-label={t("management_up", { title: ep.title })} disabled={busy || batchActive || position === 0} onClick={() => void run(() => API.moveEpisode(name, ep.episode, episodes[position - 2]?.episode ?? null))}><ArrowUp aria-hidden /></Button><Button variant="outline" aria-label={t("management_down", { title: ep.title })} disabled={busy || batchActive || position === episodes.length - 1} onClick={() => void run(() => API.moveEpisode(name, ep.episode, episodes[position + 1].episode))}><ArrowDown aria-hidden /></Button></>}
           <Button variant="ghost" disabled={busy || batchActive || projectArchived} onClick={() => void run(() => API.setProductionArchive(name, !showArchived, ep.episode))}>{t(showArchived ? "management_restore" : "management_archive")}</Button>

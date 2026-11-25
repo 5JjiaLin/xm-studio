@@ -261,7 +261,10 @@ export interface ScriptReviewViolation {
   label: string;
   message: string;
   line: number | null;
-  locations?: Array<{ path: Array<string | number>; line: number | null }>;
+  locations?: Array<
+    | { path: Array<string | number>; line: number | null }
+    | { source_line: number; dialogue_id: string }
+  >;
   reason?: string;
   action?: string;
   /** 违约所在条目在草稿正文条目数组里的下标；与 `item_id` 同缺即整集层面的违约。 */
@@ -300,6 +303,7 @@ export type DraftOwner = "user" | "agent";
  * 故这里只声明到「一个对象」，各面板按自己那条路线逐项收窄后渲染，不信任声明。
  */
 export interface ScriptReviewQuarantine {
+  coverage_advisories?: string[];
   doc_type: DraftDocType;
   /** 保存与丢弃的并发令牌；草稿文件已损坏时为 null。 */
   revision: string | null;

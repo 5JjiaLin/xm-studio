@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, Literal, TypeGuard, cast
+from uuid import uuid4
 
 import portalocker
 from pydantic import BaseModel, Field
@@ -104,6 +105,7 @@ from lib.project.asset_types import (
     resolve_asset_key,
     validate_asset_name,
 )
+from lib.project.identity import validate_project_id
 from lib.project.project_change_hints import emit_project_change_hint
 from lib.project.project_schema import parse_project_schema_version
 from lib.project.script_entry_cleanup import trash_entries
@@ -474,7 +476,10 @@ class ProjectManager:
             for subdir in self.SUBDIRS:
                 (project_dir / subdir).mkdir(exist_ok=True)
             if publish:
-                atomic_write_json(project_dir / self.PROJECT_FILE, {"content_mode": content_mode})
+                atomic_write_json(
+                    project_dir / self.PROJECT_FILE,
+                    {"content_mode": content_mode, "project_id": str(uuid4())},
+                )
             self.sync_agent_profile(project_dir, content_mode=content_mode)
         except Exception:
             # sync 失败时回滚 project_dir，避免残缺目录阻塞重试（同名 create 撞 FileExistsError）
@@ -2131,6 +2136,16 @@ class ProjectManager:
         self._touch_metadata(project)
 
         with self._project_lock(project_name):
+            existing = self.load_project(project_name) if project_file.exists() else {}
+            if "project_id" in existing:
+                persisted_id = validate_project_id(existing["project_id"])
+                if "project_id" in project and project["project_id"] != persisted_id:
+                    raise ValueError("project_id cannot be changed")
+                project["project_id"] = persisted_id
+            else:
+                # Assign here, while holding the lock, even for legacy projects.
+                # Caller-supplied IDs must not adopt another project's memberships.
+                project["project_id"] = str(uuid4())
             if self._requires_unique_asset_namespace(project):
                 ensure_project_asset_namespace(project)
             atomic_write_json(project_file, project)
@@ -2322,7 +2337,11 @@ class ProjectManager:
         # 变更可能把条目移出账本：先让历史最高号记下变更前的集 ID
         raise_episode_id_high_water(project)
         planning_inputs = source_planning_inputs(project)
+        persisted_id = validate_project_id(project["project_id"]) if "project_id" in project else str(uuid4())
+        project["project_id"] = persisted_id
         mutate_fn(project)
+        if project.get("project_id") != persisted_id:
+            raise ValueError("project_id cannot be changed")
         # 分集规划、手工切分、重新规划采纳、重置与删集都经由这里改账本：账本或源文登记变了，
         # 就按盘上源文重记源文是否还有未规划的原文，项目列表读它而不读源文
         if source_planning_inputs(project) != planning_inputs:
@@ -2606,6 +2625,7 @@ class ProjectManager:
             # extras 只许追加可选字段，不得覆盖上方已校验/已构造的核心字段——
             # 否则非路由调用方可借 extras 绕过模式互斥守卫（如 ad 项目写回 default_duration）。
             reserved = set(project) | {
+                "project_id",
                 "default_duration",
                 EPISODE_TARGET_DURATION_FIELD,
                 "style_template_id",

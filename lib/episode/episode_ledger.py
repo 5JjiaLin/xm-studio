@@ -124,9 +124,15 @@ def episode_outline_context(
     末场落地集尾钩子；prompt_authoring 仅出视觉、不再需要大纲。
     """
 
+    archived = set((project.get("production_management") or {}).get("archived_episodes", []))
+    entries = [
+        e for e in (project.get("episodes") or [])
+        if isinstance(e, Mapping) and (episode in archived or e.get("episode") not in archived)
+    ]
+
     def _entry(ep_num: int) -> Mapping[str, Any]:
         return next(
-            (e for e in (project.get("episodes") or []) if isinstance(e, Mapping) and e.get("episode") == ep_num),
+            (e for e in entries if e.get("episode") == ep_num),
             {},
         )
 
@@ -151,7 +157,6 @@ def episode_outline_context(
         return _context(_entry(episode)), _context(_entry(episode + 1))
 
     following: Mapping[str, Any] = {}
-    entries = [e for e in (project.get("episodes") or []) if isinstance(e, Mapping)]
     for index, entry in enumerate(entries[:-1]):
         if entry.get("episode") == episode:
             following = entries[index + 1]

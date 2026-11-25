@@ -79,8 +79,8 @@ class TestSessionManagerSdkSessionId:
         subscribed = []
         real_create = meta_store.create
 
-        async def _create_then_client_subscribes(project_name, session_id):
-            meta = await real_create(project_name, session_id)
+        async def _create_then_client_subscribes(project_name, session_id, **owner):
+            meta = await real_create(project_name, session_id, **owner)
             subscribed.append(session_manager._subscribe(session_id)[0])
             return meta
 

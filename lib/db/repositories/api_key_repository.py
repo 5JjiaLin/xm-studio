@@ -27,6 +27,9 @@ def _row_to_dict(row: ApiKey) -> dict[str, Any]:
         "created_at": _to_iso(row.created_at),
         "expires_at": _to_iso(row.expires_at),
         "last_used_at": _to_iso(row.last_used_at),
+        "user_id": row.user_id,
+        "project_id": row.project_id,
+        "project_permission": row.project_permission,
     }
 
 
@@ -39,8 +42,17 @@ class ApiKeyRepository(BaseRepository):
         key_prefix: str,
         expires_at: datetime | None = None,
         user_id: str = DEFAULT_USER_ID,
+        employee_session_version: int | None = None,
+        project_id: str | None = None,
+        project_permission: str | None = None,
     ) -> dict[str, Any]:
         """Create a new API key record."""
+        if any(value is not None for value in (employee_session_version, project_id, project_permission)):
+            from lib.project.identity import validate_project_id
+
+            validate_project_id(project_id)
+            if type(employee_session_version) is not int or project_permission not in {"read", "write"}:
+                raise ValueError("employee API keys require a version, project, and permission")
         row = ApiKey(
             name=name,
             key_hash=key_hash,
@@ -48,6 +60,9 @@ class ApiKeyRepository(BaseRepository):
             created_at=utc_now(),
             expires_at=expires_at,
             user_id=user_id,
+            employee_session_version=employee_session_version,
+            project_id=project_id,
+            project_permission=project_permission,
         )
         self.session.add(row)
         await self.session.flush()
@@ -77,6 +92,10 @@ class ApiKeyRepository(BaseRepository):
             "created_at": row.created_at,
             "expires_at": row.expires_at,
             "last_used_at": row.last_used_at,
+            "user_id": row.user_id,
+            "employee_session_version": row.employee_session_version,
+            "project_id": row.project_id,
+            "project_permission": row.project_permission,
         }
 
     async def get_by_id(self, key_id: int) -> dict[str, Any] | None:

@@ -15,6 +15,7 @@ from server.media_tools.image_review import (
 
 INSPECT_IMAGES = ToolDeclaration(
     name="inspect_images",
+    access="read",
     description=(
         "看资产图或分镜图：按 ID 取角色、场景、道具、商品、角色衍生的资产图，或分镜的分镜图，"
         "以图片内容块附在结果后面。只读，不收费，不触发任何生成。"

@@ -22,8 +22,14 @@ from lib.artifacts.artifact_manifest import (
 from lib.artifacts.artifact_provenance import ScriptPlanPromptVariant, build_script_plan_request
 from lib.artifacts.formal_write import formal_write_transaction
 from lib.backends.providers import CallPurpose
-from lib.backends.text_backends.base import DEFAULT_MAX_OUTPUT_TOKENS, TextOutputTruncatedError, TextTaskType
+from lib.backends.text_backends.base import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    TextGenerationTimeoutError,
+    TextOutputTruncatedError,
+    TextTaskType,
+)
 from lib.backends.text_backends.base import TextGenerationRequest as BackendTextGenerationRequest
+from lib.backends.text_backends.connection_errors import TextProviderConnectionError
 from lib.backends.text_generator import TextGenerator
 from lib.catalog.errors import ModelNotInCatalogError
 from lib.config.resolver import ConfigResolver
@@ -67,6 +73,7 @@ from lib.script.draft_quarantine import (
     QUARANTINE_KIND_NARRATION_SCRIPT_PLAN,
     QUARANTINE_KIND_PROMPT_AUTHORING,
     QUARANTINE_KIND_SCRIPT_PLAN,
+    QUARANTINE_KIND_TO_DOC_TYPE,
     clear_quarantine,
     quarantine_and_report,
     quarantine_path,
@@ -231,6 +238,16 @@ class TextGenerationResult:
 
 class TextGenerationError(Exception):
     """Expected refusal from a text-generation handler."""
+
+
+class QuarantinedDraftError(TextGenerationError):
+    """Generated content is saved for repair; this failure must not trigger a new generation."""
+
+    code = "draft_quarantined"
+
+    def __init__(self, report: str, *, episode: int, kind: str):
+        super().__init__(f"生成结果已保存为待修复草稿，请打开本集草稿并修复。\n{report}")
+        self.params = {"episode_id": episode, "doc_type": QUARANTINE_KIND_TO_DOC_TYPE[kind]}
 
 
 class PromptAuthoringInputError(TextGenerationError):
@@ -759,6 +776,9 @@ def load_script_plan_source_with_basis(
 ) -> tuple[str, dict[str, object], ArtifactBasis]:
     """Freeze the exact source text and project semantics consumed by a script_plan request."""
 
+    from lib.project.archive_context import generation_project
+
+    project = generation_project(project_path, project, episode=episode)
     novel_text = load_novel_source(project_path, source, episode=episode)
     require_script_plan_source_revision(novel_text, expected_source_revision)
     prompt_inputs, basis = build_script_plan_request(
@@ -921,7 +941,10 @@ def script_plan_preflight(project_path: Path, project: Mapping[str, Any], episod
 
 
 def _load_project_context(projects: ProjectManager, project_name: str) -> tuple[Path, dict[str, Any]]:
-    return projects.get_project_path(project_name), projects.load_project(project_name)
+    from lib.project.archive_context import generation_project
+
+    path = projects.get_project_path(project_name)
+    return path, generation_project(path, projects.load_project(project_name))
 
 
 def _formal_script_exists(project_path: Path, project: dict[str, Any], episode: int) -> bool:
@@ -1006,6 +1029,10 @@ async def generate_episode_script(
         raise VideoRequestFactsUnavailableError(exc.failure) from exc
     except FileNotFoundError as exc:
         raise TextGenerationError(f"❌ 文件错误: {exc}") from exc
+    except DraftViolation as exc:
+        if exc.code != "quarantined":
+            raise
+        raise QuarantinedDraftError(str(exc), episode=episode, kind=QUARANTINE_KIND_PROMPT_AUTHORING) from exc
     skipped_note = (
         f"\n   视觉层已齐、补缺未改动的条目: {'、'.join(skipped)}（要覆盖请传 rewrite=true）" if skipped else ""
     )
@@ -1231,6 +1258,7 @@ async def generate_drama_script_plan(
                 prompt=prompt,
                 response_schema=schema,
                 max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                prefer_stream=True,
             ),
             project_name=project_name,
         )
@@ -1262,7 +1290,7 @@ async def generate_drama_script_plan(
                     request.source,
                     formal_baseline,
                 )
-            raise TextGenerationError(report)
+            raise QuarantinedDraftError(report, episode=episode, kind=QUARANTINE_KIND_DRAMA_SCRIPT_PLAN)
 
         await reissue_plan_item_ids(projects, project_name, episode, content)
         async with draft_locks.async_file_lock(draft_path):
@@ -1297,7 +1325,13 @@ async def generate_drama_script_plan(
         return TextGenerationResult(
             drama_script_plan_result_text(script_plan_path.relative_to(project_path), raw_scenes, action="生成")
         )
-    except (TextGenerationError, TextOutputTruncatedError, ModelNotInCatalogError):
+    except (
+        TextGenerationError,
+        TextOutputTruncatedError,
+        TextGenerationTimeoutError,
+        TextProviderConnectionError,
+        ModelNotInCatalogError,
+    ):
         raise
     except VideoRequestFactsError as exc:
         raise VideoRequestFactsUnavailableError(exc.failure) from exc
@@ -1442,6 +1476,7 @@ def collect_reference_flat_violations(
     new_assets: object,
     prompt_policy_version: str | None = None,
     record_manual_dialogue_edits: bool = False,
+    coverage_advisories: list[str] | None = None,
 ) -> list[DraftViolation]:
     """逐 unit 收齐 script_plan 扁平产出的全部违约（不在首个违约处中断）。
 
@@ -1520,6 +1555,7 @@ def collect_reference_flat_violations(
                 novel_text,
                 speaker_aliases=aliases,
                 check_dialogue=not has_dialogue_bindings(flat_units),
+                coverage_advisories=coverage_advisories if coverage_advisories is not None else [],
             )
         )
     if prompt_policy_version == "drama_detail_v1":
@@ -2062,6 +2098,7 @@ async def generate_reference_script_plan(
                 prompt=prompt,
                 response_schema=schema,
                 max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                prefer_stream=True,
             ),
             project_name=project_name,
         )
@@ -2086,6 +2123,7 @@ async def generate_reference_script_plan(
             raise ValueError("script_plan 拆分内容结构异常：units 必须是非空的 unit 对象数组")
         new_assets = dedupe_new_assets(flat[NEW_ASSETS_FIELD])
 
+        coverage_advisories: list[str] = []
         violations = await asyncio.to_thread(
             collect_reference_flat_violations,
             flat_units,
@@ -2097,11 +2135,13 @@ async def generate_reference_script_plan(
             source_language=project.get("source_language"),
             new_assets=new_assets,
             prompt_policy_version=request.prompt_policy_version,
+            coverage_advisories=coverage_advisories,
         )
+        coverage_summary = [f"原文覆盖仅提示：疑似遗漏 {len(coverage_advisories)} 段，请在拆解审查页核对。"] if coverage_advisories else []
         unit_texts = [flat_unit["text"] for flat_unit in flat_units]
         soft_violations = _reference_soft_violation_lines(
             unit_texts, project, episode=episode, voice=split_caps.voice, new_assets=new_assets
-        )
+        ) + coverage_summary
         if violations:
             async with draft_locks.async_file_lock(draft_path):
                 report = await run_sync_transaction(
@@ -2120,8 +2160,10 @@ async def generate_reference_script_plan(
                 )
             # 产出即违约这条路同样带上软违约段：草稿在场、Agent 这一轮就在改它，降级提示留到晋升
             # 那一刻才第一次出现的话，它已经按不完整的信息改过一遍了。处置说明与晋升被挡下时同口径。
-            raise TextGenerationError(
-                report + render_soft_violation_section(soft_violations, note=SOFT_VIOLATION_NOTE_QUARANTINED)
+            raise QuarantinedDraftError(
+                report + render_soft_violation_section(soft_violations, note=SOFT_VIOLATION_NOTE_QUARANTINED),
+                episode=episode,
+                kind=QUARANTINE_KIND_SCRIPT_PLAN,
             )
 
         # 编号只分配、不复用：落盘前由服务端发本集从没用过的编号，回执里的降级提示按发出的编号定位。
@@ -2138,7 +2180,7 @@ async def generate_reference_script_plan(
         )
         soft_violations = _reference_soft_violation_lines(
             unit_texts, project, episode=episode, voice=split_caps.voice, unit_ids=unit_ids, new_assets=new_assets
-        )
+        ) + coverage_summary
         async with draft_locks.async_file_lock(draft_path):
             try:
                 await run_sync_transaction(
@@ -2176,7 +2218,13 @@ async def generate_reference_script_plan(
                 action="拆分",
             )
         )
-    except (TextGenerationError, TextOutputTruncatedError, ModelNotInCatalogError):
+    except (
+        TextGenerationError,
+        TextOutputTruncatedError,
+        TextGenerationTimeoutError,
+        TextProviderConnectionError,
+        ModelNotInCatalogError,
+    ):
         raise
     except VideoRequestFactsError as exc:
         raise VideoRequestFactsUnavailableError(exc.failure) from exc
@@ -2252,6 +2300,7 @@ async def generate_narration_script_plan(
                 prompt=prompt,
                 response_schema=NarrationScriptPlanDraft,
                 max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                prefer_stream=True,
             ),
             project_name=project_name,
         )
@@ -2290,7 +2339,7 @@ async def generate_narration_script_plan(
                     request.source,
                     formal_baseline,
                 )
-            raise TextGenerationError(report)
+            raise QuarantinedDraftError(report, episode=episode, kind=QUARANTINE_KIND_NARRATION_SCRIPT_PLAN)
 
         await reissue_plan_item_ids(projects, project_name, episode, content)
         async with draft_locks.async_file_lock(draft_path):
@@ -2325,7 +2374,13 @@ async def generate_narration_script_plan(
         return TextGenerationResult(
             narration_script_plan_result_text(script_plan_path.relative_to(project_path), raw_segments, action="拆分")
         )
-    except (TextGenerationError, TextOutputTruncatedError, ModelNotInCatalogError):
+    except (
+        TextGenerationError,
+        TextOutputTruncatedError,
+        TextGenerationTimeoutError,
+        TextProviderConnectionError,
+        ModelNotInCatalogError,
+    ):
         raise
     except VideoRequestFactsError as exc:
         raise VideoRequestFactsUnavailableError(exc.failure) from exc

@@ -5,16 +5,21 @@ import json
 import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import func, select
 
 from lib.artifacts.artifact_activation import activate_artifact_target_state
 from lib.artifacts.artifact_manifest import ArtifactKey, ProjectArtifactManifestAdapter
+from lib.backends.providers import CallPurpose
+from lib.backends.text_backends.base import TextGenerationRequest as BackendTextGenerationRequest
 from lib.backends.text_backends.base import TextGenerationResult as BackendTextGenerationResult
-from lib.backends.text_backends.base import TextOutputTruncatedError
+from lib.backends.text_backends.base import TextGenerationTimeoutError, TextOutputTruncatedError
 from lib.backends.text_generator import TextGenerator
+from lib.billing.ledger import Ledger
 from lib.catalog.errors import ModelNotInCatalogError
 from lib.config.resolver import ConfigResolver
 from lib.db import async_session_factory
@@ -56,6 +61,7 @@ from lib.script.draft_quarantine import (
     write_quarantine,
 )
 from server import draft_repair as draft_repair_module
+from server import tool_runtime
 from server.text_generation import TextGenerationRequest
 from server.tool_runtime import (
     CallerContext,
@@ -113,6 +119,59 @@ async def _start_text_worker(
     )
     await worker.start()
     return worker
+
+
+async def test_text_timeout_releases_single_worker_slot_without_replaying_request(file_db_factory, monkeypatch):
+    projects = ProjectManager(DataRootLayout.current().root)
+    projects.create_project("timeout", content_mode="ad")
+    projects.create_project_metadata("timeout", content_mode="ad")
+    queue = GenerationQueue(session_factory=file_db_factory, project_manager=projects)
+    backend = AsyncMock()
+    backend.name = "openai"
+    backend.model = "offline-test"
+    cancelled = asyncio.Event()
+
+    async def blocked_generation(_request):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    backend.generate.side_effect = blocked_generation
+    generator = TextGenerator(
+        backend, Ledger(session_factory=file_db_factory), "openai", purpose=CallPurpose.SCRIPT_GENERATION
+    )
+    monkeypatch.setattr("lib.backends.text_generator.TEXT_GENERATION_TOTAL_TIMEOUT_SECONDS", 0.05)
+
+    async def execute(task, *, claimed_provider_id=None):
+        if task["resource_id"] == "episode-1":
+            await generator.generate(BackendTextGenerationRequest(prompt="offline", prefer_stream=True))
+        return {"message": "next task ran"}
+
+    worker = await _start_text_worker(queue, execute)
+    try:
+        tasks = [
+            await queue.enqueue_task(
+                project_name="timeout",
+                task_type="text_episode_script",
+                media_type="text",
+                resource_id=f"episode-{episode}",
+                payload={"episode": episode},
+                provider_id="text",
+            )
+            for episode in (1, 2)
+        ]
+        failed = await wait_for_task(tasks[0]["task_id"], 0.01, queue=queue)
+        following = await wait_for_task(tasks[1]["task_id"], 0.01, queue=queue)
+    finally:
+        await worker.stop()
+
+    assert failed["status"] == "failed"
+    assert problem_from_task_failure(failed["error_message"]).code == "text_generation_timeout"
+    assert problem_from_task_failure(failed["error_message"]).action is GenerationAction.NONE
+    assert following["status"] == "succeeded"
+    assert cancelled.is_set()
+    assert backend.generate.await_count == 1
 
 
 @pytest.mark.parametrize(
@@ -808,6 +867,12 @@ async def test_queued_plan_resolves_data_root_from_current_config_and_preserves_
             GenerationAction.FIX_INPUT,
             {"source_file": "source/novel.txt", "offset": 120},
         ),
+        (
+            TextGenerationTimeoutError(1800),
+            "text_generation_timeout",
+            GenerationAction.NONE,
+            {"timeout_seconds": 1800, "may_have_been_accepted": True},
+        ),
     ],
 )
 async def test_queued_plan_failure_carries_the_way_out(
@@ -990,6 +1055,40 @@ async def test_cancel_during_started_episode_script_commit_leaves_member_running
     assert ProjectArtifactManifestAdapter(project_path).get_entry(ArtifactKey.episode_script(1)) is not None
 
 
+async def test_queued_draft_repair_ignores_queue_feedback_envelope(tmp_path: Path, file_db_factory, monkeypatch):
+    projects = ProjectManager(tmp_path / "projects")
+    monkeypatch.setenv("ARCREEL_DATA_DIR", str(projects.data_root))
+    reset_for_tests()
+    projects.create_project("repair", content_mode="narration")
+    services = SimpleNamespace()
+    called = {}
+
+    async def execute_repair(request, _scope, _services):
+        called["request"] = request
+        return tool_runtime.ToolOutcome(
+            value=tool_runtime.DraftRepairResult(
+                message="repaired", episode_id=1, doc_type="narration_script_plan", adopted=True, violation_count=0
+            )
+        )
+
+    monkeypatch.setattr(tool_runtime, "_execute_draft_repair", execute_repair)
+    task = {
+        "task_id": "repair-task",
+        "project_name": "repair",
+        "task_type": tool_runtime.TEXT_DRAFT_REPAIR_TASK_TYPE,
+        "payload": {
+            "episode_id": 1,
+            "doc_type": "narration_script_plan",
+            "base_revision": "abc",
+            "_production_feedback": {"tester_id": "tester"},
+            "_production_feedback_replan": {"event_id": "event"},
+        },
+    }
+    result = await tool_runtime.execute_queued_text_task(task, services=services)
+    assert result["message"] == "repaired"
+    assert called["request"].episode_id == 1
+
+
 async def test_cancel_during_started_episode_plan_commit_leaves_member_running_to_success(
     tmp_path: Path,
     file_db_factory,
@@ -1169,7 +1268,10 @@ async def test_cancel_during_invalid_script_plan_quarantine_leaves_member_runnin
         await worker.stop()
 
     assert task["status"] == "failed"
-    assert problem_from_task_failure(task["error_message"]).code == "generation_refused"
+    problem = problem_from_task_failure(task["error_message"])
+    assert problem.code == "draft_quarantined"
+    assert problem.action == GenerationAction.RESOLVE_DRAFT
+    assert problem.params["episode_id"] == 1
     batch = await queue.get_generation_batch(project_name=project_name, batch_id=batch_id)
     assert batch.done is True
     assert batch.members[0].status == "failed"

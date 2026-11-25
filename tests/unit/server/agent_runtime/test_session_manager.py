@@ -1,6 +1,8 @@
 import asyncio
+import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +24,14 @@ from tests.fakes import (
     use_provider_env,
     use_sdk_client,
 )
+
+
+@pytest.fixture
+def short_sdk_path():
+    # SDK paths include the encoded cwd as another component. Keep the fixture
+    # below Windows' legacy MAX_PATH while exercising real filesystem paths.
+    with tempfile.TemporaryDirectory(prefix="sdk-") as directory:
+        yield Path(directory)
 
 
 class _FakeOptions:
@@ -907,13 +917,13 @@ class TestSessionManager:
         return hook, own_project, claude_home
 
     @pytest.mark.asyncio
-    async def test_file_access_hook_allows_read_sdk_tool_results(self, tmp_path, meta_store):
+    async def test_file_access_hook_allows_read_sdk_tool_results(self, short_sdk_path, meta_store):
         """Hook allows Read for SDK tool-results of the CURRENT project.
 
         New policy: cwd-external non-projects paths (含 SDK 目录) 默认放行；
         Write 仍受 cwd 内限制约束。
         """
-        hook, own_project, claude_home = await self._make_sdk_hook_env(tmp_path, meta_store)
+        hook, own_project, claude_home = await self._make_sdk_hook_env(short_sdk_path, meta_store)
 
         encoded = AgentAccessPolicy.encode_sdk_project_path(own_project)
         tool_results_dir = claude_home / encoded / "abc-session" / "tool-results"
@@ -985,7 +995,9 @@ class TestSessionManager:
         hook, _, _ = await self._make_sdk_hook_env(tmp_path, meta_store)
 
         # SDK task output path pattern: /tmp/claude-{N}/{encoded}/tasks/{id}.output
-        task_output = "/tmp/claude-0/-app-projects-alpha-abc123/tasks/bdgaof0ba.output"
+        task_output = str(
+            Path(tempfile.gettempdir()) / "claude-0" / "-app-projects-alpha-abc123" / "tasks" / "bdgaof0ba.output"
+        )
         result = await hook(
             {"tool_name": "Read", "tool_input": {"file_path": task_output}},
             None,

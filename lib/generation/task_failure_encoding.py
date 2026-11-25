@@ -14,6 +14,7 @@ from arcreel_market_core.video_backend_contract import VideoCapabilityError
 from lib.backends.grok_shared import grpc_rejection
 from lib.backends.http_status_errors import ArtifactDownloadError, ProviderRejectedError
 from lib.backends.image_backends.base import ImageCapabilityError, ImageOutputFormatError, ImageOutputMissingError
+from lib.backends.text_backends.base import TextGenerationTimeoutError
 from lib.catalog.errors import ModelNotInCatalogError
 from lib.config.resolver import ImageBucketCapabilityError, VideoBucketCapabilityError
 from lib.custom_provider.comfyui.failures import ComfyuiError
@@ -35,6 +36,8 @@ def encode_task_failure_message(exc: Exception) -> str:
     落库只存机器码，本地化文案由读侧按 ``Accept-Language`` 渲染——worker 后台无 request
     上下文，在这里渲染会把任务的失败原因锁死成单一语言。
     """
+    if isinstance(exc, TextGenerationTimeoutError):
+        return _try_encode_failure(exc.code, {"timeout_seconds": exc.timeout_seconds}) or str(exc)
     if isinstance(exc, ScriptEditError):
         # 编不出来时退到通用 script_edit_error，保住"是剧本编辑失败"这一层信息。
         return _try_encode_failure(exc.key, exc.params) or encode_failure("script_edit_error")
