@@ -3,6 +3,8 @@ import asyncio
 import httpx
 import pytest
 from fastapi import FastAPI
+from starlette.responses import JSONResponse
+from starlette.types import Receive, Scope, Send
 
 from lib.infra.server_runtime import MaintenanceError, ServerRuntime, runtime
 from server.auth import EMBEDDED_AGENT_SUB, create_token
@@ -19,14 +21,12 @@ def clean_runtime(monkeypatch):
 
 
 def make_app():
-    app = FastAPI()
-    app.add_middleware(MaintenanceMiddleware)
+    # Exercise middleware directly; FastAPI's endpoint diagnostics may inspect
+    # source files on the first request, which is unrelated to admission.
+    async def endpoint(scope: Scope, receive: Receive, send: Send) -> None:
+        await JSONResponse({"ok": True})(scope, receive, send)
 
-    @app.api_route("/{path:path}", methods=["GET", "POST", "DELETE", "PATCH", "PUT"])
-    async def endpoint(path: str):
-        return {"ok": True}
-
-    return app
+    return MaintenanceMiddleware(endpoint)
 
 
 async def test_critical_disk_rejects_new_work_without_blocking_cleanup_or_result_saves():
