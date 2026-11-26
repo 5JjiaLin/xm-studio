@@ -818,6 +818,48 @@ async def test_late_structural_failure_cannot_replace_newer_candidate(tmp_path, 
     assert json.loads((pm.get_project_path("demo") / "drafts/episode_1/script_plan_reference_units.json").read_text()) == content
 
 
+async def test_screenplay_recap_is_context_only_in_real_split_request(tmp_path, monkeypatch, video_request_facts):
+    from lib.episode.episode_source_commands import set_episode_source_text
+    from lib.script.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, read_quarantine
+    from server.draft_workflow import revalidate_reference_script_plan_draft
+
+    monkeypatch.setenv("ARCREEL_PROMPT_CONTENT_VALIDATION", "false")
+    pm = _project(tmp_path, "drama", generation_mode="reference_video")
+    prefix = "前情提要\n姜家：这段是集前人物背景。\n"
+    body = "4-1 姜家书房 夜 内\n出场人物：阿离\n△阿离推门进屋。\n阿离：到家了。"
+    set_episode_source_text(pm, "demo", 1, prefix + body, source_kind="screenplay")
+    resolver = cast(ConfigResolver, FakeConfigResolver())
+    unit = {"duration_seconds": 8, "source_span_start": "S0003", "source_span_end": "S0006",
+            "text": "阿离推门进屋。[[Q0001]]"}
+    fake = FakeTextGenerator(
+        json.dumps({"units": [{**unit, "source_span_start": "S0002"}]}, ensure_ascii=False),
+        json.dumps({"units": [unit]}, ensure_ascii=False),
+    )
+    use_text_generator(monkeypatch, fake.create)
+    args = {"project_name": "demo", "projects": pm, "config_resolver": resolver}
+    with pytest.raises(TextGenerationError, match="原文跨度引用了集前参考"):
+        await generate_reference_script_plan(TextGenerationRequest(episode=1), **args)
+    root = pm.get_project_path("demo")
+    draft = read_quarantine(root, 1, QUARANTINE_KIND_SCRIPT_PLAN)
+    assert draft.meta["body_start"] == len(prefix)
+    checked = await revalidate_reference_script_plan_draft(
+        root, pm.load_project("demo"), 1, draft, config_resolver=resolver,
+    )
+    assert [issue.code for issue in checked.violations] == ["source_span_invalid"]
+    assert "集前人物背景" in fake.requests[0].prompt.split("<screenplay_context>", 1)[1].split("</screenplay_context>", 1)[0]
+    assert "集前人物背景" not in fake.requests[0].prompt.split("<screenplay>", 1)[1]
+    assert "[[Q0001]] 第6行" in fake.requests[0].prompt
+    assert "[[Q0002]]" not in fake.requests[0].prompt
+
+    await generate_reference_script_plan(TextGenerationRequest(episode=1), **args)
+    state = await ScriptReviewService(pm, config_resolver=resolver).get_state("demo", 1)
+    (saved,) = state["content"]["units"]
+    assert saved["source_text"] == body
+    assert saved["source_binding"]["start"] == len(prefix)
+    assert "@[阿离]{到家了。}" in saved["text"]
+    assert len(fake.requests) == 2
+
+
 async def test_screenplay_dialogue_output_survives_reopen_edit_and_confirmation(tmp_path, monkeypatch, video_request_facts):
     from lib.episode.episode_source_commands import set_episode_source_text
     from lib.script.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, read_quarantine

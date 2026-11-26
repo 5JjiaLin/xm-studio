@@ -307,6 +307,7 @@ async def revalidate_reference_script_plan_draft(
             build_reference_units_script_plan_model(split_caps.durations, use_source_spans=True, bind_dialogue=dialogue is not None),
             split_caps.durations, novel_text,
             manual=manual, dialogue=dialogue, project=project,
+            body_start=draft.meta.get("body_start", 0) if dialogue is not None else 0,
         )
         if not flat.get("units"):
             raise ScriptPlanParseError("units 为空", draft.content, [DraftViolation("content.units 必须是非空数组", code="schema_invalid")])
@@ -498,7 +499,10 @@ async def _promote_reference_script_plan(
         )
         raise DraftWorkflowError("draft_invalid", report + _soft_violation_section(revalidation), draft_refreshed=True)
     if violations:
-        meta = {key: value for key, value in draft.meta.items() if key not in {"dialogue_source_revision", "dialogue_fragment_ids"}}
+        meta = {
+            key: value for key, value in draft.meta.items()
+            if key not in {"dialogue_source_revision", "dialogue_fragment_ids", "body_start"}
+        }
         report = await run_sync_transaction(
             _rewrite_invalid_draft,
             project_path,

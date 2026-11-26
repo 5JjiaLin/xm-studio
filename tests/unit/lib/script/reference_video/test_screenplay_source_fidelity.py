@@ -1,6 +1,7 @@
 import pytest
 
 from lib.script.reference_video.screenplay_coverage import (
+    screenplay_body_start,
     screenplay_dialogue,
     screenplay_source_dialogue,
     screenplay_speaker_aliases,
@@ -91,12 +92,14 @@ def test_accepts_full_ordered_coverage_and_original_dialogue():
     assert validate_screenplay_coverage(units, SCRIPT) == []
 
 
-@pytest.mark.parametrize("episode_heading", ["第1集", "**Episode 1**"])
-def test_leading_recap_is_context_without_weakening_episode_coverage(episode_heading):
+@pytest.mark.parametrize("body_heading", ["第1集", "**Episode 1**", "4-1 姜家书房 夜 内", "**8-1 NIGHT — INT. HALL**"])
+def test_leading_recap_is_context_without_weakening_episode_coverage(body_heading):
     recap = "\n## 【前情提要】\n姜家：人物背景。\n他曾离开。\n\n"
     action = "△甲推开门。"
     speech = "ALICE: Stop."
-    source = f"{recap}{episode_heading}\n{action}\n{speech}"
+    source = f"{recap}{body_heading}\n{action}\n{speech}"
+    assert screenplay_body_start(source) == len(recap)
+    assert screenplay_dialogue(source) == [("ALICE", "Stop.")]
     units = [
         {"source_text": action, "text": action},
         {"source_text": speech, "text": "@[ALICE]{Stop.}"},
@@ -105,19 +108,41 @@ def test_leading_recap_is_context_without_weakening_episode_coverage(episode_hea
     assert validate_screenplay_coverage(units, source) == []
     missing_action = validate_screenplay_coverage(units[1:], source)
     assert [issue.code for issue in missing_action] == ["screenplay_source_coverage"]
-    assert action in str(missing_action[0]) and "人物背景" not in str(missing_action[0])
+    assert action in str(missing_action[0])
+    assert "人物背景" not in str(missing_action[0])
     assert [issue.code for issue in validate_screenplay_coverage(
         [units[0], {"source_text": speech, "text": "甲站定。"}], source,
     )] == ["screenplay_dialogue_coverage"]
 
 
-@pytest.mark.parametrize("opening", ["前情提要\n他曾离开。", "△甲进屋。\n前情提要\n他曾离开。\n第1集"])
-def test_recap_exemption_requires_a_leading_recap_and_an_episode_heading(opening):
+@pytest.mark.parametrize("opening", [
+    "前情提要\n他曾离开。",
+    "前情提要\n他曾离开。\n出场人物：甲、乙",
+    "△甲进屋。\n前情提要\n他曾离开。\n第1集",
+    "前情提要\n他曾离开。\n△甲进屋。\n第1集",
+    "前情提要\n他曾离开。\n【闪回】\n画面：甲进屋。\n4-1 大殿 夜 内",
+])
+def test_recap_exemption_requires_a_leading_recap_and_a_boundary_before_action(opening):
     action = "△甲推开门。"
     issues = validate_screenplay_coverage([{"source_text": action, "text": action}], f"{opening}\n{action}")
 
     assert [issue.code for issue in issues] == ["screenplay_source_coverage"]
     assert "他曾离开" in str(issues[0])
+    assert screenplay_body_start(opening) == 0
+
+
+def test_recap_does_not_skip_body_flashback_narration_or_first_scene_in_search_for_episode_heading():
+    recap = "前情提要\n反派：她已离开。\n"
+    body = "4-1 书房 夜 内\n【闪回】\n△她打开木盒。\n旁白：那是三年前。\n第5集"
+    assert screenplay_body_start(recap + body) == len(recap)
+    assert screenplay_dialogue(recap + body) == [("", "那是三年前。")]
+    advisories = []
+    assert validate_screenplay_coverage(
+        [{"source_text": "旁白：那是三年前。", "text": "{那是三年前。}"}],
+        recap + body, coverage_advisories=advisories,
+    ) == []
+    assert any("她打开木盒" in line for line in advisories)
+    assert all("她已离开" not in line for line in advisories)
 
 
 @pytest.mark.parametrize("title", ["仙侠视觉体系（制作参考）", "**制作参考**"])
@@ -128,7 +153,8 @@ def test_production_reference_requires_only_body_with_original_dialogue_coordina
     units = [{"source_text": action, "text": action}, {"source_text": speech, "text": "@[甲]{回来了。}"}]
     assert validate_screenplay_coverage(units, source) == []
     (line,), _ = screenplay_source_dialogue(source)
-    assert line.id == "D0010" and source[slice(*line.ranges[0])] == "回来了。"
+    assert line.id == "D0010"
+    assert source[slice(*line.ranges[0])] == "回来了。"
     assert [issue.code for issue in validate_screenplay_coverage(units[1:], source)] == ["screenplay_source_coverage"]
     assert [issue.code for issue in validate_screenplay_coverage(
         [units[0], {"source_text": speech, "text": "她站住。"}], source,

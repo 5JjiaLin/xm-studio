@@ -19,12 +19,15 @@ from lib.script.draft_violation import DraftViolation
 from lib.script.plan_new_assets import NewAssetResolution, resolve_new_assets
 from lib.script.reference_video.text_parser import SpeechMark, split_speech_line
 
-_METADATA = re.compile(
-    r"(?:Episode\s+\d+|第[\d一二三四五六七八九十百]+[集幕章]|"
-    r"(?:出场)?人物\s*[:：][^。！？!?]*|角色\s*[:：][^。！？!?]*|"
+_SCENE_HEADING = re.compile(
     r"(?:\d+[-－.]\d+\s+)?(?:DAY|NIGHT)\s*[—–-]\s*(?:INT|EXT)\..*|"
     r"(?:INT|EXT|INT\./EXT)\..*(?:DAY|NIGHT)|"
-    r"\d+[-－.]\d+\s*[^。！？!?]*?(?:日|夜)\s*[·・/／—–-]?\s*(?:内|外)[^。！？!?]*)",
+    r"\d+[-－.]\d+\s*[^。！？!?]*?(?:日|夜)\s*[·・/／—–-]?\s*(?:内|外)[^。！？!?]*",
+    re.IGNORECASE,
+)
+_METADATA = re.compile(
+    r"Episode\s+\d+|第[\d一二三四五六七八九十百]+[集幕章]|"
+    r"(?:出场)?人物\s*[:：][^。！？!?]*|角色\s*[:：][^。！？!?]*|" + _SCENE_HEADING.pattern,
     re.IGNORECASE,
 )
 # Inline character cues (including performance directions) are unambiguous.
@@ -71,14 +74,21 @@ def _cue(raw: str) -> tuple[str, Literal["onscreen", "offscreen", "narration"]] 
 
 def _leading_context_line_count(lines: Sequence[str]) -> int:
     """Find a bounded preamble without changing absolute source or dialogue coordinates."""
-    headings = [line.strip().strip("#* ") for line in lines]
-    first = next((heading for heading in headings if heading), "")
+    headings = [line.strip().lstrip("\ufeff").strip("#* ") for line in lines]
+    first_index = next((i for i, heading in enumerate(headings) if heading), None)
+    if first_index is None:
+        return 0
+    first = headings[first_index]
     if _RECAP_HEADING.fullmatch(first):
-        return next((i for i, heading in enumerate(headings) if _EPISODE_HEADING.fullmatch(heading)), 0)
+        for i in range(first_index + 1, len(headings)):
+            heading = headings[i]
+            if _EPISODE_HEADING.fullmatch(heading) or _SCENE_HEADING.fullmatch(heading):
+                return i
+            if _ACTION.match(heading):
+                break  # No safe boundary before staged action; preserve the source.
     if _PRODUCTION_HEADING.fullmatch(first):
-        for i, heading in enumerate(headings):
-            if heading == first:
-                continue
+        for i in range(first_index + 1, len(headings)):
+            heading = headings[i]
             if _BODY_HEADING.fullmatch(heading):
                 episode = next((j for j in range(i + 1, len(headings)) if headings[j]), None)
                 return episode if episode is not None and _EPISODE_HEADING.fullmatch(headings[episode]) else 0
@@ -86,6 +96,12 @@ def _leading_context_line_count(lines: Sequence[str]) -> int:
             if _ACTION.match(heading) or _METADATA.fullmatch(heading):
                 break
     return 0
+
+
+def screenplay_body_start(source: str) -> int:
+    """Absolute offset of the first body line, or 0 if no bounded prefix exists."""
+    lines = source.splitlines(keepends=True)
+    return sum(map(len, lines[:_leading_context_line_count(lines)]))
 
 
 def screenplay_source_dialogue(

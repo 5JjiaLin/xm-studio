@@ -20,7 +20,8 @@ slots:
   character_names: 角色候选引用名列表（含 本体/衍生）
   scene_names: 场景候选引用名列表
   prop_names: 道具候选引用名列表
-  source_spans: 逐字源文切分出的带 ID 连续跨度列表；ID 用于服务端精确回填原文锚
+  source_spans: 正式拆解范围内带 ID 的逐字原文跨度列表；ID 用于服务端精确回填原文锚
+  screenplay_context: 与剧本正文分开的集前背景或制作参考；没有时传 null
   dialogue_lines: 剧本原声片段清单，按源文位置排序，小说传 null
   episode_outline: 本集大纲，键齐全的对象 {title, story_beats, hook, next_episode_teaser}；无有效内容时传 null
   next_episode_outline: 下集大纲，形状同上；无有效内容时传 null
@@ -56,6 +57,16 @@ protected: false
 
 {{ partial("shared/lists/asset_registry_blocks") }}
 
+{% if screenplay_context %}
+## 集前参考（不参与拆解）
+
+只用于理解本集正文已有的人物、关系与场景设定。不得从这里新增动作、对白、旁白、镜头或视频单元，也不计入本集时长和原文覆盖。
+
+<screenplay_context>
+{{ screenplay_context }}
+</screenplay_context>
+
+{% endif %}
 {{ variant("text/reference_video_script_plan/source_heading", source_kind) }}
 
 <{{ source_kind }}>

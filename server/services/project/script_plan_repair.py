@@ -423,6 +423,7 @@ async def execute_reference_repair_plan(
     caps: Any,
     initial_prompt: str,
     dialogue: Any = None,
+    body_start: int = 0,
     before_commit: Callable[[], None] | None = None,
 ) -> Any:
     """At most one initial response and one repair; success uses the original commit."""
@@ -512,7 +513,10 @@ async def execute_reference_repair_plan(
             project_name=project_name,
             require_complete=True,
         )
-        responses.append({"phase": phase, "text": response.text, "dialogue_binding": dialogue is not None})
+        entry = {"phase": phase, "text": response.text, "dialogue_binding": dialogue is not None}
+        if phase == "generating" and body_start:
+            entry["body_start"] = body_start
+        responses.append(entry)
         await evidence.record("validating" if phase == "generating" else "revalidating", responses=responses)
         await check()
         return response.text
@@ -533,12 +537,12 @@ async def execute_reference_repair_plan(
             prompt_policy_version=request.prompt_policy_version,
         )
 
-    async def parse_initial(text: str, *, bound: bool) -> dict[str, Any]:
+    async def parse_initial(text: str, *, bound: bool, request_body_start: int) -> dict[str, Any]:
         try:
             project = await asyncio.to_thread(projects.load_project, project_name)
             return await asyncio.to_thread(
                 parse_reference_script_plan_candidate, text, initial_schema, caps.durations, novel,
-                dialogue=dialogue if bound else None, project=project,
+                dialogue=dialogue if bound else None, project=project, body_start=request_body_start,
             )
         except ScriptPlanParseError as exc:
             if bound:
@@ -550,6 +554,7 @@ async def execute_reference_repair_plan(
                         snapshot["formal_fingerprint"], prompt_policy_version=request.prompt_policy_version,
                         raw_response=text, dialogue_source_revision=prefixed_canonical_json_digest(novel),
                         dialogue_fragment_ids=[fragment.id for fragment in dialogue],
+                        body_start=request_body_start,
                     )
                 await evidence.record("failed", violations=violation_entries(exc.violations), recovery_rejected=True)
                 raise TextGenerationError(report) from exc
@@ -612,13 +617,15 @@ async def execute_reference_repair_plan(
                 targets = await asyncio.to_thread(repair_targets, content, await validate(content), novel)
                 content = await merge_response(content, targets, parsed)
             elif last.get("phase") == "generating":
-                content = await parse_initial(last["text"], bound=bool(last.get("dialogue_binding")))
+                content = await parse_initial(
+                    last["text"], bound=bool(last.get("dialogue_binding")), request_body_start=last.get("body_start", 0),
+                )
             else:
                 raise PlanRepairError("repair_response_unknown: 恢复响应缺少可识别的生成阶段")
             await evidence.record("revalidating", candidate=content)
         elif not request.repair_draft_revision:
             text = await generate(initial_prompt, initial_schema, "generating")
-            content = await parse_initial(text, bound=dialogue is not None)
+            content = await parse_initial(text, bound=dialogue is not None, request_body_start=body_start)
         violations = await validate(content)
         if request.repair_recheck_task_id and violations:
             if responses[-1].get("phase") == "generating" and snapshot.get("draft_file_digest") is None:
