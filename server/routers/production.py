@@ -17,6 +17,7 @@ from lib.generation.generation_queue import ActiveTaskRequestConflict, get_gener
 from lib.infra.api_errors import ConflictError
 from lib.infra.async_thread import run_sync_transaction
 from lib.jianying_draft.local_delivery import LocalSettings
+from lib.openfilm.runtime import EditError
 from lib.project.production_management import MANAGEMENT_RESOURCE, set_archive
 from lib.project.project_change_hints import project_change_source
 from lib.script.source_loader import SourceLoader
@@ -78,6 +79,61 @@ async def production_costs(project_name: str, request: Request, user: CurrentUse
 @router.post("/projects/{project_name}/production/assets/preview")
 async def production_asset_preview(project_name: str, body: AssetPreviewRequest, request: Request, user: CurrentUser):
     return await service(request).preview_asset(project_name, body.kind, body.name, user.id)
+
+
+class EpisodeEditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    music: bool = False
+
+
+class AdoptEditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    sha256: str
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/production/cut")
+async def production_cut(
+    project_name: str, episode: int, body: EpisodeEditRequest, request: Request, user: CurrentUser
+):
+    owner = service(request)
+    try:
+        await owner.episode_edit.start(project_name, episode, user.id, body.music)
+    except EditError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return await owner.status(project_name, episode)
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/production/cut/resume")
+async def resume_production_cut(project_name: str, episode: int, request: Request, user: CurrentUser):
+    owner = service(request)
+    try:
+        await owner.episode_edit.start(project_name, episode, user.id, False, resume=True)
+    except EditError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return await owner.status(project_name, episode)
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/production/cut/retry")
+async def retry_production_cut(project_name: str, episode: int, request: Request, user: CurrentUser):
+    owner = service(request)
+    try:
+        await owner.episode_edit.start(project_name, episode, user.id, False, retry=True)
+    except EditError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return await owner.status(project_name, episode)
+
+
+@router.post("/projects/{project_name}/episodes/{episode}/production/cut/confirm")
+async def confirm_production_cut(
+    project_name: str, episode: int, body: AdoptEditRequest, request: Request, user: CurrentUser
+):
+    owner = service(request)
+    try:
+        await owner.episode_edit.confirm(project_name, episode, body.id, body.sha256)
+    except EditError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return await owner.status(project_name, episode)
 
 
 @router.post("/projects/{project_name}/episodes/{episode}/production/render")
@@ -587,13 +643,19 @@ async def jianying_delivery_status(project_name: str, episode: int, request: Req
     record = await asyncio.to_thread(store.latest, project_name, episode)
     if record:
         record = await asyncio.to_thread(store.observed, record)
-        try:
-            job = await TimelineJianyingDraftService(pm).prepare(
-                project_name, record["timeline_id"], narration=record["narration"]
-            )
-            record["stale"] = job.basis.digest != record["basis"]
-        except (ValueError, FileNotFoundError, JianyingDraftError, EditTimelineError):
+        adopted = await asyncio.to_thread(service(request).episode_edit.adopted, project_name, episode)
+        if adopted:
+            record["stale"] = record.get("edit_id") != adopted["id"]
+        elif record.get("edit_id"):
             record["stale"] = True
+        else:
+            try:
+                job = await TimelineJianyingDraftService(pm).prepare(
+                    project_name, record["timeline_id"], narration=record["narration"]
+                )
+                record["stale"] = job.basis.digest != record["basis"]
+            except (ValueError, FileNotFoundError, JianyingDraftError, EditTimelineError):
+                record["stale"] = True
         if record["state"] == "preparing":
             task = await get_generation_queue().get_task(record["task_id"]) if record.get("task_id") else None
             if not task or task.get("status") in {"failed", "cancelled"}:
@@ -617,34 +679,53 @@ async def submit_jianying_delivery(
     store = delivery_store(pm)
     record = None
     try:
-        timelines, timeline_id = await _production_timeline(project_name, episode, request)
-        drafts = TimelineJianyingDraftService(pm)
-        checked = await drafts.check(project_name, timeline_id, narration="without_narration")
-        job = await drafts.prepare(project_name, timeline_id, revision=checked.revision, narration=checked.narration)
-        readout = await timelines.read(project_name, timeline_id)
-        project = await asyncio.to_thread(pm.load_project, project_name)
-        name = draft_folder_name(
-            project_name, project, episode=episode, timeline_name=readout.timeline.name, narration=checked.narration
-        )
-        record = await asyncio.to_thread(
-            store.reserve,
-            project=project_name,
-            episode=episode,
-            timeline_id=timeline_id,
-            revision=job.revision,
-            narration=job.narration,
-            basis=job.basis.digest,
-            name=name,
-            new_version=body.new_version,
-            previous_id=body.previous_id,
-            local=body.local,
-        )
+        adopted = await asyncio.to_thread(service(request).episode_edit.adopted, project_name, episode)
+        if adopted:
+            from server.services.project.episode_edit import delivery
+
+            edit_id = adopted["id"]
+            root = await asyncio.to_thread(pm.get_project_path, project_name)
+            result = await asyncio.to_thread(delivery, root, episode, edit_id)
+            basis = result["sha256"]
+            previous = await asyncio.to_thread(store.latest, project_name, episode)
+            replaced = previous is not None and previous.get("edit_id") != edit_id
+            record = await asyncio.to_thread(
+                store.reserve, project=project_name, episode=episode, timeline_id=f"edit-{edit_id}",
+                revision=1, narration="without_narration", basis=basis, name=f"第{episode}集",
+                new_version=body.new_version or replaced,
+                previous_id=previous["delivery_id"] if replaced else body.previous_id,
+                local=body.local, edit_id=edit_id,
+            )
+        else:
+            timelines, timeline_id = await _production_timeline(project_name, episode, request)
+            drafts = TimelineJianyingDraftService(pm)
+            checked = await drafts.check(project_name, timeline_id, narration="without_narration")
+            job = await drafts.prepare(project_name, timeline_id, revision=checked.revision, narration=checked.narration)
+            readout = await timelines.read(project_name, timeline_id)
+            project = await asyncio.to_thread(pm.load_project, project_name)
+            name = draft_folder_name(
+                project_name, project, episode=episode, timeline_name=readout.timeline.name, narration=checked.narration
+            )
+            basis = job.basis.digest
+            record = await asyncio.to_thread(
+                store.reserve,
+                project=project_name,
+                episode=episode,
+                timeline_id=timeline_id,
+                revision=job.revision,
+                narration=job.narration,
+                basis=job.basis.digest,
+                name=name,
+                new_version=body.new_version,
+                previous_id=body.previous_id,
+                local=body.local,
+            )
         if record["local"]:
             _require_local_jianying(request)
+        if record["basis"] != basis or (adopted and record.get("edit_id") != adopted["id"]):
+            raise DeliveryError("素材或剪辑版本已变化，请建立新版本")
         if record["state"] in {"delivered", "package_ready"}:
             return {"delivery": record}
-        if record["basis"] != job.basis.digest:
-            raise DeliveryError("素材或时间线已变化，请建立新版本")
         if await asyncio.to_thread(store.package_path(record["delivery_id"]).is_file):
             try:
                 return {"delivery": await asyncio.to_thread(store.register, record["delivery_id"])}
@@ -671,8 +752,14 @@ async def submit_jianying_delivery(
                 store.patch, record["delivery_id"], state="failed", error="另一个草稿任务正在运行，请稍后重试"
             )
         raise HTTPException(409, "另一个草稿任务正在运行，请稍后重试") from exc
-    except (DeliveryError, JianyingDraftError) as exc:
+    except (DeliveryError, JianyingDraftError, EditError) as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+async def _require_adopted_draft(request: Request, project: str, episode: int, record: dict) -> None:
+    adopted = await asyncio.to_thread(service(request).episode_edit.adopted, project, episode)
+    if record.get("edit_id") != (adopted["id"] if adopted else None):
+        raise HTTPException(409, "草稿属于旧版，请为当前成片建立新草稿")
 
 
 class OpenJianyingRequest(BaseModel):
@@ -691,6 +778,7 @@ async def open_jianying_delivery(
     record = await asyncio.to_thread(store.latest, project_name, episode)
     if not record:
         raise HTTPException(404, "还没有建立剪映草稿")
+    await _require_adopted_draft(request, project_name, episode, record)
     try:
         await asyncio.to_thread(store.open_target, record["delivery_id"], body.target)
     except DeliveryError as exc:
@@ -708,6 +796,7 @@ async def download_jianying_delivery(project_name: str, episode: int, request: R
     record = await asyncio.to_thread(store.latest, project_name, episode)
     if not record or not await asyncio.to_thread(store.package_path(record["delivery_id"]).is_file):
         raise HTTPException(404, "草稿包尚未准备完成")
+    await _require_adopted_draft(request, project_name, episode, record)
     return FileResponse(
         store.package_path(record["delivery_id"]), filename=f"{record['folder']}.zip", media_type="application/zip"
     )

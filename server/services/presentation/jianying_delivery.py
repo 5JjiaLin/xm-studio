@@ -83,7 +83,16 @@ async def execute_delivery(projects: ProjectManager, delivery_id: str) -> dict:
     store = delivery_store(projects)
     record = await asyncio.to_thread(store.read, delivery_id)
     try:
-        if not await asyncio.to_thread(store.package_path(delivery_id).is_file):
+        if record.get("edit_id"):
+            from server.services.presentation.episode_edit_delivery import package_edit_draft
+            from server.services.project.episode_edit import directory
+
+            root = await asyncio.to_thread(projects.get_project_path, record["project"])
+            work = directory(root, record["episode"], record["edit_id"])
+            await asyncio.to_thread(package_edit_draft, store, record, work)
+            if not record["local"]:
+                return await asyncio.to_thread(store.patch, delivery_id, state="package_ready", error=None)
+        elif not await asyncio.to_thread(store.package_path(delivery_id).is_file):
             service = TimelineJianyingDraftService(projects)
             job = await service.prepare(
                 record["project"], record["timeline_id"], narration=record["narration"], revision=record["revision"]

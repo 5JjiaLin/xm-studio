@@ -18,7 +18,7 @@ import { ProductionVideoCard } from "./videos/ProductionVideoCard";
 import { BreakdownEditor } from "./breakdown/BreakdownEditor";
 import { resolveCharacterForm } from "@/utils/reference-mentions";
 import { errMsg } from "@/utils/async";
-import { enqueuePromptAuthoring, enqueueProductionAssets, enqueueProductionRender, enqueueProductionFinish, enqueueProductionVideos, enqueueScriptPlan } from "@/actions/generation";
+import { enqueuePromptAuthoring, enqueueProductionAssets, enqueueProductionFinish, enqueueProductionVideos, enqueueScriptPlan } from "@/actions/generation";
 import { API } from "@/api";
 import { useAppStore } from "@/stores/app-store";
 import { useHasUnsavedChanges } from "@/components/shared/edit-unit/LeaveGuard";
@@ -75,6 +75,8 @@ export function ProductionPage() {
   const [repairOnce, setRepairOnce] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  const [editMusic, setEditMusic] = useState(false);
+  const player = useRef<HTMLVideoElement>(null);
   const [timelineBlocked, setTimelineBlocked] = useState<Record<string, boolean>>({});
   const onTimelineValidation = useCallback((key: string, blocked: boolean) => {
     setTimelineBlocked((current) => current[key] === blocked ? current : { ...current, [key]: blocked });
@@ -107,12 +109,16 @@ export function ProductionPage() {
   const failedUnitIds = production?.status === "failed" ? production.members?.filter((member) => ["failed", "cancelled", "blocked"].includes(member.status)).map((member) => member.unit_id) : undefined;
   const retryVideos = production?.stage === "videos" && production.action === "videos" && Boolean(failedUnitIds?.length);
   const videoTimelineBlocked = units.some((unit) => (!retryVideos || failedUnitIds?.includes(unit.unit_id)) && timelineBlocked[`${projectName}/${episode}/${unit.unit_id}`]);
+  const edit = production?.edit_output;
+  const editing = production?.action === "edit";
+  const retryEdit = production?.edit_recovery === "invalid" || production?.edit_recovery === "unconfirmed";
   const output = production?.output;
   const outputCurrent = output?.status === "current" && output.version != null && Boolean(output.artifact_path);
-  const previousOutputUrl = projectName && output?.artifact_path && output.version != null ? API.getFileUrl(projectName, output.artifact_path, output.version) : null;
-  const outputUrl = projectName && outputCurrent ? API.getFileUrl(projectName, output.artifact_path, output.version) : null;
+  const editUrl = projectName && edit ? API.getFileUrl(projectName, edit.artifact_path, edit.sha256) : null;
+  const previousOutputUrl = editUrl ?? (projectName && output?.artifact_path && output.version != null ? API.getFileUrl(projectName, output.artifact_path, output.version) : null);
+  const outputUrl = edit ? (edit.adopted ? editUrl : null) : projectName && outputCurrent ? API.getFileUrl(projectName, output.artifact_path, output.version) : null;
   const inputGate = workflow?.gates.production_inputs;
-  const canRebuild = inputGate?.videos_ready === true;
+  const canEdit = inputGate?.videos_ready === true;
   const completedImages = assetItems.filter((asset) => asset.sheet_state === "current" || asset.sheet_state === "stale").length;
   const allImagesReady = inputGate?.references_ready === true;
   const openSavedBreakdown = Boolean(review?.content || review?.quarantine);
@@ -120,7 +126,7 @@ export function ProductionPage() {
   const explicitStep = PRODUCTION_STEPS.find((s) => s === requestedStep);
   const resumedStep = (
     planning || review?.quarantine || savedPlanStale ? "breakdown"
-      : outputCurrent || production?.action === "finish" ? "output"
+      : outputCurrent || edit || editing || production?.action === "finish" ? "output"
       : promptsReady && allImagesReady ? "videos"
       : review?.status === "confirmed" || workflow?.content?.formal_script === "present" ? "assets"
       : openSavedBreakdown || planFailed || planTask?.status === "succeeded" ? "breakdown"
@@ -214,20 +220,31 @@ export function ProductionPage() {
       if (scope?.signal.aborted) reportBackground(errMsg(e), true); else setActionError(errMsg(e));
     } finally { setStarting(false); }
   };
-  const rebuild = async () => {
+  const startEdit = async () => {
     if (!projectName || !episode || active) return;
     if (hasUnsavedChanges()) { setActionError(t("common:unsaved_changes")); return; }
     const scope = actionScope.current;
     setStarting(true); setActionError(null);
     try {
-      if (step === "videos") await enqueueProductionFinish(projectName, episode);
-      else await enqueueProductionRender(projectName, episode);
+      await API.cutProduction(projectName, episode, editMusic);
       if (scope?.signal.aborted) { reportBackground(t("production_submitted_background")); return; }
       refresh();
-      if (step === "videos") navigate(productionPath(projectName, "output", episode));
+      navigate(productionPath(projectName, "output", episode));
     }
     catch (cause) { if (scope?.signal.aborted) reportBackground(errMsg(cause), true); else setActionError(errMsg(cause)); }
     finally { setStarting(false); }
+  };
+  const editAction = async (adopt: boolean) => {
+    if (!projectName || !episode || active || hasUnsavedChanges() || (adopt && !edit)) return;
+    const scope = actionScope.current;
+    setStarting(true); setActionError(null);
+    try {
+      if (adopt && edit) await API.adoptProductionCut(projectName, episode, edit.id, edit.sha256);
+      else await API.cutProduction(projectName, episode, false, retryEdit ? "retry" : "resume");
+      if (!scope?.signal.aborted) refresh();
+    } catch (cause) {
+      if (!scope?.signal.aborted) setActionError(errMsg(cause));
+    } finally { setStarting(false); }
   };
   const resumeFinish = async () => {
     if (!projectName || !episode || active || hasUnsavedChanges()) return;
@@ -294,6 +311,8 @@ export function ProductionPage() {
         {actionError && <p role="alert" className="text-sm text-destructive">{actionError}</p>}
         {production?.error && <p role="alert" className="text-sm text-destructive">{production.action === "finish" && isFinishError(production.error) ? t(production.error) : production.status === "unknown" ? t("production_unknown") : production.error}</p>}
         {production?.action === "finish" && production.status === "failed" && <Button variant="outline" className="self-start" disabled={active} onClick={() => void resumeFinish()}>{t("finish_resume")}</Button>}
+        {editing && production.status === "failed" && <Button variant="outline" className="self-start" disabled={active} onClick={() => void editAction(false)}>{t(retryEdit ? "production_edit_retry" : "production_edit_resume")}</Button>}
+        {editing && (production.status === "active" || production.status === "submitting") && <p role="status" className="flex items-center gap-2 text-sm"><Loader2 aria-hidden className="size-4 animate-spin" />{t("production_edit_running")}</p>}
         {production?.action === "finish" && production.status === "active" && <p role="status" className="text-sm">{t(production.stage === "draft" ? "finish_draft" : "finish_render")}</p>}
         {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
         {loading ? <LoadingState variant="pane" /> : !projectName ? <ScriptInput /> : project && episode && <>
@@ -346,14 +365,23 @@ export function ProductionPage() {
             <p className="text-sm text-muted-foreground">{t("production_videos_counts", { running: videoCounts.running, queued: videoCounts.queued + videoCounts.submitting, failed: videoCounts.failed, waiting: videoCounts.waiting + videoCounts.unknown })}</p>
             <p role="status" className="flex items-center gap-2 text-sm">{production?.stage === "render" && production.status === "active" && <Loader2 aria-hidden className="size-4 animate-spin text-primary" />}{t(production?.stage === "render" && production.status === "active" ? "production_videos_rendering" : "production_videos_hint")}</p>
           </section><div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-4">{episode && units.map((u, i) => <ProductionVideoCard key={`${projectName}/${episode}/${u.unit_id}`} referenceRevision={JSON.stringify([videoReferenceRevision, i === 0, handoffRevisions[i - 1], handoffRevisions[i + 1]])} project={projectName} episode={episode} unit={u} index={i} production={production} progress={videoProgress.get(u.unit_id)!} busy={operationBusy} generationSyncing={refreshing} onGenerate={() => startVideos([u.unit_id])} onChanged={refresh} onTimelineValidation={onTimelineValidation} />)}</div></>}</>}
-          {step === "output" && (previousOutputUrl ? <><video controls src={previousOutputUrl} className="max-h-[70vh] w-full"><track kind="captions" /></video>{!outputCurrent && <p className="text-sm text-muted-foreground">{t("production_output_changed")}</p>}{!outputCurrent && !active && canRebuild && <Button variant="outline" className="self-start" onClick={() => void rebuild()}>{t("production_rebuild_output")}</Button>}</> : <div className="flex flex-col gap-3"><p className="text-sm text-muted-foreground">{t(output && output.status !== "missing" ? "production_output_changed" : "production_wait_output")}</p>{!active && canRebuild && <Button variant="outline" className="self-start" onClick={() => void rebuild()}>{t("production_rebuild_output")}</Button>}</div>)}
-          {step === "output" && production?.timeline_id && <JianyingDeliveryCard key={`${projectName}/${episode}`} project={projectName} episode={episode} busy={active} revision={JSON.stringify(production)} />}
+          {step === "output" && (previousOutputUrl ? <><video ref={player} controls src={previousOutputUrl} className="max-h-[70vh] w-full"><track kind="captions" /></video>{!(edit ? edit.current : outputCurrent) && <p className="text-sm text-muted-foreground">{t(edit ? "production_edit_stale" : "production_output_changed")}</p>}{!editing && !edit && !outputCurrent && !active && canEdit && <Link className={buttonVariants({ variant: "outline", className: "self-start" })} to={productionPath(projectName, "videos", episode)}>{t("production_edit_back_to_videos")}</Link>}</> : <div className="flex flex-col gap-3"><p className="text-sm text-muted-foreground">{t(output && output.status !== "missing" ? "production_output_changed" : "production_wait_output")}</p>{!editing && !active && canEdit && <Link className={buttonVariants({ variant: "outline", className: "self-start" })} to={productionPath(projectName, "videos", episode)}>{t("production_edit_back_to_videos")}</Link>}</div>)}
+          {step === "output" && edit && <>
+            {edit.music_failed && <p className="text-sm text-muted-foreground">{t("production_edit_music_failed")}</p>}
+            {edit.review.length > 0 && <ul className="space-y-1">
+              {edit.review.map((item) => <li key={item.unit}><Button variant="link" className="h-auto whitespace-normal text-left" onClick={() => {
+                if (player.current) player.current.currentTime = item.at;
+              }}>{Math.floor(item.at / 60)}:{String(Math.floor(item.at % 60)).padStart(2, "0")} · {item.text}</Button></li>)}
+            </ul>}
+            {!edit.adopted && <Button className="self-start" disabled={active || !edit.current} onClick={() => void editAction(true)}>{t("production_edit_adopt")}</Button>}
+          </>}
+          {step === "output" && (edit ? edit.adopted : !editing && production?.timeline_id) && <JianyingDeliveryCard key={`${projectName}/${episode}/${edit?.id ?? "legacy"}`} project={projectName} episode={episode} busy={active} revision={JSON.stringify(production)} />}
           {step === "output" && <EpisodeCost project={projectName} episode={episode} revision={JSON.stringify(production)} />}
         </>}
       </div>
     </main>
     {review?.status === "confirmed" && !review.quarantine && <div className="px-4 py-2"><Button variant="outline" disabled={active} onClick={() => void revisePlan()}>{t("common:edit")} · {t("production_step_breakdown")}</Button></div>}
-    <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border bg-card px-4 py-3"><p className="text-sm text-muted-foreground">{loading || (step !== "videos" && refreshing) ? t("common:loading") : operationBusy ? t("production_running") : step === "videos" && error ? error : step === "assets" ? t("production_video_targets", { count: units.length }) : step === "videos" && canRebuild ? t("finish_merge_hint") : t("production_saved")}</p>{step === "output" && outputUrl ? <a className={buttonVariants()} href={outputUrl} download>{t("production_download")}</a> : <Button form={submitForm ? "production-action" : undefined} type={submitForm ? "submit" : "button"} onClick={step === "script" && openSavedBreakdown && projectName && episode ? () => navigate(productionPath(projectName, "breakdown", episode)) : retryPlan && projectName ? requestReplan : step === "assets" ? assetAction : step === "videos" ? () => void (canRebuild ? rebuild() : startVideos()) : undefined} disabled={active || (step !== "script" && step !== "breakdown" && step !== "assets" && step !== "videos") || (step === "breakdown" && !retryPlan && (!review?.content || !!review.quarantine)) || (step === "assets" && (allImagesReady ? !promptsReady && workflow?.operations.author_prompts?.state !== "admitted" : !review?.fingerprint || review.status !== "confirmed")) || (step === "videos" && !canRebuild && (!allImagesReady || !promptsReady || videoTimelineBlocked))}>{t(planning ? "production_breakdown_running" : retryPlan ? "production_breakdown_retry" : step === "script" ? (openSavedBreakdown ? "production_open_saved_breakdown" : "production_start") : step === "breakdown" ? "production_confirm_assets" : step === "assets" ? allImagesReady ? promptsReady ? "production_review_videos" : "production_confirm_assets_write_prompts" : "production_confirm_image_prompts" : step === "videos" && canRebuild ? "production_confirm_merge" : step === "videos" && retryVideos ? "production_retry_failed" : step === "videos" ? "production_confirm_videos" : "production_download")}</Button>}</footer>
+    <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border bg-card px-4 py-3"><p className="text-sm text-muted-foreground">{loading || (step !== "videos" && refreshing) ? t("common:loading") : operationBusy ? t("production_running") : step === "videos" && error ? error : step === "assets" ? t("production_video_targets", { count: units.length }) : step === "videos" && canEdit ? t("production_edit_hint") : t("production_saved")}</p>{step === "videos" && canEdit && <Label className="ml-auto flex items-center gap-2"><input type="checkbox" checked={editMusic} disabled={active} onChange={(event) => setEditMusic(event.target.checked)} />{t("production_edit_music")}</Label>}{step === "output" && outputUrl ? <a className={buttonVariants()} href={outputUrl} download>{t("production_download")}</a> : <Button form={submitForm ? "production-action" : undefined} type={submitForm ? "submit" : "button"} onClick={step === "script" && openSavedBreakdown && projectName && episode ? () => navigate(productionPath(projectName, "breakdown", episode)) : retryPlan && projectName ? requestReplan : step === "assets" ? assetAction : step === "videos" ? () => void (canEdit ? startEdit() : startVideos()) : undefined} disabled={active || (step !== "script" && step !== "breakdown" && step !== "assets" && step !== "videos") || (step === "breakdown" && !retryPlan && (!review?.content || !!review.quarantine)) || (step === "assets" && (allImagesReady ? !promptsReady && workflow?.operations.author_prompts?.state !== "admitted" : !review?.fingerprint || review.status !== "confirmed")) || (step === "videos" && !canEdit && (!allImagesReady || !promptsReady || videoTimelineBlocked))}>{t(planning ? "production_breakdown_running" : retryPlan ? "production_breakdown_retry" : step === "script" ? (openSavedBreakdown ? "production_open_saved_breakdown" : "production_start") : step === "breakdown" ? "production_confirm_assets" : step === "assets" ? allImagesReady ? promptsReady ? "production_review_videos" : "production_confirm_assets_write_prompts" : "production_confirm_image_prompts" : step === "videos" && canEdit ? "production_edit" : step === "videos" && retryVideos ? "production_retry_failed" : step === "videos" ? "production_confirm_videos" : "production_download")}</Button>}</footer>
     {picker && <WorkPicker onClose={() => setPicker(false)} />}
     <AlertDialog open={confirmReplan} onOpenChange={(open) => { if (!starting) setConfirmReplan(open); }}>
       <AlertDialogContent>

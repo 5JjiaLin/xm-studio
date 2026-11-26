@@ -1104,6 +1104,7 @@ _OPERATION_LABELS: dict[str, str] = {
     "edit_images": "图片编辑",
     "generate_videos": "视频生成",
     "render_final_cut": "成片渲染",
+    "render_episode_edit": "剪辑",
     "export_jianying_draft": "剪映草稿导出",
 }
 _FALLBACK_OPERATION_LABEL = "生成"
