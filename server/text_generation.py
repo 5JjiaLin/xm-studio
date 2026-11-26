@@ -104,6 +104,7 @@ from lib.script.reference_video.draft_validation import (
     validate_source_text_anchor,
     validate_unit_text,
 )
+from lib.script.reference_video.screenplay_coverage import screenplay_body_start
 from lib.script.reference_video.script_preview import (
     WARN_REFERENCE_AUDIO_OVERFLOW,
     WARN_SILENT_EPISODE,
@@ -480,6 +481,7 @@ def _quarantine_invalid_script_plan_generation(
     raw_response: str | None = None,
     dialogue_source_revision: str | None = None,
     dialogue_fragment_ids: list[str] | None = None,
+    body_start: int = 0,
 ) -> str:
     from lib.project.task_project_claim import current_task_project_claim
 
@@ -488,6 +490,8 @@ def _quarantine_invalid_script_plan_generation(
     if dialogue_source_revision:
         meta["dialogue_source_revision"] = dialogue_source_revision
         meta["dialogue_fragment_ids"] = dialogue_fragment_ids
+        if body_start:
+            meta["body_start"] = body_start
     if raw_response is not None:
         meta["raw_response"] = raw_response
         meta["generated_content_fingerprint"] = script_review.content_fingerprint_of_data(content)
@@ -652,8 +656,11 @@ def _parse_script_plan_json(response_text: str, model: type[BaseModel], *, label
 def parse_reference_script_plan_candidate(
     response_text: str, schema: type[BaseModel], supported_durations: list[int], novel_text: str, *,
     manual: bool = False, dialogue: Sequence[DialogueFragment] | None = None, project: dict | None = None,
+    body_start: int = 0,
 ) -> dict:
     """Resolve model span IDs to exact text and retain the selected source position.
+
+    body_start 由实际发给模型的请求确定；没有该字段的历史响应继续按全源文解锚。
 
     纯旧响应继续使用逐字原文锚校验。出现任一跨度字段就必须满足完整跨度 schema，
     不能用 source_text 或响应内的兼容标记绕过跨度校验。
@@ -666,7 +673,7 @@ def parse_reference_script_plan_candidate(
     uses_spans = isinstance(units, list) and any(
         isinstance(unit, dict) and ("source_span_start" in unit or "source_span_end" in unit) for unit in units
     )
-    uses_spans = uses_spans or dialogue is not None
+    uses_spans = uses_spans or dialogue is not None or body_start > 0
     model = schema if uses_spans else build_reference_units_script_plan_model(supported_durations)
     flat = _parse_script_plan_json(response_text, model, label="script_plan 拆分内容", top_shape="{units}", manual=manual)
     if not uses_spans:
@@ -681,6 +688,13 @@ def parse_reference_script_plan_candidate(
         if start_range is None or end_range is None or start_range[0] > end_range[0]:
             violations.append(DraftViolation(
                 f"units[{index}] 原文跨度 {unit['source_span_start']} → {unit['source_span_end']} 无法解引用或顺序反向；请修正编号",
+                code="source_span_invalid", item_index=index,
+                params={"source_span_start": unit["source_span_start"], "source_span_end": unit["source_span_end"]},
+            ))
+            continue
+        if start_range[0] < body_start or end_range[0] < body_start:
+            violations.append(DraftViolation(
+                f"units[{index}] 原文跨度引用了集前参考；请选择「剧本原文」区提供的正文编号。",
                 code="source_span_invalid", item_index=index,
                 params={"source_span_start": unit["source_span_start"], "source_span_end": unit["source_span_end"]},
             ))
@@ -2032,6 +2046,7 @@ async def generate_reference_script_plan(
                 split_caps.reference_durations, split_caps.text_durations, split_caps.durations,
             )
         dialogue = screenplay_inputs[1] if screenplay_inputs is not None else None
+        body_start = screenplay_body_start(novel_text) if screenplay_inputs is not None else 0
         prompt = build_reference_units_split_prompt(
             novel_text=novel_text,
             project_overview=cast(dict[str, Any], prompt_inputs["project_overview"]),
@@ -2071,6 +2086,7 @@ async def generate_reference_script_plan(
                 caps=split_caps,
                 initial_prompt=prompt,
                 dialogue=dialogue,
+                body_start=body_start,
                 before_commit=before_commit,
             )
 
@@ -2105,7 +2121,7 @@ async def generate_reference_script_plan(
         try:
             flat = await asyncio.to_thread(
                 parse_reference_script_plan_candidate, result.text, schema, split_caps.durations, novel_text,
-                dialogue=dialogue, project=project,
+                dialogue=dialogue, project=project, body_start=body_start,
             )
         except ScriptPlanParseError as exc:
             async with draft_locks.async_file_lock(draft_path):
@@ -2116,6 +2132,7 @@ async def generate_reference_script_plan(
                     prompt_policy_version=request.prompt_policy_version, raw_response=result.text,
                     dialogue_source_revision=prefixed_canonical_json_digest(novel_text) if dialogue is not None else None,
                     dialogue_fragment_ids=[fragment.id for fragment in dialogue] if dialogue is not None else None,
+                    body_start=body_start,
                 )
             raise TextGenerationError(report) from exc
         flat_units = flat.get("units")

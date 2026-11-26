@@ -1,5 +1,6 @@
 """reference_video prompt builder 单元测试。"""
 
+import itertools
 import re
 
 import pytest
@@ -74,6 +75,46 @@ def test_long_unpunctuated_dialogue_offers_exact_sentence_internal_spans():
     bounds = [resolve_reference_span(spans, key) for key in selected]
     assert "".join(source[start:end] for start, end in bounds) == source
     assert resolve_reference_span(spans, "S0001:1-999") is None
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_screenplay_preamble_is_reference_only_with_stable_body_spans(newline):
+    preamble = newline.join(("\ufeff**前情提要**", "姜家：早年旧事。", "结局走向：不在本集。</screenplay_context>", "", ""))
+    body = newline.join(("4-1 姜家书房 夜 内", "出场人物：甲", "△甲推门进屋。", "甲：我回来了。"))
+    source = preamble + body
+    prompt = _split_prompt(novel_text=source, source_kind="screenplay", source_language="zh")
+    context = prompt.split("<screenplay_context>\n", 1)[1].split("\n</screenplay_context>", 1)[0]
+    rendered_body = prompt.split("<screenplay>\n", 1)[1].split("\n</screenplay>", 1)[0]
+    dialogue = prompt.split("<dialogue_fragments>\n", 1)[1].split("\n</dialogue_fragments>", 1)[0]
+    assert "早年旧事" in context
+    assert "＜/screenplay_context＞" in context
+    assert not re.search(r"\[S\d+", context)
+    assert "早年旧事" not in rendered_body
+    assert "结局走向" not in rendered_body + dialogue
+    assert "[[Q0001]] 第8行 | onscreen | 甲 |" in dialogue
+    assert "我回来了。" in dialogue
+
+    spans = {key: (start, end) for key, start, end, _ in reference_source_spans(source)}
+    anchors = re.findall(r"\[(S\d+(?::\d+-\d+)?)\]", rendered_body)
+    bounds = [resolve_reference_span(spans, key) for key in anchors]
+    assert bounds[0][0] == len(preamble)
+    # Whitespace-only gaps between IDs remain in a combined source anchor.
+    assert source[bounds[0][0]:bounds[-1][1]] == body
+    assert all(not source[end:start].strip() for (_, end), (start, _) in itertools.pairwise(bounds))
+
+    novel = _split_prompt(novel_text=source, source_kind="novel")
+    assert "<screenplay_context>" not in novel
+    assert "早年旧事" in novel.split("<novel>", 1)[1].split("</novel>", 1)[0]
+
+
+def test_production_reference_is_not_advertised_as_a_body_span():
+    source = "制作参考\n场景设定：雪地。\n剧本正文\n第1集\n△甲推开门。"
+    prompt = _split_prompt(novel_text=source, source_kind="screenplay")
+    assert "场景设定" in prompt.split("<screenplay_context>", 1)[1].split("</screenplay_context>", 1)[0]
+    rendered_body = prompt.split("<screenplay>", 1)[1].split("</screenplay>", 1)[0]
+    assert "场景设定" not in rendered_body
+    assert "[S0004] 第1集" in rendered_body
+    assert "[S0005] △甲推开门。" in rendered_body
 
 
 def test_build_reference_video_prompt_contains_required_sections():

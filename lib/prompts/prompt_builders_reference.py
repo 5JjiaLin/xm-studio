@@ -17,10 +17,11 @@ import re
 from itertools import pairwise
 
 from lib.infra.text_metrics import count_reading_units, find_reading_unit_offset, reading_unit_noun
-from lib.prompts.prompt_builders_script import outline_slot, overview_slot, project_asset_appearances
+from lib.prompts.prompt_builders_script import neutralize_tags, outline_slot, overview_slot, project_asset_appearances
 from lib.prompts.prompt_rules.asset_appearance import asset_reference_names
 from lib.prompts.prompt_templates.builtin import builtin_templates
 from lib.script.reference_video.dialogue_binding import DialogueFragment, dialogue_fragments, render_dialogue_catalogue
+from lib.script.reference_video.screenplay_coverage import screenplay_body_start, screenplay_source_dialogue
 from lib.speech.speech_rate import speech_rate_units_per_second
 
 
@@ -69,17 +70,19 @@ def resolve_reference_span(spans: dict[str, tuple[int, int]], span_id: str) -> t
 
 
 def _screenplay_span_lines(spans, source_text: str, language: str | None, budget: int) -> tuple[list[str], list[int]]:
-    from lib.script.reference_video.screenplay_coverage import screenplay_source_dialogue
-
+    body_start = screenplay_body_start(source_text)
     speech, _ = screenplay_source_dialogue(source_text)
     ranges = iter(fragment for line in speech for fragment in line.ranges)
     active = next(ranges, None)
     lines = []
     cuts = []
     for span_id, start, end, text in spans:
+        if end <= body_start:
+            continue
         while active and active[1] <= start:
             active = next(ranges, None)
-        points = [0]
+        # Keep IDs/relative offsets anchored to the complete, unchanged source.
+        points = [max(0, body_start - start)]
         while active and active[0] < end:
             left, right = max(start, active[0]) - start, min(end, active[1]) - start
             while count_reading_units(text[left:right], language) > budget:
@@ -90,7 +93,7 @@ def _screenplay_span_lines(spans, source_text: str, language: str | None, budget
             if active[1] > end:
                 break
             active = next(ranges, None)
-        if len(points) == 1:
+        if points == [0]:
             lines.append(f"[{span_id}] {text}")
         else:
             points.append(len(text))
@@ -206,7 +209,9 @@ def build_reference_units_split_prompt(
     speech_rate = speech_rate_units_per_second(source_language, speech_rate_override)
 
     dialogue_lines = None
+    screenplay_context = None
     if source_kind == "screenplay":
+        screenplay_context = neutralize_tags(novel_text[:screenplay_body_start(novel_text)].strip()) or None
         span_lines, fragments = screenplay_inputs if screenplay_inputs is not None else reference_screenplay_inputs(
             novel_text, source_language, speech_rate_override,
             normalized_reference_durations, normalized_text_durations, normalized_durations,
@@ -223,6 +228,7 @@ def build_reference_units_split_prompt(
         assets=project_asset_appearances(characters, scenes, props, include_creation_text=True),
         **_candidate_names(characters, scenes, props),
         source_spans=rendered_source_spans,
+        screenplay_context=screenplay_context,
         dialogue_lines=dialogue_lines,
         episode_outline=outline_slot(episode_outline),
         next_episode_outline=outline_slot(next_episode_outline),

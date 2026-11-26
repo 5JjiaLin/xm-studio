@@ -10,11 +10,12 @@ from lib.script.draft_violation import DraftViolation
 from lib.script.reference_video.dialogue_binding import dialogue_fragments, speech_signature, validate_stored_dialogue
 from lib.script.reference_video.draft_validation import assert_dialogue_preserved, validate_reference_source_bindings
 from lib.script.reference_video.plan_repair import merge_repair, repair_targets
+from lib.script.reference_video.screenplay_coverage import screenplay_body_start
 from lib.script.script_models import build_reference_units_script_plan_model
 from server.text_generation import ScriptPlanParseError, parse_reference_script_plan_candidate
 
 
-def _run(source, units, fragments):
+def _run(source, units, fragments, *, body_start=0):
     schema = build_reference_units_script_plan_model([4, 8], bind_dialogue=True)
     project = {"characters": {"第一人": {"aliases": ["ALICE"]}, "第二人": {"aliases": ["BOB"]}}}
     return parse_reference_script_plan_candidate(
@@ -24,6 +25,7 @@ def _run(source, units, fragments):
         source,
         dialogue=fragments,
         project=project,
+        body_start=body_start,
     )
 
 
@@ -143,6 +145,22 @@ def test_model_gets_short_distinct_ids_for_fragments_on_the_same_line():
     units = _run(source, [_unit("S0001", "门开了。[[Q0001]][[Q0002]]", "S0002")], fragments)["units"]
     assert units[0]["source_binding"]["dialogue_ids"] == [part.id for part in fragments]
     assert speech_signature(units[0]["text"], {}) == [("第一人", "onscreen", "Run!"), ("第一人", "onscreen", " Hide!")]
+
+
+@pytest.mark.parametrize(("start", "end"), [("S0002", "S0002"), ("S0002", "S0005")])
+def test_new_response_cannot_turn_excluded_recap_into_a_unit(monkeypatch, start, end):
+    monkeypatch.setenv("ARCREEL_PROMPT_CONTENT_VALIDATION", "false")
+    source = "前情提要\n姜家：人员介绍。\n4-1 书房 夜 内\n△门开了。\nALICE: Run!"
+    _, fragments = reference_screenplay_inputs(source, "en", None, [8])
+    body_start = screenplay_body_start(source)
+    assert [(part.dialogue.line, part.text) for part in fragments] == [(5, "Run!")]
+    with pytest.raises(ScriptPlanParseError) as error:
+        _run(source, [_unit(start, "门开了。[[Q0001]]", end)], fragments, body_start=body_start)
+    assert [issue.code for issue in error.value.violations] == ["source_span_invalid"]
+    units = _run(source, [_unit("S0003", "门开了。[[Q0001]]", "S0005")], fragments, body_start=body_start)["units"]
+    assert units[0]["source_text"] == source[body_start:]
+    assert validate_reference_source_bindings(units, source) == []
+    assert validate_stored_dialogue(units, source, {"alice": "第一人"}) == []
 
 
 def test_explicit_recap_is_context_and_legacy_dialogue_bindings_are_readable():
