@@ -378,14 +378,20 @@ test("completed videos stay for review and only a confirmed single clip is regen
   let status = "active";
   const generated: unknown[] = [];
   let merged = 0;
+  let cutStatus: "active" | "completed" | undefined;
+  let adopted = false;
+  const cut = { id: "cut-1", sha256: "preview-hash", artifact_path: "renders/episode_1/edit-cut-1/final.mp4", current: true, music_failed: false, review: [] };
   let saved = unit.text;
   api.override({ ...productionBase,
     "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: productionWorkflow(true, true) },
     "GET /api/v1/tasks?page=1&page_size=100": { status: 200, body: { items: [], total: 0 } },
+    "GET /api/v1/files/demo/renders/episode_1/edit-cut-1/final.mp4?v=preview-hash": { status: 204, body: "" },
     "GET /api/v1/files/demo/reference_videos/E1U2.mp4": { status: 204, body: "" },
     "POST /api/v1/projects/demo/reference-videos/episodes/1/units/E1U2/prompt-preview": { status: 200, body: { text: "完整视频框架", creative_text: "完整视频框架", declarations: "", references: [], unavailable: null } },
   });
-  await page.route("**/api/v1/projects/demo/episodes/1/production", (route) => route.fulfill({ json: {
+  await page.route("**/api/v1/projects/demo/episodes/1/production", (route) => route.fulfill({ json: cutStatus ? { episode: 1, status: cutStatus, stage: "edit", action: "edit",
+    ...(cutStatus === "completed" ? { edit_output: { ...cut, adopted } } : {}),
+  } : {
     episode: 1, status, stage: "videos", action: "videos",
     // An existing cut must not trigger automatic navigation after a new batch completes.
     output: { status: "current", artifact_path: "renders/final.mp4", version: 2 },
@@ -404,21 +410,28 @@ test("completed videos stay for review and only a confirmed single clip is regen
     generated.push(route.request().postDataJSON()); status = "active";
     await route.fulfill({ json: { episode: 1, status, stage: "videos", action: "videos" } });
   });
-  await page.route("**/api/v1/projects/demo/episodes/1/production/finish", async (route) => {
+  await page.route("**/api/v1/projects/demo/episodes/1/production/cut", async (route) => {
     merged++;
-    await route.fulfill({ json: { episode: 1, status: "active", stage: "render" } });
+    cutStatus = "active";
+    expect(route.request().postDataJSON()).toEqual({ music: false });
+    await route.fulfill({ json: { episode: 1, status: cutStatus, stage: "edit", action: "edit" } });
+  });
+  await page.route("**/api/v1/projects/demo/episodes/1/production/cut/confirm", async (route) => {
+    expect(route.request().postDataJSON()).toEqual({ id: cut.id, sha256: cut.sha256 });
+    adopted = true;
+    await route.fulfill({ json: { episode: 1, status: "completed", stage: "edit", action: "edit", edit_output: { ...cut, adopted } } });
   });
   await page.goto("/app/make/demo?step=videos&episode=1");
   const first = page.getByRole("article", { name: "单元 1 · 7 秒", exact: true });
   const second = page.getByRole("article", { name: "单元 2 · 7 秒", exact: true });
   const regenerate = first.getByRole("button", { name: "确认提示词并重新生成当前视频", exact: true });
-  const merge = page.getByRole("button", { name: "确认视频并合成成片", exact: true });
+  const merge = page.getByRole("button", { name: "剪辑", exact: true });
   await expect(regenerate).toBeDisabled();
   await expect(merge).toBeDisabled();
   status = "completed";
   await expect(regenerate).toBeEnabled({ timeout: 10000 });
   await expect(merge).toBeEnabled();
-  await expect(page.getByText("保留视频原声，按剪辑时间线合成成片与剪映草稿，无需配置音频模型。", { exact: true })).toBeVisible();
+  await expect(page.getByText("使用本集视频和对白剪辑，完成后可预览及交接剪映。", { exact: true })).toBeVisible();
   await expect(page).toHaveURL(/step=videos&episode=1$/);
   expect([generated.length, merged]).toEqual([0, 0]);
   await page.reload();
@@ -448,6 +461,13 @@ test("completed videos stay for review and only a confirmed single clip is regen
   await merge.click();
   await expect.poll(() => merged).toBe(1);
   await expect(page).toHaveURL(/step=output&episode=1$/);
+  await expect(page.getByText("剪辑中", { exact: true })).toBeVisible();
+  cutStatus = "completed";
+  const adopt = page.getByRole("button", { name: "采用此版", exact: true });
+  await expect(adopt).toBeEnabled({ timeout: 10000 });
+  await expect(page.getByRole("link", { name: "下载 MP4", exact: true })).toHaveCount(0);
+  await adopt.click();
+  await expect(page.getByRole("link", { name: "下载 MP4", exact: true })).toHaveAttribute("href", /edit-cut-1\/final\.mp4/);
   expect(generated).toHaveLength(1);
 });
 
@@ -512,7 +532,7 @@ test("stale or missing outputs cannot masquerade as current downloads", async ({
       "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "completed", stage: "render", output: { status, artifact_path: "renders/final.mp4", version: status === "missing" ? null : 1 } } },
     });
     await page.goto("/app/make/demo?step=output");
-    await expect(page.getByRole("button", { name: "重新合成成片", exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "返回视频页剪辑", exact: true })).toBeVisible();
     await expect(page.getByRole("link", { name: "下载 MP4", exact: true })).toHaveCount(0);
     await expect(page.locator("video")).toHaveCount(status === "stale" ? 1 : 0);
   }
@@ -525,12 +545,12 @@ test("render failure offers local rebuilding without paid video retry", async ({
     "GET /api/v1/projects/demo/workflow-status?episode=1": { status: 200, body: productionWorkflow(true, true) },
     "GET /api/v1/projects/demo/reference-videos/episodes/1/units": { status: 200, body: { units: [{ ...unit, generated_assets: { video_clip: "reference_videos/E1U1.mp4" } }], unit_capabilities: {} } },
     "GET /api/v1/projects/demo/episodes/1/production": { status: 200, body: { episode: 1, status: "failed", stage: "render", action: "videos", error: "render failed", members: [{ unit_id: "render-final-cut", status: "failed" }] } },
-    "POST /api/v1/projects/demo/episodes/1/production/finish": { status: 200, body: { episode: 1, status: "active", stage: "render", action: "finish" } },
+    "POST /api/v1/projects/demo/episodes/1/production/cut": { status: 200, body: { episode: 1, status: "active", stage: "edit", action: "edit" } },
   });
   await page.goto("/app/make/demo?step=videos");
   await expect(page.getByRole("button", { name: "重试失败项", exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "确认视频并合成成片", exact: true }).click();
-  await expect.poll(() => posts.filter((path) => path.endsWith("/production/finish")).length).toBe(1);
+  await page.getByRole("button", { name: "剪辑", exact: true }).click();
+  await expect.poll(() => posts.filter((path) => path.endsWith("/production/cut")).length).toBe(1);
   expect(posts.filter((path) => path.endsWith("/production/videos"))).toEqual([]);
 });
 

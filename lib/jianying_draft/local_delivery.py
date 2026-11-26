@@ -165,6 +165,7 @@ class LocalDeliveryStore:
         new_version: bool,
         previous_id: str | None,
         local: bool,
+        edit_id: str | None = None,
     ) -> dict:
         with self.lock():
             previous = self.latest(project, episode)
@@ -197,6 +198,8 @@ class LocalDeliveryStore:
                 "created_ns": time.time_ns(),
                 "error": None,
             }
+            if edit_id:
+                record["edit_id"] = edit_id
             self.write(record)
             return record
 
@@ -235,7 +238,7 @@ class LocalDeliveryStore:
         if file_sha256(target / "draft_info.json") != record["content_sha256"]:
             raise DeliveryError("草稿已在外部修改，未覆盖；请建立新版本")
         for name, digest in load_json(target / "xm_materials.json")["assets"].items():
-            if portable_name(name) != name or file_sha256(target / "assets" / name) != digest:
+            if portable_name(name) != name or file_sha256(target / ("media" if record.get("edit_id") else "assets") / name) != digest:
                 raise DeliveryError("草稿素材校验失败，请重新准备")
 
     def register(self, delivery_id: str) -> dict:
@@ -314,8 +317,8 @@ class LocalDeliveryStore:
                     "draft_json_file": str(target / "draft_info.json"),
                     "draft_cover": str(target / "draft_cover.jpg"),
                     "draft_root_path": str(root),
-                    "draft_new_version": "164.0.0",
-                    "draft_timeline_materials_size": sum(p.stat().st_size for p in (target / "assets").iterdir()),
+                    "draft_new_version": record.get("draft_new_version", "164.0.0"),
+                    "draft_timeline_materials_size": sum(p.stat().st_size for p in (target / ("media" if record.get("edit_id") else "assets")).iterdir()),
                     "streaming_edit_draft_ready": True,
                     "tm_draft_create": stamp,
                     "tm_draft_modified": stamp,

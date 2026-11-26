@@ -1571,6 +1571,18 @@ class API {
     return this.request(`/projects/${encodeURIComponent(project)}/episodes/${episode}/production/finish${resume ? "/resume" : ""}`, { method: "POST" });
   }
 
+  static async cutProduction(project: string, episode: number, music: boolean, recovery?: "resume" | "retry"): Promise<import("@/types/production").ProductionState> {
+    return this.request(`/projects/${encodeURIComponent(project)}/episodes/${episode}/production/cut${recovery ? `/${recovery}` : ""}`, {
+      method: "POST", ...(recovery ? {} : { body: JSON.stringify({ music }) }),
+    });
+  }
+
+  static async adoptProductionCut(project: string, episode: number, id: string, sha256: string): Promise<import("@/types/production").ProductionState> {
+    return this.request(`/projects/${encodeURIComponent(project)}/episodes/${episode}/production/cut/confirm`, {
+      method: "POST", body: JSON.stringify({ id, sha256 }),
+    });
+  }
+
   static async getScriptReview(
     projectName: string,
     episode: number,

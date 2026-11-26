@@ -1,12 +1,17 @@
 export interface ProductionState {
   episode: number;
   status: "idle" | "active" | "submitting" | "unknown" | "failed" | "completed";
-  action?: "assets" | "videos" | "finish";
-  stage: "confirm" | "prompts" | "assets" | "videos" | "prepare" | "music" | "apply_music" | "render" | "draft" | null;
+  action?: "assets" | "videos" | "finish" | "edit";
+  stage: "confirm" | "prompts" | "assets" | "videos" | "prepare" | "music" | "apply_music" | "render" | "draft" | "edit" | null;
   batch_id?: string | null;
   timeline_id?: string;
   error?: string | null;
+  edit_recovery?: "resume" | "invalid" | "unconfirmed" | null;
   members?: Array<{ unit_id: string; task_id?: string | null; status: string; problem?: { detail?: string | null } | null }>;
+  edit_output?: {
+    id: string; sha256: string; artifact_path: string; current: boolean; adopted: boolean;
+    music_failed: boolean; review: Array<{ at: number; unit: string; text: string }>;
+  };
   output?: { status: string; artifact_path: string; version: number | null };
 }
 

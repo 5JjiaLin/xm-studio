@@ -65,10 +65,10 @@ export function JianyingDeliveryCard({ project, episode, busy, revision }: { pro
     {delivery?.error && <p role="alert" className="text-sm text-destructive">{delivery.error}</p>}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
     <div className="flex flex-wrap gap-2">
-      {!delivered && delivery?.state !== "removed" && <Button disabled={!!disabled} onClick={() => void submit()}>{t(delivery ? "jy_continue" : settings?.local === false ? "jy_prepare_package" : "jy_create")}</Button>}
+      {!delivered && !delivery?.stale && delivery?.state !== "removed" && <Button disabled={!!disabled} onClick={() => void submit()}>{t(delivery ? "jy_continue" : settings?.local === false ? "jy_prepare_package" : "jy_create")}</Button>}
       {(delivered || delivery?.state === "removed" || delivery?.state === "failed" || delivery?.stale) && <Button variant="outline" disabled={!!disabled} onClick={() => void submit(true)}>{t("jy_new_version")}</Button>}
-      {delivery?.state === "delivered" && settings?.local && <><Button variant="outline" disabled={working} onClick={() => void run(() => API.openJianyingDelivery(project, episode, "app"))}>{t("jy_open")}</Button><Button variant="ghost" disabled={working} onClick={() => void run(() => API.openJianyingDelivery(project, episode, "folder"))}>{t("jy_folder")}</Button></>}
-      {delivered && <Button variant="ghost" disabled={working} onClick={() => void download()}>{t("jy_download")}</Button>}
+      {delivery?.state === "delivered" && !delivery.stale && settings?.local && <><Button variant="outline" disabled={working} onClick={() => void run(() => API.openJianyingDelivery(project, episode, "app"))}>{t("jy_open")}</Button><Button variant="ghost" disabled={working} onClick={() => void run(() => API.openJianyingDelivery(project, episode, "folder"))}>{t("jy_folder")}</Button></>}
+      {delivered && !delivery?.stale && <Button variant="ghost" disabled={working} onClick={() => void download()}>{t("jy_download")}</Button>}
       <Button variant="ghost" disabled={working} onClick={() => void run(refresh)}>{t("jy_refresh")}</Button>
     </div>
     {settings?.local === false && <p className="text-sm text-muted-foreground">{t("jy_remote")}</p>}

@@ -25,6 +25,7 @@ from lib.jianying_draft.basis import (
     jianying_draft_key,
 )
 from lib.jianying_draft.errors import JianyingDraftError
+from lib.openfilm.runtime import TASK_TYPE
 from lib.project.project_manager import ProjectManager, get_project_manager
 
 RENDER_FINAL_CUT_TASK_TYPE = "render_final_cut"
@@ -159,8 +160,15 @@ async def execute_jianying_draft_task(task: dict[str, Any], projects: ProjectMan
     return {"file_path": result.artifact_path, "jianying_draft": result.model_dump(mode="json")}
 
 
+async def execute_episode_edit_task(task: dict[str, Any], projects: ProjectManager) -> dict[str, Any]:
+    from server.services.project.episode_edit import execute_edit
+
+    return await execute_edit(task, projects)
+
+
 RENDER_TASK_EXECUTORS: dict[str, RenderTaskExecutor] = {
     RENDER_FINAL_CUT_TASK_TYPE: execute_final_cut_task,
+    TASK_TYPE: execute_episode_edit_task,
     RENDER_JIANYING_DRAFT_TASK_TYPE: execute_jianying_draft_task,
 }
 """``render`` 车道的任务类型 → 执行器。"""

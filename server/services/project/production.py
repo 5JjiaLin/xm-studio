@@ -34,6 +34,7 @@ from server.media_tools.final_cuts import FinalCutToolResult, RenderFinalCutRequ
 from server.media_tools.videos import EpisodeTarget, GenerateVideosRequest, SelectedTarget, generate_videos
 from server.services.admission.asset_sheet_batch import AssetSheetScope, load_asset_sheet_batch_plan
 from server.services.admission.cost_estimation import estimate_image_batch_cost
+from server.services.project.episode_edit import EpisodeEdit
 from server.services.project.post_production import PostProduction, ProductionError
 from server.services.project.script_review import ScriptReviewService
 from server.services.tasks.formal_image_commit import get_aspect_ratio
@@ -57,6 +58,7 @@ class ProductionService:
 
         self.script_batch = WholeScriptBatchService(projects, self.services)
         self.post_production = PostProduction(self)
+        self.episode_edit = EpisodeEdit(self)
         self._runner: asyncio.Task | None = None
 
     def _path(self, project: str, episode: int):
@@ -86,6 +88,8 @@ class ProductionService:
             state["output"] = output.model_dump(mode="json")
             if state.get("basis") != await asyncio.to_thread(self._script_hash, project, episode):
                 state["output"]["status"] = "stale"
+        if edited := await asyncio.to_thread(self.episode_edit.status, project, episode, state):
+            state["edit_output"] = edited
         return state
 
     async def _write(self, project: str, episode: int, state: dict[str, Any]):
@@ -390,6 +394,9 @@ class ProductionService:
         path = await asyncio.to_thread(self._path, project, episode)
         async with self.projects.async_file_lock(path):
             state = await asyncio.to_thread(self._read, project, episode)
+            if state.get("action") == "edit":
+                await self.episode_edit.advance(project, episode, state)
+                return
             if state.get("action") == "finish":
                 if state["status"] == "submitting":
                     operation = state.get("operation_id")
